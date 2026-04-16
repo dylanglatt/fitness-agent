@@ -2,3 +2,7 @@
 data/fitness_bot.db
 __pycache__/
 *.pyc
+.env
+data/fitness_bot.db
+__pycache__/
+*.pyc
