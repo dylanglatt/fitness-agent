@@ -465,6 +465,37 @@ class Coach:
                     f"RHR: {r.get('resting_hr')} bpm"
                 )
 
+        # ── Active training plan — today's session
+        # Placed high in the context because it's the primary driver of the
+        # brief's prescription: the coach delivers today's planned session
+        # and modulates intensity based on recovery, rather than inventing
+        # a session from scratch.
+        try:
+            plan = await self.db.get_active_plan()
+        except Exception as e:
+            logger.warning(f"Active plan lookup failed: {e}")
+            plan = None
+        if plan:
+            day_name = today.strftime("%A").lower()
+            session = (plan.get("weekly_template") or {}).get(day_name)
+            lines.append("")
+            lines.append(f"ACTIVE PLAN: {plan.get('name')}")
+            lines.append(f"  Goal: {plan.get('goal')}")
+            if session:
+                stype = session.get("session_type", "?")
+                focus = session.get("focus", "")
+                presc = session.get("prescription", "")
+                notes = session.get("notes", "")
+                lines.append(
+                    f"  Today ({day_name}): {stype.upper()} — {focus}"
+                )
+                if presc:
+                    lines.append(f"  Prescription: {presc}")
+                if notes:
+                    lines.append(f"  Scheduling notes: {notes}")
+            else:
+                lines.append(f"  Today ({day_name}): no session defined in template")
+
         # ── Weather block (forecast + air quality for home location)
         try:
             weather_block = await self.weather.summarize_today()

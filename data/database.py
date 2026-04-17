@@ -140,7 +140,24 @@ class Database:
                     note TEXT
                 )
             """)
+            # training_plans: one row per plan. Only one is 'active' at a time.
+            # weekly_template is a JSON object keyed by lowercase day-of-week
+            # (monday..sunday) with session_type / focus / prescription / notes.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS training_plans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    goal TEXT NOT NULL,
+                    weekly_template TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    notes TEXT DEFAULT '',
+                    created_at TEXT DEFAULT (datetime('now')),
+                    activated_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
             await db.commit()
+        # Seed a default balanced-concurrent plan if no plan exists yet.
+        await self._seed_default_plan_if_empty()
         logger.info(f"Database initialized at {self.db_path}")
 
     # ── Lifts / notes (unchanged behaviour) ─────────────────────────────────
@@ -519,3 +536,224 @@ class Database:
             return int(dt.timestamp())
         except Exception:
             return None
+
+    # ── Training plans ──────────────────────────────────────────────────────
+    #
+    # A plan is a weekly template. weekly_template is JSON keyed by
+    # lowercase day-of-week (monday..sunday) with the shape:
+    #   { "session_type": "lift" | "run" | "rest" | "cross",
+    #     "focus": "<short label>",
+    #     "prescription": "<full session detail>",
+    #     "notes": "<scheduling logic, substitutions, etc.>" }
+    # Only one plan at a time has status='active'. Activating a new plan
+    # archives the previous one.
+
+    async def get_active_plan(self) -> Optional[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM training_plans WHERE status = 'active' "
+                "ORDER BY activated_at DESC LIMIT 1"
+            ) as cursor:
+                row = await cursor.fetchone()
+        if not row:
+            return None
+        plan = dict(row)
+        try:
+            plan["weekly_template"] = json.loads(plan["weekly_template"])
+        except Exception:
+            plan["weekly_template"] = {}
+        return plan
+
+    async def list_plans(self) -> list[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, name, goal, status, created_at, activated_at "
+                "FROM training_plans ORDER BY created_at DESC"
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def save_plan(
+        self,
+        name: str,
+        goal: str,
+        weekly_template: dict,
+        notes: str = "",
+        activate: bool = True,
+    ) -> int:
+        """Save a new plan. If activate=True, archive any currently-active plan."""
+        tpl_json = json.dumps(weekly_template)
+        async with aiosqlite.connect(self.db_path) as db:
+            if activate:
+                await db.execute(
+                    "UPDATE training_plans SET status = 'archived' WHERE status = 'active'"
+                )
+            cursor = await db.execute(
+                "INSERT INTO training_plans (name, goal, weekly_template, status, notes) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (name, goal, tpl_json, "active" if activate else "draft", notes),
+            )
+            plan_id = cursor.lastrowid
+            await db.commit()
+        logger.info(f"Saved training plan '{name}' (id={plan_id}, active={activate})")
+        return plan_id
+
+    async def set_active_plan(self, plan_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            # Check plan exists
+            async with db.execute(
+                "SELECT id FROM training_plans WHERE id = ?", (plan_id,)
+            ) as cursor:
+                exists = await cursor.fetchone()
+            if not exists:
+                return False
+            await db.execute(
+                "UPDATE training_plans SET status = 'archived' WHERE status = 'active'"
+            )
+            await db.execute(
+                "UPDATE training_plans SET status = 'active', "
+                "activated_at = datetime('now') WHERE id = ?",
+                (plan_id,),
+            )
+            await db.commit()
+        logger.info(f"Activated plan id={plan_id}")
+        return True
+
+    async def get_session_for_day(self, day_of_week: str) -> Optional[dict]:
+        """Return the session for a given weekday ('monday'..'sunday')
+        from the active plan, or None if no plan / no session."""
+        plan = await self.get_active_plan()
+        if not plan:
+            return None
+        tpl = plan.get("weekly_template") or {}
+        return tpl.get(day_of_week.lower())
+
+    async def _seed_default_plan_if_empty(self):
+        """Insert a sensible starter plan if the table has no rows."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT COUNT(*) FROM training_plans") as cursor:
+                (count,) = await cursor.fetchone()
+        if count:
+            return
+        template = {
+            "monday": {
+                "session_type": "lift",
+                "focus": "legs",
+                "prescription": (
+                    "Main: back squat 4x6 working up to a top set at ~80% (RPE 8). "
+                    "Assistance: RDL 3x10, walking lunge 3x10/side, leg curl 3x12, "
+                    "standing calf raise 3x15, core (ab wheel or weighted plank) 3 sets. "
+                    "~55–65 min."
+                ),
+                "notes": (
+                    "Heavy legs first in the week while you're fresh from Sunday. "
+                    "Progressive overload: add 2.5–5 lb on the main lift when you hit "
+                    "all reps with technique intact."
+                ),
+            },
+            "tuesday": {
+                "session_type": "run",
+                "focus": "easy aerobic",
+                "prescription": (
+                    "Easy Z2 run 30–45 min, conversational pace. Target HR roughly "
+                    "65–75% of max (~130–145 bpm for you). Nothing hard — this is "
+                    "aerobic base AND recovery from Monday legs."
+                ),
+                "notes": (
+                    "If legs are trashed from Monday, keep it to 30 min or swap for "
+                    "a brisk walk. The point is blood flow, not pace."
+                ),
+            },
+            "wednesday": {
+                "session_type": "lift",
+                "focus": "push (upper)",
+                "prescription": (
+                    "Main: bench press 4x6–8 working up to RPE 8. Assistance: "
+                    "overhead press 3x8, incline DB press 3x10, lateral raise 3x12, "
+                    "tricep pushdown or dip 3x10, core 3 sets. ~50–60 min."
+                ),
+                "notes": (
+                    "Alternate bench and OHP as the main lift week-to-week if you "
+                    "want both to progress. Same rule: +2.5–5 lb when you hit all reps."
+                ),
+            },
+            "thursday": {
+                "session_type": "run",
+                "focus": "quality (tempo or intervals)",
+                "prescription": (
+                    "The one hard run of the week. Pick one:\n"
+                    "  (a) 4 x 1 mi at threshold pace w/ 60s jog recovery\n"
+                    "  (b) 20 min steady tempo at comfortably-hard effort\n"
+                    "  (c) 8 x 400m at 5k pace w/ 90s easy recovery\n"
+                    "Always: 10 min easy warmup + 10 min cool down. Total 35–50 min."
+                ),
+                "notes": (
+                    "This is the 20% of the 80/20. If recovery is yellow, pick the "
+                    "shortest option. If red, swap for easy 30 min Z2."
+                ),
+            },
+            "friday": {
+                "session_type": "lift",
+                "focus": "pull (upper) / posterior chain",
+                "prescription": (
+                    "Main: deadlift 3x5 OR barbell row 4x6 (alternate weeks). "
+                    "Assistance: pull-up or lat pulldown 3x8–10, seated row 3x10, "
+                    "face pull or rear delt fly 3x12, barbell/DB curl 3x10, "
+                    "core 3 sets. ~55–65 min."
+                ),
+                "notes": (
+                    "Heavy pull day. If low back is cranky, swap deadlift for RDL "
+                    "3x8 at moderate weight and emphasize the row variation."
+                ),
+            },
+            "saturday": {
+                "session_type": "run",
+                "focus": "long run",
+                "prescription": (
+                    "Long easy run, Z2 pace. Start at your current comfortable "
+                    "distance and build 10% per week until 10–12 mi feels easy. "
+                    "Conversational throughout — if you can't hold a sentence, slow "
+                    "down. Duration target: 60–90 min."
+                ),
+                "notes": (
+                    "This is the volume driver for aerobic base. Sauna after is a "
+                    "legitimate cap — heat exposure post-long-run compounds the "
+                    "cardiovascular adaptations."
+                ),
+            },
+            "sunday": {
+                "session_type": "rest",
+                "focus": "active recovery",
+                "prescription": (
+                    "Full rest or gentle active recovery only: mobility, walk, "
+                    "sauna/steam, cold plunge. No running, no lifting."
+                ),
+                "notes": (
+                    "Actual rest is training. Skipping Sunday is how you end up in "
+                    "the 30-day recovery hole you were climbing out of last week."
+                ),
+            },
+        }
+        plan_notes = (
+            "Default starter plan. 3 lifts + 3 runs + 1 rest. Concurrent-friendly "
+            "scheduling: heavy legs after Sunday rest, quality run mid-week, long "
+            "run separated from leg day by 5 days. Golf/basketball/squash/tennis "
+            "count as light cross-training — play them on any day; if intense they "
+            "can replace Tuesday's easy run, if gentle they can add to Sunday. "
+            "Adjust freely as goals or life shift — this is a starting point, not a "
+            "contract."
+        )
+        await self.save_plan(
+            name="Balanced concurrent",
+            goal=(
+                "Good mix of lifting and running — 3 runs + 3 lifts + 1 rest per "
+                "week, polarized running (80% easy + 20% quality), progressive "
+                "overload on main lifts (squat, bench/OHP, deadlift/row)."
+            ),
+            weekly_template=template,
+            notes=plan_notes,
+            activate=True,
+        )
+        logger.info("Seeded default 'Balanced concurrent' training plan.")

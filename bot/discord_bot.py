@@ -60,6 +60,83 @@ class FitnessBot(commands.Bot):
                 for i in range(0, len(text), 1900):
                     await ctx.send(f"```\n{text[i:i+1900]}\n```")
 
+        @self.command(
+            name="plan",
+            help=(
+                "Show the active training plan. "
+                "Usage: !plan | !plan today | !plan week | !plan <day>"
+            ),
+        )
+        async def plan_cmd(ctx, arg: str = "full"):
+            if ctx.author.id != self.config.OWNER_USER_ID:
+                return
+            plan = await self.db.get_active_plan()
+            if not plan:
+                await ctx.send("No active plan. (This shouldn't happen — the DB "
+                               "seeds a default on init. Check logs.)")
+                return
+
+            arg = (arg or "full").strip().lower()
+            days_order = [
+                "monday", "tuesday", "wednesday", "thursday",
+                "friday", "saturday", "sunday",
+            ]
+            tz = pytz.timezone(self.config.TIMEZONE)
+            today_name = datetime.now(tz).strftime("%A").lower()
+
+            def fmt_day(name: str, sess: dict) -> str:
+                stype = sess.get("session_type", "?").upper()
+                focus = sess.get("focus", "")
+                presc = sess.get("prescription", "")
+                notes = sess.get("notes", "")
+                marker = "  ← today" if name == today_name else ""
+                out = f"**{name.title()}**{marker} — {stype} / {focus}\n{presc}"
+                if notes:
+                    out += f"\n_{notes}_"
+                return out
+
+            tpl = plan.get("weekly_template") or {}
+
+            if arg == "today":
+                sess = tpl.get(today_name)
+                if not sess:
+                    await ctx.send(f"No session defined for {today_name}.")
+                    return
+                msg = f"**{plan['name']}** — today\n\n" + fmt_day(today_name, sess)
+                await ctx.send(msg[:1990])
+                return
+
+            if arg == "week":
+                lines = [f"**{plan['name']}** — this week at a glance"]
+                for day in days_order:
+                    sess = tpl.get(day, {})
+                    stype = sess.get("session_type", "?")
+                    focus = sess.get("focus", "")
+                    marker = " ← today" if day == today_name else ""
+                    lines.append(f"  {day.title()[:3]}: {stype} / {focus}{marker}")
+                await ctx.send("\n".join(lines)[:1990])
+                return
+
+            if arg in days_order:
+                sess = tpl.get(arg)
+                if not sess:
+                    await ctx.send(f"No session defined for {arg}.")
+                    return
+                msg = f"**{plan['name']}**\n\n" + fmt_day(arg, sess)
+                await ctx.send(msg[:1990])
+                return
+
+            # Default: full plan, chunked because it's long
+            header = (
+                f"**{plan['name']}**\n"
+                f"_{plan.get('goal', '')}_\n"
+                f"{plan.get('notes', '')}\n\n"
+            )
+            body_parts = [fmt_day(d, tpl[d]) for d in days_order if d in tpl]
+            full = header + "\n\n".join(body_parts)
+            for i in range(0, len(full), 1900):
+                await ctx.send(full[i:i+1900])
+
     async def on_ready(self):
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
         await self.change_presence(activity=discord.Activity(

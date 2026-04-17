@@ -130,22 +130,38 @@ parse it as a lift log. Confirm what you logged. Flag PRs. Track progression.
 DAILY_BRIEF_PROMPT = """
 Generate Dylan's morning brief based on the data below.
 
-The prescription for today should be reasoned from the 7-day picture — not
-just "what did he do yesterday." Look at the TRENDS block, the day-by-day
-table, the activity composition, AND today's weather together before
-deciding. Specifically:
+TODAY'S PRESCRIPTION COMES FROM THE ACTIVE PLAN, NOT FROM SCRATCH.
 
-- Today's recovery + HRV + RHR tell you TODAY's readiness.
-- The TRENDS block tells you the DIRECTION things are moving — HRV slope,
-  recovery slope, 30-day vs baseline. A green score on top of a declining
-  3-day trend is different from a green score on top of a rising trend.
-- The 7-day activity composition tells you what's been UNDER-DONE or
-  OVER-DONE. Five runs and zero lifts is a different prescription than two
-  runs and three lifts, even if yesterday was identical.
-- The acute:chronic strain ratio flags accumulating load. Above 1.5 =
-  injury risk; well below 1.0 = detraining.
-- If 30-day recovery is meaningfully below the 12-month baseline, surface
-  that — it's a real signal, not a footnote.
+If the data contains an ACTIVE PLAN block, that block defines today's
+session — session type, focus, full prescription (sets/reps/intensity/
+duration), and scheduling notes. Your job is to DELIVER that session,
+not invent one. Restate it in concrete terms Dylan can walk into the gym
+and execute. Modulate intensity based on recovery (see below). If
+something on the plan conflicts sharply with today's readiness, say so
+and propose a substitution — but defaulting to "skip it" is wrong.
+
+If there is no ACTIVE PLAN block (edge case — plan not set up), fall
+back to reasoning a session from scratch using the 7-day picture.
+
+Recovery-based intensity modulation (apply to the planned session):
+- Green (recovery ≥ 67%): deliver the plan as written. Push the main
+  lift to RPE 8 or hit the interval targets as specified.
+- Yellow (34–66%): deliver the plan but cap main-lift intensity at
+  RPE 7, drop one top set if heavy, or trim the hardest interval option.
+  The session still happens — just with a ceiling.
+- Red (≤ 33%): swap heavy work for either the lighter alternative in
+  the plan, or a Z2 easy option, or rest. Be explicit about what you're
+  swapping and why.
+- HRV trending down 3+ days despite a green score: treat as yellow.
+- 30-day recovery meaningfully below 12-month baseline: bias toward
+  conservative even if today's score is green — you're climbing out of
+  a hole, not fully back.
+
+Other signals to weave in (don't enumerate — use them where they matter):
+- TRENDS block: HRV slope, recovery slope, ACWR, baseline gap
+- Activity composition over 7 days (has anything been skipped repeatedly?)
+- Acute:chronic strain ratio (above 1.5 = flag injury risk; well below
+  1.0 = accumulated detraining)
 - The WEATHER block matters for outdoor runs AND for sun-seeking:
   * Heat + humidity: if apparent temp ≥ 75°F or humidity ≥ 70%, expect
     pace to drop ~5–15 sec/mi; reframe "slow run" → "appropriate effort."
@@ -164,21 +180,34 @@ deciding. Specifically:
     skipping outright.
   * Wind: > 20mph ruins quality workouts; note it.
 
-Write 4–6 short lines, roughly in this order:
+Shape: a morning brief that feels like a training partner handing him
+today's session, not a report. Typically 6–9 short lines, though the
+session prescription itself can expand when it's a complex lift or run.
 
-1. Recovery status with specific HRV + RHR numbers.
-2. Today's training intent — specific, grounded in the 7-day context.
-   Reference the balance (e.g., "you're 5-run, 1-lift over the last 7 days
-   and recovery is holding — lift today, not run") or the trend ("HRV is
-   trending down 3 days running despite today's green — keep effort
-   conversational"). Avoid the lazy heuristic "you lifted yesterday, so run
-   today" — use the actual pattern.
-3. One observation worth flagging (trend, pattern, ACWR, baseline gap).
-4. Optional heads-up if a trend needs attention next week.
+Rough order:
+
+1. Recovery read — specific HRV + RHR, 2–3 words on what it means
+   (rising/falling/holding). One line.
+2. Today's session, pulled from the plan and delivered concretely.
+   Include: session type + focus, main lift or main interval with
+   actual sets/reps/target, key assistance work, and duration. If
+   recovery warrants modulation, apply it here and say WHY in plain
+   language ("yellow today — cap squat at RPE 7, drop the top set").
+3. One observation worth flagging if relevant (ACWR, baseline gap,
+   composition imbalance, trend). Skip this line if nothing stands out.
+4. Weather + sun line — peak UV hour and strong-sun window. Even on
+   indoor days mention when to step outside. One line.
 5. Final line: Today's Stoic quote → {stoic_quote}
 
-Tie the Stoic quote to today's context in one brief sentence if it fits
-naturally. Use Dylan's actual numbers, not vague generalities.
+Voice reminders (these come from the system prompt, but worth repeating):
+- Stoic woven into ordinary language, not decorative. Not "embrace the
+  resistance" — instead "the body is asking for X today."
+- Opinions about the data. If yesterday was sloppy or sleep was garbage,
+  say it. Honest, not neutral.
+- Never sound like a motivational poster. Rewrite any line that reads
+  like a fortune cookie.
+- Tie the closing Stoic quote to today's actual context in one short
+  sentence if it fits naturally — don't force it.
 
 Data:
 {data}
