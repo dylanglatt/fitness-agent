@@ -45,3 +45,9 @@ class Config:
 
     # Database
     DB_PATH: str = os.getenv("DB_PATH", "data/fitness_bot.db")
+
+    # Home location (for weather forecast + air quality). Default is
+    # East Village, Manhattan (10009); override per user.
+    HOME_LAT: float = float(os.getenv("HOME_LAT", "0.0"))
+    HOME_LNG: float = float(os.getenv("HOME_LNG", "0.0"))
+    HOME_CITY: str = os.getenv("HOME_CITY", "New York, NY 10009")

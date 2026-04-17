@@ -131,7 +131,8 @@ Generate Dylan's morning brief based on the data below.
 
 The prescription for today should be reasoned from the 7-day picture — not
 just "what did he do yesterday." Look at the TRENDS block, the day-by-day
-table, and the activity composition together before deciding. Specifically:
+table, the activity composition, AND today's weather together before
+deciding. Specifically:
 
 - Today's recovery + HRV + RHR tell you TODAY's readiness.
 - The TRENDS block tells you the DIRECTION things are moving — HRV slope,
@@ -144,6 +145,16 @@ table, and the activity composition together before deciding. Specifically:
   injury risk; well below 1.0 = detraining.
 - If 30-day recovery is meaningfully below the 12-month baseline, surface
   that — it's a real signal, not a footnote.
+- The WEATHER block matters for outdoor runs:
+  * Heat + humidity: if apparent temp ≥ 75°F or humidity ≥ 70%, expect
+    pace to drop ~5–15 sec/mi; reframe "slow run" → "appropriate effort."
+  * UV: UV ≥ 8 (very high/extreme) = push runs before 10am or after 5pm,
+    or lift/train indoors.
+  * AQI: US AQI > 100 (unhealthy for sensitive) = cap intensity, shorten
+    duration, or move indoors. > 150 = strongly recommend indoor.
+  * Precipitation: factor into timing (pick a dry hour) rather than
+    skipping outright.
+  * Wind: > 20mph ruins quality workouts; note it.
 
 Write 4–6 short lines, roughly in this order:
 

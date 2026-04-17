@@ -44,6 +44,7 @@ from ai.prompts import (
 from integrations.strava import StravaClient
 from integrations.whoop import WhoopClient
 from integrations.notion import NotionClient
+from integrations.weather import WeatherClient
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +192,7 @@ class Coach:
         self.strava = StravaClient(config)
         self.whoop = WhoopClient(config)
         self.notion = NotionClient(config)
+        self.weather = WeatherClient(config)
         self.claude = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
         self.model = config.CLAUDE_MODEL
         # Haiku is ~10x cheaper — great for the "is this a lift?" classifier.
@@ -462,6 +464,16 @@ class Coach:
                     f"HRV: {r.get('hrv_rmssd_ms')}ms | "
                     f"RHR: {r.get('resting_hr')} bpm"
                 )
+
+        # ── Weather block (forecast + air quality for home location)
+        try:
+            weather_block = await self.weather.summarize_today()
+        except Exception as e:
+            logger.warning(f"Weather summary failed: {e}")
+            weather_block = ""
+        if weather_block:
+            lines.append("")
+            lines.append(weather_block)
 
         # ── Load everything we need for trends + detail
         daily = await self.db.get_whoop_daily(str(d7), str(today))
