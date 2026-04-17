@@ -129,15 +129,37 @@ parse it as a lift log. Confirm what you logged. Flag PRs. Track progression.
 DAILY_BRIEF_PROMPT = """
 Generate Dylan's morning brief based on the data below.
 
-Format:
-- Line 1: Recovery status with HRV + RHR context (specific numbers)
-- Line 2: Recommended training intent for today (specific — e.g., "easy run under 145 bpm" or "good day to go heavy")
-- Line 3: One notable observation or pattern worth flagging
-- Line 4 (optional): Heads-up based on recent trend
-- Final line: Today's Stoic quote → {stoic_quote}
+The prescription for today should be reasoned from the 7-day picture — not
+just "what did he do yesterday." Look at the TRENDS block, the day-by-day
+table, and the activity composition together before deciding. Specifically:
 
-Tie the Stoic quote to the training context in one brief sentence if it fits naturally.
-Keep the whole brief under 6 lines. Be specific, not generic.
+- Today's recovery + HRV + RHR tell you TODAY's readiness.
+- The TRENDS block tells you the DIRECTION things are moving — HRV slope,
+  recovery slope, 30-day vs baseline. A green score on top of a declining
+  3-day trend is different from a green score on top of a rising trend.
+- The 7-day activity composition tells you what's been UNDER-DONE or
+  OVER-DONE. Five runs and zero lifts is a different prescription than two
+  runs and three lifts, even if yesterday was identical.
+- The acute:chronic strain ratio flags accumulating load. Above 1.5 =
+  injury risk; well below 1.0 = detraining.
+- If 30-day recovery is meaningfully below the 12-month baseline, surface
+  that — it's a real signal, not a footnote.
+
+Write 4–6 short lines, roughly in this order:
+
+1. Recovery status with specific HRV + RHR numbers.
+2. Today's training intent — specific, grounded in the 7-day context.
+   Reference the balance (e.g., "you're 5-run, 1-lift over the last 7 days
+   and recovery is holding — lift today, not run") or the trend ("HRV is
+   trending down 3 days running despite today's green — keep effort
+   conversational"). Avoid the lazy heuristic "you lifted yesterday, so run
+   today" — use the actual pattern.
+3. One observation worth flagging (trend, pattern, ACWR, baseline gap).
+4. Optional heads-up if a trend needs attention next week.
+5. Final line: Today's Stoic quote → {stoic_quote}
+
+Tie the Stoic quote to today's context in one brief sentence if it fits
+naturally. Use Dylan's actual numbers, not vague generalities.
 
 Data:
 {data}

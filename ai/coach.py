@@ -300,21 +300,143 @@ class Coach:
         logger.warning("Claude tool-use loop hit max iterations; returning empty.")
         return "Sorry, I got stuck looking things up. Try asking again."
 
+    # ── Trend helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _mean(vals):
+        vals = [v for v in vals if v is not None]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
+    @staticmethod
+    def _describe_delta(recent, baseline, good_direction: str = "up") -> str:
+        """Return 'rising/stable/declining' label based on recent vs baseline."""
+        if recent is None or baseline is None or baseline == 0:
+            return "n/a"
+        pct = (recent - baseline) / baseline * 100
+        # ±5% = "stable"; bigger moves get a direction.
+        if abs(pct) < 5:
+            return "stable"
+        if pct > 0:
+            return "rising" if good_direction == "up" else "elevated"
+        return "declining" if good_direction == "up" else "lowered"
+
+    def _compute_trend_signals(
+        self,
+        daily_7d: list[dict],
+        agg30: dict,
+        agg365: dict,
+        acts_7d: list[dict],
+        acts_28d: list[dict],
+    ) -> list[str]:
+        """Derive the summary trend lines the model should reason over.
+
+        The daily-brief prompt no longer asks the model to infer trend from
+        the day-by-day table alone — we compute it here and hand it over
+        explicitly, so the model can focus on the coaching decision.
+        """
+        lines: list[str] = []
+        if not daily_7d:
+            return lines
+
+        # daily_7d comes ordered DESC by date. Slice carefully.
+        last3 = daily_7d[:3]
+        prior4 = daily_7d[3:7]
+
+        hrv_recent = self._mean([d.get("hrv_rmssd_ms") for d in last3])
+        hrv_prior = self._mean([d.get("hrv_rmssd_ms") for d in prior4])
+        rec_recent = self._mean([d.get("recovery_score") for d in last3])
+        rec_prior = self._mean([d.get("recovery_score") for d in prior4])
+
+        baseline_hrv = round(agg365.get("avg_hrv") or 0, 1) if agg365 else None
+        baseline_rec = int(agg365.get("avg_recovery") or 0) if agg365 else None
+        avg30_rec = int(agg30.get("avg_recovery") or 0) if agg30 else None
+
+        hrv_slope = self._describe_delta(hrv_recent, hrv_prior)
+        rec_slope = self._describe_delta(rec_recent, rec_prior)
+
+        lines.append(
+            f"HRV trend: last-3d avg {hrv_recent}ms vs prior-4d avg {hrv_prior}ms "
+            f"→ {hrv_slope} (12-mo baseline {baseline_hrv}ms)"
+        )
+        lines.append(
+            f"Recovery trend: last-3d avg {rec_recent}% vs prior-4d avg {rec_prior}% "
+            f"→ {rec_slope} (12-mo baseline {baseline_rec}%)"
+        )
+
+        # Flag when 30d recovery is meaningfully below baseline.
+        if avg30_rec and baseline_rec:
+            gap = baseline_rec - avg30_rec
+            if gap >= 5:
+                lines.append(
+                    f"⚠ 30-day recovery avg ({avg30_rec}%) is {gap} pts below "
+                    f"12-month baseline ({baseline_rec}%) — accumulated fatigue signal."
+                )
+            elif gap <= -5:
+                lines.append(
+                    f"↑ 30-day recovery avg ({avg30_rec}%) is {-gap} pts above "
+                    f"12-month baseline — well-adapted."
+                )
+
+        # Red/green day count in the last 7 days.
+        rec_scores = [d.get("recovery_score") for d in daily_7d if d.get("recovery_score") is not None]
+        if rec_scores:
+            red = sum(1 for r in rec_scores if r < 34)
+            green = sum(1 for r in rec_scores if r > 66)
+            lines.append(
+                f"Last 7 days: {green} green / {len(rec_scores) - green - red} yellow / {red} red recovery days."
+            )
+
+        # 7-day activity composition (Strava sport_type breakdown).
+        if acts_7d:
+            by_sport: dict[str, int] = {}
+            for a in acts_7d:
+                sp = a.get("sport_type") or "Other"
+                by_sport[sp] = by_sport.get(sp, 0) + 1
+            breakdown = ", ".join(f"{v} {k}" for k, v in sorted(by_sport.items(), key=lambda x: -x[1]))
+            rest_days = 7 - len({a.get("date") for a in acts_7d if a.get("date")})
+            lines.append(f"Last 7 days activities: {breakdown} ({rest_days} rest days).")
+
+        # Acute:chronic workload ratio on strain (7d avg / 28d avg).
+        # >1.5 is the conventional injury-risk red zone.
+        strain_7d = self._mean([d.get("strain") for d in daily_7d])
+        strain_28d_vals = [a.get("strain") for a in acts_28d if a.get("strain") is not None]
+        # acts_28d here is actually the 28d whoop rows we pass in; see caller.
+        strain_28d = self._mean(strain_28d_vals) if strain_28d_vals else None
+        if strain_7d and strain_28d and strain_28d > 0:
+            acwr = round(strain_7d / strain_28d, 2)
+            flag = ""
+            if acwr >= 1.5:
+                flag = " ⚠ above injury-risk threshold (>1.5)"
+            elif acwr <= 0.8:
+                flag = " (detraining zone, <0.8)"
+            lines.append(
+                f"Acute:chronic strain ratio (7d/28d): {acwr} "
+                f"[7d avg {strain_7d}, 28d avg {strain_28d}]{flag}"
+            )
+
+        return lines
+
     # ── Layered context builder ─────────────────────────────────────────────
 
     async def _build_layered_context(self) -> str:
         """Assemble a compact, layered view of Dylan's recent state.
 
         Shape:
-          - Today line (if WHOOP has landed today's recovery)
-          - Last 7 days (day-by-day)
-          - Last 30 days (aggregate block)
-          - Last 12 months (baseline line)
+          - TODAY (live WHOOP snapshot)
+          - TRENDS (HRV/recovery slope, baselines, ACWR, activity composition)
+          - LAST 7 DAYS (day-by-day detail)
+          - LAST 30 DAYS / 12-MONTH BASELINE (aggregates)
           - Recent Strava activities (last 14 days)
-          - Recent lifts (last 14 days)
+          - Recent lifts + notes (last 14 days)
+
+        The TRENDS block is the new load-bearing piece: it replaces the
+        old "infer trend from the daily table" work the model used to do
+        implicitly — often poorly. Now the model gets pre-computed slopes
+        and can spend its tokens on the coaching decision.
         """
         today = datetime.now().date()
         d7 = today - timedelta(days=7)
+        d28 = today - timedelta(days=28)
         d30 = today - timedelta(days=30)
         d365 = today - timedelta(days=365)
         d14 = today - timedelta(days=14)
@@ -341,8 +463,22 @@ class Coach:
                     f"RHR: {r.get('resting_hr')} bpm"
                 )
 
-        # ── Last 7 days detail
+        # ── Load everything we need for trends + detail
         daily = await self.db.get_whoop_daily(str(d7), str(today))
+        daily_28 = await self.db.get_whoop_daily(str(d28), str(today))
+        agg30 = await self.db.get_whoop_aggregates(str(d30), str(today))
+        agg365 = await self.db.get_whoop_aggregates(str(d365), str(today))
+        acts_7d = await self.db.get_strava_activities_range(str(d7), str(today))
+
+        # ── TRENDS block (pre-computed so the model doesn't have to infer)
+        trend_lines = self._compute_trend_signals(daily, agg30, agg365, acts_7d, daily_28)
+        if trend_lines:
+            lines.append("")
+            lines.append("TRENDS:")
+            for t in trend_lines:
+                lines.append(f"  {t}")
+
+        # ── Last 7 days detail
         if daily:
             lines.append("")
             lines.append("LAST 7 DAYS (WHOOP):")
@@ -361,7 +497,6 @@ class Coach:
                 lines.append("  " + " | ".join(parts))
 
         # ── Last 30 days aggregate
-        agg30 = await self.db.get_whoop_aggregates(str(d30), str(today))
         if agg30 and agg30.get("days"):
             lines.append("")
             lines.append(
@@ -374,7 +509,6 @@ class Coach:
             )
 
         # ── 12-month baseline
-        agg365 = await self.db.get_whoop_aggregates(str(d365), str(today))
         if agg365 and agg365.get("days"):
             lines.append(
                 f"12-MONTH BASELINE ({agg365['days']} days on record): "

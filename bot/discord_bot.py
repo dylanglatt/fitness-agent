@@ -29,8 +29,36 @@ class FitnessBot(commands.Bot):
 
     async def setup_hook(self):
         await self.db.initialize()
+        self._register_commands()
         self.scheduler.start()
         logger.info("Bot setup complete.")
+
+    def _register_commands(self):
+        """Register prefix commands. Kept minimal — owner-only."""
+
+        @self.command(name="brief", help="Fire the morning brief on demand (owner only).")
+        async def brief_cmd(ctx):
+            if ctx.author.id != self.config.OWNER_USER_ID:
+                return
+            # Pre-sync today's WHOOP data so the brief sees today's row in the
+            # 7-day block, just like the scheduled path does.
+            async with ctx.typing():
+                try:
+                    await self.scheduler._refresh_recent_whoop_into_db(days=2)
+                except Exception as e:
+                    logger.warning(f"Pre-brief refresh failed (non-fatal): {e}")
+                text = await self.coach.daily_brief()
+                await ctx.send(text)
+
+        @self.command(name="context", help="Dump the layered context the coach sees (owner only).")
+        async def context_cmd(ctx):
+            if ctx.author.id != self.config.OWNER_USER_ID:
+                return
+            async with ctx.typing():
+                text = await self.coach._build_layered_context()
+                # Discord messages cap at 2000 chars — chunk if needed.
+                for i in range(0, len(text), 1900):
+                    await ctx.send(f"```\n{text[i:i+1900]}\n```")
 
     async def on_ready(self):
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")

@@ -3,6 +3,19 @@ Scheduler — sends the daily morning brief, weekly training summary,
 and Sunday Stoic reflection automatically. Also runs a nightly incremental
 sync of WHOOP + Strava so the SQLite history stays current without a manual
 re-run of sync_history.py.
+
+Daily-brief trigger (why this is more complex than a cron):
+The brief used to fire at a fixed 7:30 AM local time. The problem: if Dylan
+hadn't yet synced his WHOOP (phone still charging, watch mid-sync, etc.),
+the "today" snapshot silently returned yesterday's recovery. The brief came
+out with stale numbers and stale advice.
+
+New behavior: inside a poll window (default 05:30–10:00 local), check every
+10 minutes whether WHOOP has posted a recovery record dated today. The first
+time we see one, fire the brief. If we hit the backstop time (10:00) without
+seeing a fresh record, fire anyway with whatever's available — better a
+slightly-stale brief than no brief. "Fired today" state is in-memory and
+resets at local midnight.
 """
 
 import logging
@@ -13,6 +26,11 @@ from discord.ext import tasks
 logger = logging.getLogger(__name__)
 
 
+def _parse_hhmm(s: str) -> tuple[int, int]:
+    hh, mm = s.split(":")
+    return int(hh), int(mm)
+
+
 class Scheduler:
     def __init__(self, bot, config, coach):
         self.bot = bot
@@ -20,22 +38,36 @@ class Scheduler:
         self.coach = coach
         self.tz = pytz.timezone(config.TIMEZONE)
 
-        # Parse configured time
-        hour, minute = map(int, config.DAILY_BRIEF_TIME.split(":"))
-        self.brief_hour = hour
-        self.brief_minute = minute
+        # Poll-window bounds for the morning brief.
+        self.poll_start_h, self.poll_start_m = _parse_hhmm(config.DAILY_BRIEF_POLL_START)
+        self.backstop_h, self.backstop_m = _parse_hhmm(config.DAILY_BRIEF_BACKSTOP)
+
+        # In-memory "did the brief fire today?" state. Keyed by local date.
+        self._brief_fired_on: str | None = None  # ISO date string, or None
+        # Throttle the WHOOP check to once every N minutes (we're called every
+        # minute by the loop; no need to hit WHOOP that often).
+        self._last_whoop_check: datetime | None = None
 
     def start(self):
         self.check_scheduled_tasks.start()
-        logger.info(f"Scheduler started. Daily brief at {self.config.DAILY_BRIEF_TIME} {self.config.TIMEZONE}")
+        logger.info(
+            "Scheduler started. Morning brief window: "
+            f"{self.config.DAILY_BRIEF_POLL_START}–{self.config.DAILY_BRIEF_BACKSTOP} "
+            f"{self.config.TIMEZONE}"
+        )
 
     @tasks.loop(minutes=1)
     async def check_scheduled_tasks(self):
         now = datetime.now(self.tz)
+        today_iso = now.date().isoformat()
 
-        # Daily morning brief
-        if now.hour == self.brief_hour and now.minute == self.brief_minute:
-            await self._send_daily_brief()
+        # Reset the "fired today" flag on day rollover.
+        if self._brief_fired_on and self._brief_fired_on != today_iso:
+            self._brief_fired_on = None
+
+        # ── Daily morning brief — data-driven window ───────────────────────
+        if self._brief_fired_on != today_iso:
+            await self._maybe_fire_daily_brief(now, today_iso)
 
         # Weekly training summary — Sundays at 7:00pm
         if now.weekday() == 6 and now.hour == 19 and now.minute == 0:
@@ -45,19 +77,113 @@ class Scheduler:
         if now.weekday() == 6 and now.hour == 20 and now.minute == 30:
             await self._send_stoic_reflection()
 
-        # Nightly incremental sync — 3:05 AM local (after WHOOP usually finishes
-        # scoring the previous night's sleep, before the morning brief at 7:30).
+        # Nightly incremental sync — 3:05 AM local
         if now.hour == 3 and now.minute == 5:
             await self._nightly_sync()
 
-    async def _send_daily_brief(self):
+    async def _maybe_fire_daily_brief(self, now: datetime, today_iso: str):
+        """Decide whether to fire today's brief.
+
+        Three gates:
+          1. Before poll-start → no-op.
+          2. Inside window: every ~10 min, check WHOOP for a record dated
+             today. If present → fire. If absent → wait.
+          3. At/past backstop → fire regardless of WHOOP state.
+        """
+        start_min = self.poll_start_h * 60 + self.poll_start_m
+        back_min = self.backstop_h * 60 + self.backstop_m
+        now_min = now.hour * 60 + now.minute
+
+        if now_min < start_min:
+            return  # too early
+
+        if now_min >= back_min:
+            logger.info("Backstop time reached without fresh WHOOP record — firing brief anyway.")
+            await self._send_daily_brief(reason="backstop")
+            self._brief_fired_on = today_iso
+            return
+
+        # Inside the poll window. Throttle the WHOOP check.
+        if self._last_whoop_check is not None:
+            since = (now - self._last_whoop_check).total_seconds()
+            if since < 600:  # 10 minutes
+                return
+        self._last_whoop_check = now
+
+        try:
+            fresh = await self._whoop_has_today_recovery(now)
+        except Exception as e:
+            logger.warning(f"WHOOP freshness check failed: {e}")
+            fresh = False
+
+        if fresh:
+            logger.info("Fresh WHOOP recovery detected for today — firing brief.")
+            await self._send_daily_brief(reason="fresh-whoop")
+            self._brief_fired_on = today_iso
+
+    async def _whoop_has_today_recovery(self, now_local: datetime) -> bool:
+        """Ask WHOOP whether a recovery record for today's local date exists yet.
+
+        WHOOP returns recoveries timestamped in UTC. A recovery calculated
+        from a sleep that ended this morning will have `created_at` within
+        the last few hours. We consider it "today's" if its timestamp,
+        converted to local tz, falls on today's local date.
+        """
+        records = await self.coach.whoop.get_recovery(days=1)
+        if not records:
+            return False
+        today = now_local.date()
+        for rec in records:
+            ts = rec.get("created_at") or rec.get("updated_at")
+            if not ts:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                local_date = dt.astimezone(self.tz).date()
+            except Exception:
+                continue
+            if local_date == today:
+                return True
+        return False
+
+    async def _send_daily_brief(self, reason: str = ""):
         channel = self.bot.get_channel(self.config.DISCORD_CHANNEL_DAILY)
         if not channel:
             logger.warning("Daily channel not found.")
             return
-        logger.info("Sending daily brief...")
+        logger.info(f"Sending daily brief (reason={reason})...")
+        # Upsert today (and yesterday, for safety) into SQLite so the 7-day
+        # block in the context actually shows today as a row, not a gap.
+        try:
+            await self._refresh_recent_whoop_into_db(days=2)
+        except Exception as e:
+            logger.warning(f"Pre-brief WHOOP refresh failed (non-fatal): {e}")
         brief = await self.coach.daily_brief()
         await channel.send(brief)
+
+    async def _refresh_recent_whoop_into_db(self, days: int = 2):
+        """Quick upsert of the last N days of WHOOP data into SQLite.
+
+        Same code path as the nightly sync, just a tighter window. Runs in a
+        couple of seconds. Makes today's row available in the 7-day block
+        rather than relying on the live snapshot alone.
+        """
+        whoop = self.coach.whoop
+        db = self.coach.db
+        start = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00.000Z")
+        end = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        async for rec in whoop.iter_all_recovery(start=start, end=end):
+            date, row = whoop.normalize_recovery(rec)
+            if date:
+                await db.upsert_whoop_recovery(date, row, rec)
+        async for rec in whoop.iter_all_sleep(start=start, end=end):
+            date, row = whoop.normalize_sleep(rec)
+            if date:
+                await db.upsert_whoop_sleep(date, row, rec)
+        async for rec in whoop.iter_all_cycles(start=start, end=end):
+            date, row = whoop.normalize_cycle(rec)
+            if date:
+                await db.upsert_whoop_cycle(date, row, rec)
 
     async def _send_weekly_summary(self):
         channel = self.bot.get_channel(self.config.DISCORD_CHANNEL_DAILY)
