@@ -203,6 +203,8 @@ class WeatherClient:
         )
 
         daily = fc.get("daily") or {}
+        sunrise = ""
+        sunset = ""
         if daily.get("time"):
             hi = daily["temperature_2m_max"][0]
             lo = daily["temperature_2m_min"][0]
@@ -220,9 +222,54 @@ class WeatherClient:
                 f"| sunrise {sunrise} / sunset {sunset}"
             )
 
-        # Sparse hourly strip at training-relevant hours.
+        # ── SUN block ────────────────────────────────────────────────────
+        # Dylan loves the sun — surface the peak-UV hour, the high-UV
+        # "strong-sun" window (UV ≥ 6), and meaningful-sun bookends
+        # (UV ≥ 3) as peak-seeking info, not avoidance. Also emit a
+        # compact hourly UV curve so the coach can pick a precise window.
         hourly = fc.get("hourly") or {}
         times = hourly.get("time") or []
+        uvs = hourly.get("uv_index") or []
+        hour_uv: list[tuple[int, float]] = []
+        for t, uv in zip(times, uvs):
+            if uv is None:
+                continue
+            try:
+                hh = int(t.split("T")[1][:2])
+            except Exception:
+                continue
+            hour_uv.append((hh, uv))
+
+        if hour_uv:
+            sun_parts: list[str] = []
+            peak_hh, peak_uv = max(hour_uv, key=lambda x: x[1])
+            sun_parts.append(
+                f"peak UV {peak_uv} ({_uv_category(peak_uv)}) at {peak_hh:02d}:00"
+            )
+            high_hours = [hh for hh, uv in hour_uv if uv >= 6]
+            if high_hours:
+                sun_parts.append(
+                    f"strong-sun window {min(high_hours):02d}:00–{max(high_hours)+1:02d}:00 (UV ≥ 6)"
+                )
+            else:
+                sun_parts.append("no UV ≥ 6 hours today (weaker-sun day)")
+            any_hours = [hh for hh, uv in hour_uv if uv >= 3]
+            if any_hours:
+                sun_parts.append(
+                    f"UV ≥ 3 from {min(any_hours):02d}:00 to {max(any_hours)+1:02d}:00"
+                )
+            lines.append(f"  Sun: {' | '.join(sun_parts)}")
+            curve = " ".join(
+                f"{hh:02d}={uv}"
+                for hh, uv in sorted(hour_uv)
+                if 6 <= hh <= 20
+            )
+            if curve:
+                lines.append(f"  UV curve (06–20): {curve}")
+            if sunrise and sunset:
+                lines.append(f"  Daylight: sunrise {sunrise} → sunset {sunset}")
+
+        # Sparse hourly strip at training-relevant hours.
         target_hours = [6, 9, 12, 15, 18, 21]
         strip = []
         for i, t in enumerate(times):
