@@ -1,0 +1,51 @@
+name: Deploy to Digital Ocean
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: REDACTED_HOST
+          username: root
+          key: ${{ secrets.DO_SSH_KEY }}
+          script: |
+            set -e
+
+            cd ~/fitness-bot
+
+            # Defensive backup of .env in case anything ever touches it
+            # (git reset --hard won't touch gitignored files, but belt + suspenders)
+            cp .env /tmp/fitness_bot_env_backup 2>/dev/null || true
+
+            git fetch origin
+            git reset --hard origin/main
+
+            # Restore .env if it somehow got removed
+            if [ ! -f .env ] && [ -f /tmp/fitness_bot_env_backup ]; then
+              cp /tmp/fitness_bot_env_backup .env
+            fi
+
+            # Ensure venv exists
+            if [ ! -d venv ]; then
+              python3 -m venv venv
+            fi
+
+            # Install / update dependencies
+            ./venv/bin/pip install --quiet --upgrade pip
+            ./venv/bin/pip install --quiet -r requirements.txt
+
+            # Restart the bot via systemd
+            systemctl restart fitness-bot
+            sleep 2
+            systemctl is-active --quiet fitness-bot && echo "✅ Deploy successful — fitness-bot is running" || {
+              echo "❌ fitness-bot failed to start — recent logs:"
+              journalctl -u fitness-bot -n 30 --no-pager
+              exit 1
+            }
