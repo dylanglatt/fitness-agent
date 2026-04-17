@@ -64,10 +64,10 @@ class FitnessBot(commands.Bot):
             name="plan",
             help=(
                 "Show the active training plan. "
-                "Usage: !plan | !plan today | !plan week | !plan <day>"
+                "Usage: !plan (today) | !plan week | !plan full | !plan <day>"
             ),
         )
-        async def plan_cmd(ctx, arg: str = "full"):
+        async def plan_cmd(ctx, arg: str = "today"):
             if ctx.author.id != self.config.OWNER_USER_ID:
                 return
             plan = await self.db.get_active_plan()
@@ -76,7 +76,7 @@ class FitnessBot(commands.Bot):
                                "seeds a default on init. Check logs.)")
                 return
 
-            arg = (arg or "full").strip().lower()
+            arg = (arg or "today").strip().lower()
             days_order = [
                 "monday", "tuesday", "wednesday", "thursday",
                 "friday", "saturday", "sunday",
@@ -84,19 +84,20 @@ class FitnessBot(commands.Bot):
             tz = pytz.timezone(self.config.TIMEZONE)
             today_name = datetime.now(tz).strftime("%A").lower()
 
-            def fmt_day(name: str, sess: dict) -> str:
+            def fmt_day(name: str, sess: dict, include_notes: bool = True) -> str:
                 stype = sess.get("session_type", "?").upper()
                 focus = sess.get("focus", "")
                 presc = sess.get("prescription", "")
                 notes = sess.get("notes", "")
                 marker = "  ← today" if name == today_name else ""
                 out = f"**{name.title()}**{marker} — {stype} / {focus}\n{presc}"
-                if notes:
+                if include_notes and notes:
                     out += f"\n_{notes}_"
                 return out
 
             tpl = plan.get("weekly_template") or {}
 
+            # Default (no args) — today only. Keeps the chat lightweight.
             if arg == "today":
                 sess = tpl.get(today_name)
                 if not sess:
@@ -126,16 +127,24 @@ class FitnessBot(commands.Bot):
                 await ctx.send(msg[:1990])
                 return
 
-            # Default: full plan, chunked because it's long
-            header = (
-                f"**{plan['name']}**\n"
-                f"_{plan.get('goal', '')}_\n"
-                f"{plan.get('notes', '')}\n\n"
+            # Explicit: !plan full — each day as one compact line, no notes.
+            if arg == "full":
+                lines = [f"**{plan['name']}** — {plan.get('goal', '')}", ""]
+                for day in days_order:
+                    sess = tpl.get(day)
+                    if not sess:
+                        continue
+                    lines.append(fmt_day(day, sess, include_notes=False))
+                    lines.append("")
+                full = "\n".join(lines).strip()
+                for i in range(0, len(full), 1900):
+                    await ctx.send(full[i:i+1900])
+                return
+
+            await ctx.send(
+                "Unknown arg. Usage: `!plan` (today), `!plan week`, "
+                "`!plan full`, or `!plan <monday..sunday>`."
             )
-            body_parts = [fmt_day(d, tpl[d]) for d in days_order if d in tpl]
-            full = header + "\n\n".join(body_parts)
-            for i in range(0, len(full), 1900):
-                await ctx.send(full[i:i+1900])
 
     async def on_ready(self):
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
