@@ -90,6 +90,21 @@ _LIFT_HINT = re.compile(
 )
 
 
+# ── Regex — does this message plausibly describe a recovery session? ────────
+# sauna, steam, cold plunge, ice bath, contrast bath, cryo, sensory-dep.
+_RECOVERY_HINT = re.compile(
+    r"\b("
+    r"sauna|"
+    r"steam\s*room|steamroom|"
+    r"cold\s*plunge|cold[-\s]?tub|ice\s*bath|plunge|"
+    r"contrast\s*(bath|therapy)|"
+    r"cryo(therapy)?|cryo\s*chamber|"
+    r"hot\s*tub|jacuzzi"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
 # ── Claude tools — what the coach can query on demand ───────────────────────
 
 TOOLS = [
@@ -597,6 +612,26 @@ class Coach:
             lines.append("RECENT LIFTS (self-reported, last 14 days):")
             for l in lifts[:15]:
                 lines.append(f"  - {l['date']} | {l['exercise']} | {l['details']}")
+
+        # ── Recovery sessions (sauna / plunge / etc.) — last 14 days
+        try:
+            recovery_sessions = await self.db.get_recent_recovery_sessions(days=14)
+        except Exception as e:
+            logger.debug(f"Could not load recovery sessions: {e}")
+            recovery_sessions = []
+        if recovery_sessions:
+            lines.append("")
+            lines.append("RECENT RECOVERY SESSIONS (self-reported, last 14 days):")
+            for r in recovery_sessions[:20]:
+                parts = [r["date"], r["session_type"]]
+                if r.get("duration_min") is not None:
+                    parts.append(f"{r['duration_min']:g} min")
+                if r.get("temp_f") is not None:
+                    parts.append(f"{r['temp_f']:g}°F")
+                if r.get("notes"):
+                    parts.append(r["notes"])
+                lines.append("  - " + " | ".join(str(p) for p in parts))
+
         if notes:
             lines.append("")
             lines.append("RECENT NOTES (last 14 days):")
@@ -688,6 +723,19 @@ class Coach:
             except Exception:
                 pass
 
+        # Recovery session logging runs independently — a single message can
+        # describe both a lift AND a post-lift sauna.
+        recovery = await self._try_parse_recovery_session(message)
+        if recovery:
+            await self.db.log_recovery_session(
+                date=datetime.now().strftime("%Y-%m-%d"),
+                session_type=recovery["session_type"],
+                duration_min=recovery.get("duration_min"),
+                temp_f=recovery.get("temp_f"),
+                notes=recovery.get("notes", ""),
+                raw=message,
+            )
+
         context = await self._build_layered_context()
         knowledge = self._retrieve_knowledge(message)
         prompt = CHAT_PROMPT.format(
@@ -729,4 +777,52 @@ If not: {{"is_lift": false}}
                 return {"exercise": data["exercise"], "details": data["details"]}
         except Exception as e:
             logger.debug(f"Lift parse failed: {e}")
+        return None
+
+    # ── Recovery-session parsing (sauna / cold plunge / etc.) ───────────────
+
+    async def _try_parse_recovery_session(self, message: str) -> dict | None:
+        """Fast pre-filter: skip the model unless the message mentions a
+        known recovery modality. Parses duration (min) and temp (°F).
+        """
+        if not _RECOVERY_HINT.search(message):
+            return None
+
+        parse_prompt = f"""
+Does this message describe a completed recovery session (sauna, steam room,
+cold plunge, ice bath, contrast bath, cryo)? If yes, extract:
+- session_type: one of "sauna", "steam_room", "cold_plunge", "ice_bath",
+  "contrast", "cryo", "hot_tub" (pick the closest match)
+- duration_min: minutes as a number, or null if not stated
+- temp_f: temperature in degrees Fahrenheit as a number. Convert from Celsius
+  if the user gave °C. null if not stated.
+- notes: short free-text detail worth keeping (e.g. "post-lift", "after run",
+  "2 rounds"), else empty string.
+
+Message: "{message}"
+
+Respond with JSON only.
+If it's a session: {{"is_session": true, "session_type": "...", "duration_min": <number or null>, "temp_f": <number or null>, "notes": "..."}}
+If not (e.g. "headed to the sauna later" — no completion, no data): {{"is_session": false}}
+""".strip()
+
+        try:
+            resp = await self.claude.messages.create(
+                model=self.cheap_model,  # Haiku — cheap classifier
+                max_tokens=250,
+                messages=[{"role": "user", "content": parse_prompt}],
+            )
+            raw = resp.content[0].text
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            data = json.loads(raw[start:end])
+            if data.get("is_session"):
+                return {
+                    "session_type": data.get("session_type") or "sauna",
+                    "duration_min": data.get("duration_min"),
+                    "temp_f": data.get("temp_f"),
+                    "notes": data.get("notes", "") or "",
+                }
+        except Exception as e:
+            logger.debug(f"Recovery-session parse failed: {e}")
         return None

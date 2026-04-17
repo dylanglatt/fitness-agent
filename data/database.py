@@ -155,6 +155,27 @@ class Database:
                     activated_at TEXT DEFAULT (datetime('now'))
                 )
             """)
+            # recovery_sessions: sauna, steam room, cold plunge, ice bath,
+            # contrast, cryo. Duration in minutes, temp in Fahrenheit (Dylan's
+            # unit preference). session_type is free-form enough to handle
+            # new modalities but the regex pre-filter & Haiku parser in
+            # ai/coach.py try to normalize to a small set.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS recovery_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    session_type TEXT NOT NULL,
+                    duration_min REAL,
+                    temp_f REAL,
+                    notes TEXT DEFAULT '',
+                    raw_message TEXT,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_recovery_sessions_date "
+                "ON recovery_sessions(date)"
+            )
             await db.commit()
         # Seed a default balanced-concurrent plan if no plan exists yet.
         await self._seed_default_plan_if_empty()
@@ -757,3 +778,44 @@ class Database:
             activate=True,
         )
         logger.info("Seeded default 'Balanced concurrent' training plan.")
+
+    # ── Recovery sessions (sauna / steam / cold plunge / etc.) ──────────────
+
+    async def log_recovery_session(
+        self,
+        date: str,
+        session_type: str,
+        duration_min: Optional[float] = None,
+        temp_f: Optional[float] = None,
+        notes: str = "",
+        raw: str = "",
+    ) -> int:
+        """Insert a recovery session (sauna, cold plunge, etc.)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "INSERT INTO recovery_sessions "
+                "(date, session_type, duration_min, temp_f, notes, raw_message) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (date, session_type, duration_min, temp_f, notes, raw),
+            )
+            rec_id = cursor.lastrowid
+            await db.commit()
+        bits = [session_type]
+        if duration_min is not None:
+            bits.append(f"{duration_min}min")
+        if temp_f is not None:
+            bits.append(f"{temp_f}°F")
+        logger.info(f"Recovery session logged: {' | '.join(bits)}")
+        return rec_id
+
+    async def get_recent_recovery_sessions(self, days: int = 14) -> list[dict]:
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT date, session_type, duration_min, temp_f, notes "
+                "FROM recovery_sessions WHERE date >= ? ORDER BY date DESC, id DESC",
+                (since,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
