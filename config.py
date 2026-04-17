@@ -14,6 +14,9 @@ class Config:
     DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
     DISCORD_CHANNEL_DAILY: int = int(os.getenv("DISCORD_CHANNEL_DAILY", "0"))
     DISCORD_CHANNEL_TRAINING: int = int(os.getenv("DISCORD_CHANNEL_TRAINING", "0"))
+    # Optional: if set, slash commands sync to this single guild (instant).
+    # If 0/unset, sync is global and can take up to an hour to propagate.
+    DISCORD_GUILD_ID: int = int(os.getenv("DISCORD_GUILD_ID", "0"))
 
     # Strava
     STRAVA_CLIENT_ID: str = os.getenv("STRAVA_CLIENT_ID", "")

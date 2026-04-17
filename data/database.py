@@ -176,6 +176,46 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_recovery_sessions_date "
                 "ON recovery_sessions(date)"
             )
+            # goals: user-set training targets. Intentionally schema-light —
+            # goal_type drives how compute_goal_progress reads the underlying
+            # tables. metadata is JSON for type-specific extras (e.g. the
+            # exercise name for strength goals, HR anchor for pace goals).
+            # status: 'active' | 'completed' | 'abandoned' | 'paused'.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS goals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    goal_type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    target_value REAL,
+                    target_unit TEXT DEFAULT '',
+                    baseline_value REAL,
+                    baseline_date TEXT,
+                    deadline TEXT,
+                    metadata TEXT DEFAULT '{}',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    note TEXT DEFAULT '',
+                    created_at TEXT DEFAULT (datetime('now')),
+                    retired_at TEXT
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status)"
+            )
+            # whoop_body_measurements: WHOOP's /v2/user/measurement/body only
+            # returns a single latest value, so we snapshot it each time we
+            # fetch. Over time these rows give us a weight trend the app UI
+            # doesn't expose via API. BF% / lean mass are NOT in the v2 API —
+            # they need a separate pipeline (FitDays → Apple Health → webhook).
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS whoop_body_measurements (
+                    date TEXT PRIMARY KEY,
+                    weight_kg REAL,
+                    height_m REAL,
+                    max_hr REAL,
+                    raw_json TEXT,
+                    updated_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
             await db.commit()
         # Seed a default balanced-concurrent plan if no plan exists yet.
         await self._seed_default_plan_if_empty()
@@ -819,3 +859,317 @@ class Database:
             ) as cursor:
                 rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    # ── Goals ───────────────────────────────────────────────────────────────
+    #
+    # One row per goal. goal_type tells compute_goal_progress where to read
+    # the "current value" from:
+    #   weight   → WHOOP /v2/user/measurement/body (latest only)
+    #   strength → lifts table, filtered by metadata.exercise
+    #   pace     → strava_activities (running pace)
+    #   bf       → external (FitDays → Apple Health → webhook) — no auto source
+    #   habit    → active-day count over a trailing window
+    # metadata is a JSON blob for type-specific extras (exercise name, HR
+    # anchor, etc.). Kept loose so new goal types can bolt on without schema
+    # churn.
+
+    async def create_goal(
+        self,
+        goal_type: str,
+        title: str,
+        target_value: Optional[float] = None,
+        target_unit: str = "",
+        baseline_value: Optional[float] = None,
+        baseline_date: Optional[str] = None,
+        deadline: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> int:
+        meta_json = json.dumps(metadata or {})
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO goals
+                    (goal_type, title, target_value, target_unit, baseline_value,
+                     baseline_date, deadline, metadata, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                """,
+                (
+                    goal_type,
+                    title,
+                    target_value,
+                    target_unit or "",
+                    baseline_value,
+                    baseline_date,
+                    deadline,
+                    meta_json,
+                ),
+            )
+            goal_id = cursor.lastrowid
+            await db.commit()
+        logger.info(f"Goal created: #{goal_id} {goal_type} — {title}")
+        return goal_id
+
+    async def list_goals(self, status: Optional[str] = None) -> list[dict]:
+        """List goals. status=None returns all; 'active' returns only active."""
+        query = "SELECT * FROM goals"
+        params: list = []
+        if status:
+            query += " WHERE status = ?"
+            params.append(status)
+        query += " ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, created_at DESC"
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+        out: list[dict] = []
+        for r in rows:
+            g = dict(r)
+            try:
+                g["metadata"] = json.loads(g.get("metadata") or "{}")
+            except Exception:
+                g["metadata"] = {}
+            out.append(g)
+        return out
+
+    async def get_goal(self, goal_id: int) -> Optional[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM goals WHERE id = ?", (goal_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+        if not row:
+            return None
+        g = dict(row)
+        try:
+            g["metadata"] = json.loads(g.get("metadata") or "{}")
+        except Exception:
+            g["metadata"] = {}
+        return g
+
+    async def update_goal_status(
+        self, goal_id: int, status: str, note: str = ""
+    ) -> bool:
+        """Mark a goal completed / abandoned / paused / active. Returns False if no such id."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT id FROM goals WHERE id = ?", (goal_id,)
+            ) as cursor:
+                exists = await cursor.fetchone()
+            if not exists:
+                return False
+            # retired_at marks the last state-change into a terminal state;
+            # reactivating clears it.
+            retired_expr = (
+                "datetime('now')" if status != "active" else "NULL"
+            )
+            await db.execute(
+                f"UPDATE goals SET status = ?, note = ?, retired_at = {retired_expr} "
+                f"WHERE id = ?",
+                (status, note, goal_id),
+            )
+            await db.commit()
+        logger.info(f"Goal #{goal_id} → {status}")
+        return True
+
+    async def compute_goal_progress(self, goal: dict, coach=None) -> dict:
+        """Compute live progress for a goal.
+
+        Returns dict with keys: current_value, pct_done, eta, note.
+        Any may be None when the data source is missing or ambiguous.
+        """
+        result: dict = {
+            "current_value": None,
+            "pct_done": None,
+            "eta": None,
+            "note": "",
+        }
+        gtype = (goal.get("goal_type") or "").lower()
+        target = goal.get("target_value")
+        baseline = goal.get("baseline_value")
+        baseline_date = goal.get("baseline_date")
+        deadline = goal.get("deadline")
+        metadata = goal.get("metadata") or {}
+
+        def _project_eta(
+            current: float, start: float, target_v: float, start_date: str
+        ) -> Optional[str]:
+            """Linear projection of ETA given progress so far."""
+            try:
+                bd = datetime.strptime(start_date, "%Y-%m-%d").date()
+            except Exception:
+                return None
+            elapsed = (datetime.now().date() - bd).days
+            if elapsed <= 0 or current == start or target_v == start:
+                return None
+            progress_per_day = (current - start) / elapsed
+            if progress_per_day == 0:
+                return None
+            remaining_units = target_v - current
+            # Only project if we're moving in the right direction.
+            needed_sign = 1 if target_v > current else -1
+            if (progress_per_day > 0) != (needed_sign > 0):
+                return None
+            days_needed = remaining_units / progress_per_day
+            if days_needed < 0 or days_needed > 365 * 3:
+                return None
+            eta_date = datetime.now().date() + timedelta(days=int(days_needed))
+            return eta_date.isoformat()
+
+        # ── Weight: pull latest from WHOOP ──────────────────────────────────
+        if gtype == "weight":
+            body = None
+            if coach is not None:
+                try:
+                    body = await coach.whoop.get_body_measurement()
+                except Exception as e:
+                    logger.info(f"WHOOP body fetch failed in goal progress: {e}")
+            if body and body.get("weight_kilogram"):
+                current_lb = round(body["weight_kilogram"] * 2.20462, 1)
+                result["current_value"] = current_lb
+                # Also persist the snapshot so weight has a history.
+                try:
+                    await self.upsert_whoop_body_measurement(body)
+                except Exception as e:
+                    logger.debug(f"Body measurement upsert failed: {e}")
+                if baseline is not None and target is not None and baseline != target:
+                    total = abs(baseline - target)
+                    done = abs(baseline - current_lb)
+                    pct = round(max(0, min(100, (done / total) * 100)), 1) if total else 0
+                    result["pct_done"] = pct
+                    if baseline_date:
+                        result["eta"] = _project_eta(current_lb, baseline, target, baseline_date)
+            else:
+                result["note"] = (
+                    "No current weight from WHOOP. Step on the scale (FitDays syncs to WHOOP) "
+                    "or manually enter one."
+                )
+
+        # ── Strength: pull latest lift for the exercise ─────────────────────
+        elif gtype == "strength":
+            exercise = metadata.get("exercise") or ""
+            if not exercise:
+                result["note"] = "Strength goal has no exercise in metadata."
+            else:
+                rows = await self.get_lifts_for_exercise(exercise, limit=1)
+                if rows:
+                    # current_value is free-form because lift details are
+                    # free-form; user can refine if they want a numeric track.
+                    result["current_value"] = rows[0]["details"]
+                    result["note"] = f"Most recent {exercise}: {rows[0]['date']}"
+                else:
+                    result["note"] = f"No lifts logged for {exercise} yet."
+
+        # ── Pace: avg run pace over trailing 30d ────────────────────────────
+        elif gtype == "pace":
+            today = datetime.now().date()
+            d30 = (today - timedelta(days=30)).isoformat()
+            rows = await self.get_strava_activities_range(d30, today.isoformat(), sport_type="Run")
+            paces_sec = [
+                1609.344 / r["average_speed_mps"]
+                for r in rows
+                if (r.get("average_speed_mps") or 0) > 0
+            ]
+            if paces_sec:
+                avg_sec = sum(paces_sec) / len(paces_sec)
+                m, s = divmod(int(avg_sec), 60)
+                result["current_value"] = f"{m}:{s:02d}/mi"
+                result["note"] = (
+                    f"30d avg run pace across {len(paces_sec)} runs. "
+                    "For a cleaner signal anchor to a specific HR (e.g. Z2 at 145 bpm)."
+                )
+            else:
+                result["note"] = "No runs logged in the last 30 days."
+
+        # ── BF%: no API source ──────────────────────────────────────────────
+        elif gtype == "bf":
+            result["note"] = (
+                "BF% has no WHOOP API source — FitDays/Apple Health webhook or manual "
+                "entry needed. Baseline and target are held; current value is user-supplied."
+            )
+
+        # ── Habit: active days in trailing 7 ────────────────────────────────
+        elif gtype == "habit":
+            today = datetime.now().date()
+            d7 = (today - timedelta(days=7)).isoformat()
+            async with aiosqlite.connect(self.db_path) as db:
+                async with db.execute(
+                    "SELECT DISTINCT date FROM strava_activities WHERE date >= ?",
+                    (d7,),
+                ) as cur:
+                    strava_days = {r[0] for r in await cur.fetchall()}
+                async with db.execute(
+                    "SELECT DISTINCT date FROM lifts WHERE date >= ?",
+                    (d7,),
+                ) as cur:
+                    lift_days = {r[0] for r in await cur.fetchall()}
+            active = len(strava_days | lift_days)
+            result["current_value"] = active
+            if target and target > 0:
+                result["pct_done"] = round(min(100, (active / target) * 100), 1)
+            result["note"] = "Active days = day with a Strava activity or a logged lift."
+
+        else:
+            result["note"] = f"Unknown goal_type '{gtype}' — progress not computed."
+
+        # Deadline-aware note
+        if deadline:
+            try:
+                dl = datetime.strptime(deadline, "%Y-%m-%d").date()
+                days_left = (dl - datetime.now().date()).days
+                tail = (
+                    f" | {days_left} days to deadline ({deadline})"
+                    if days_left >= 0
+                    else f" | past deadline by {-days_left} days"
+                )
+                result["note"] = (result["note"] or "") + tail
+            except Exception:
+                pass
+
+        return result
+
+    # ── WHOOP body measurement snapshot ─────────────────────────────────────
+
+    async def upsert_whoop_body_measurement(self, body: dict) -> None:
+        """Snapshot today's WHOOP body measurement (weight/height/maxHR).
+
+        The v2 endpoint only returns the latest value, so the only way to
+        build a weight trend is to stamp it whenever we fetch.
+        """
+        if not body:
+            return
+        today_iso = datetime.now().strftime("%Y-%m-%d")
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO whoop_body_measurements
+                    (date, weight_kg, height_m, max_hr, raw_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(date) DO UPDATE SET
+                    weight_kg=excluded.weight_kg,
+                    height_m=excluded.height_m,
+                    max_hr=excluded.max_hr,
+                    raw_json=excluded.raw_json,
+                    updated_at=datetime('now')
+                """,
+                (
+                    today_iso,
+                    body.get("weight_kilogram"),
+                    body.get("height_meter"),
+                    body.get("max_heart_rate"),
+                    json.dumps(body),
+                ),
+            )
+            await db.commit()
+
+    async def get_body_measurement_history(self, days: int = 90) -> list[dict]:
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT date, weight_kg, height_m, max_hr FROM whoop_body_measurements "
+                "WHERE date >= ? ORDER BY date DESC",
+                (since,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(r) for r in rows]

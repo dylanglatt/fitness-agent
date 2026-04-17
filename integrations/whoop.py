@@ -134,6 +134,26 @@ class WhoopClient:
             resp.raise_for_status()
             return resp.json().get("records", [])
 
+    async def get_body_measurement(self) -> Optional[dict]:
+        """Fetch the user's body measurement (height_meter, weight_kilogram, max_heart_rate).
+
+        The v2 API only exposes a single latest value — there is no history
+        endpoint, and BF%/lean mass are NOT returned. Third-party scales
+        (FitDays etc.) update the app UI but NOT the API payload. Returns
+        None on 404 or if the payload is empty.
+        """
+        await self._ensure_token()
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"{WHOOP_BASE}/v2/user/measurement/body",
+                headers=self._headers(),
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+        return data or None
+
     async def get_today_snapshot(self) -> dict:
         """Get today's recovery, sleep, and strain as a single dict."""
         recovery = await self.get_recovery(days=1)

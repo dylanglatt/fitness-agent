@@ -698,6 +698,38 @@ class Coach:
         prompt = SUNDAY_REFLECTION_PROMPT.format(data=context)
         return await self._ask_claude(prompt, allow_tools=True, max_tokens=1200)
 
+    async def recommend_workout(self) -> str:
+        """Prescribe today's session, modulated by recovery + training load.
+
+        This isn't a freeform "give me a workout" — it reads the active plan's
+        session for today and dials intensity up/down based on recovery, ACWR,
+        and recent sleep. If recovery is red, it substitutes a rest-day shape
+        (walk + mobility + heat) rather than insisting on the planned session.
+        Output stays terse and concrete — no philosophy quotes mid-message.
+        """
+        context = await self._build_layered_context()
+        prompt = (
+            "You're CoachRex. Prescribe TODAY's workout, using the active "
+            "plan's session for today as the default and modulating intensity "
+            "based on the data below. Rules:\n"
+            "  • Recovery green (>=67) AND ACWR 0.8–1.3 → run the session as written.\n"
+            "  • Recovery yellow (34–66) OR ACWR >1.3 → dial intensity down "
+            "one notch: lighter top sets, easier run intervals, or shorter work.\n"
+            "  • Recovery red (<34) → swap the session for an active-recovery "
+            "shape (walk, mobility, sauna/plunge). Be honest about why.\n"
+            "  • No planned session defined for today → give a simple default "
+            "consistent with the plan's weekly shape.\n\n"
+            "Output shape (plain text, no markdown headers):\n"
+            "  Line 1: one-sentence honest read on today's state.\n"
+            "  Line 2 onward: session type / focus, then the prescription with "
+            "specific sets/reps/time/pace. Units: miles and pounds.\n"
+            "  Close with one short line on what you dialed up or down and why.\n\n"
+            "Keep total output under ~200 words. Stoic-concrete voice — no "
+            "philosophy-poster phrases, no 'keep pushing' filler.\n\n"
+            f"=== CONTEXT ===\n{context}"
+        )
+        return await self._ask_claude(prompt, allow_tools=False, max_tokens=700)
+
     async def chat(self, message: str) -> str:
         """
         Handle a conversational message.
