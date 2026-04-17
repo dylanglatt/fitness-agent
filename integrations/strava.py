@@ -57,6 +57,36 @@ class StravaClient:
         logger.info(f"Fetched {len(activities)} Strava activities.")
         return activities
 
+    async def iter_all_activities(self, after: Optional[int] = None, per_page: int = 200):
+        """
+        Paginate through every activity from `after` (epoch seconds) to now.
+        Strava caps per_page at 200; we walk `page` until we get an empty page.
+        Yields activities one at a time.
+        """
+        await self._ensure_token()
+        page = 1
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            while True:
+                await self._ensure_token()
+                params: dict = {"per_page": per_page, "page": page}
+                if after is not None:
+                    params["after"] = after
+                resp = await client.get(
+                    f"{STRAVA_BASE}/athlete/activities",
+                    headers={"Authorization": f"Bearer {self._access_token}"},
+                    params=params,
+                )
+                resp.raise_for_status()
+                activities = resp.json()
+                if not activities:
+                    return
+                for act in activities:
+                    yield act
+                # Last page is signaled by getting fewer than per_page results.
+                if len(activities) < per_page:
+                    return
+                page += 1
+
     async def get_activity_detail(self, activity_id: int) -> dict:
         """Fetch full detail for a single activity."""
         await self._ensure_token()

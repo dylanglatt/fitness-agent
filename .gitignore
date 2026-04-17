@@ -1,8 +1,27 @@
+# Secrets
 .env
-data/fitness_bot.db
+
+# Python
 __pycache__/
 *.pyc
-.env
+*.pyo
+venv/
+.python-version
+
+# Local data / databases
 data/fitness_bot.db
-__pycache__/
-*.pyc
+data/chroma_db/
+
+# OS / editor
+.DS_Store
+.claude/
+
+# Node (legacy)
+node_modules/
+dist/
+build/
+.next/
+.cache/
+
+# Logs
+*.log
