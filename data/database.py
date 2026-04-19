@@ -216,6 +216,46 @@ class Database:
                     updated_at TEXT DEFAULT (datetime('now'))
                 )
             """)
+            # whoop_workouts: per-session workout records from /v2/activity/workout.
+            # Distinct from whoop_cycle (which is DAY-level strain). When Dylan
+            # starts/ends an activity on WHOOP manually, this is the authoritative
+            # per-run source for HR, zones, and workout strain. Keyed by WHOOP
+            # workout id (stable across refetch). start_utc/end_utc are ISO-8601
+            # UTC strings we use for overlap matching against Strava activities.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS whoop_workouts (
+                    workout_id TEXT PRIMARY KEY,
+                    start_date TEXT NOT NULL,
+                    start_utc TEXT NOT NULL,
+                    end_utc TEXT NOT NULL,
+                    sport_id INTEGER,
+                    sport_name TEXT,
+                    strain REAL,
+                    kilojoule REAL,
+                    average_hr REAL,
+                    max_hr REAL,
+                    distance_m REAL,
+                    altitude_gain_m REAL,
+                    altitude_change_m REAL,
+                    zone0_ms INTEGER,
+                    zone1_ms INTEGER,
+                    zone2_ms INTEGER,
+                    zone3_ms INTEGER,
+                    zone4_ms INTEGER,
+                    zone5_ms INTEGER,
+                    percent_recorded REAL,
+                    raw_json TEXT,
+                    updated_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_whoop_workouts_date "
+                "ON whoop_workouts(start_date)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_whoop_workouts_start "
+                "ON whoop_workouts(start_utc)"
+            )
             await db.commit()
         # Seed a default balanced-concurrent plan if no plan exists yet.
         await self._seed_default_plan_if_empty()
@@ -374,6 +414,129 @@ class Database:
                 ),
             )
             await db.commit()
+
+    # ── WHOOP workouts (per-session, distinct from day-level cycle) ─────────
+
+    async def upsert_whoop_workout(self, row: dict, raw: dict) -> None:
+        """Insert/update a per-workout WHOOP record. Keyed by workout_id.
+
+        `row` is the output of WhoopClient.normalize_workout(); `raw` is the
+        original v2 payload so we don't lose any fields we don't model yet.
+        """
+        workout_id = row.get("workout_id")
+        if not workout_id:
+            return
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO whoop_workouts
+                    (workout_id, start_date, start_utc, end_utc, sport_id, sport_name,
+                     strain, kilojoule, average_hr, max_hr, distance_m,
+                     altitude_gain_m, altitude_change_m,
+                     zone0_ms, zone1_ms, zone2_ms, zone3_ms, zone4_ms, zone5_ms,
+                     percent_recorded, raw_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(workout_id) DO UPDATE SET
+                    start_date=excluded.start_date,
+                    start_utc=excluded.start_utc,
+                    end_utc=excluded.end_utc,
+                    sport_id=excluded.sport_id,
+                    sport_name=excluded.sport_name,
+                    strain=excluded.strain,
+                    kilojoule=excluded.kilojoule,
+                    average_hr=excluded.average_hr,
+                    max_hr=excluded.max_hr,
+                    distance_m=excluded.distance_m,
+                    altitude_gain_m=excluded.altitude_gain_m,
+                    altitude_change_m=excluded.altitude_change_m,
+                    zone0_ms=excluded.zone0_ms,
+                    zone1_ms=excluded.zone1_ms,
+                    zone2_ms=excluded.zone2_ms,
+                    zone3_ms=excluded.zone3_ms,
+                    zone4_ms=excluded.zone4_ms,
+                    zone5_ms=excluded.zone5_ms,
+                    percent_recorded=excluded.percent_recorded,
+                    raw_json=excluded.raw_json,
+                    updated_at=datetime('now')
+                """,
+                (
+                    str(workout_id),
+                    row.get("start_date"),
+                    row.get("start_utc"),
+                    row.get("end_utc"),
+                    row.get("sport_id"),
+                    row.get("sport_name"),
+                    row.get("strain"),
+                    row.get("kilojoule"),
+                    row.get("average_hr"),
+                    row.get("max_hr"),
+                    row.get("distance_m"),
+                    row.get("altitude_gain_m"),
+                    row.get("altitude_change_m"),
+                    row.get("zone0_ms"),
+                    row.get("zone1_ms"),
+                    row.get("zone2_ms"),
+                    row.get("zone3_ms"),
+                    row.get("zone4_ms"),
+                    row.get("zone5_ms"),
+                    row.get("percent_recorded"),
+                    json.dumps(raw),
+                ),
+            )
+            await db.commit()
+
+    async def get_whoop_workouts_in_window(
+        self, start_utc: str, end_utc: str
+    ) -> list[dict]:
+        """Return workouts whose [start_utc, end_utc] overlaps the given window.
+
+        Both bounds inclusive. Used by the debrief to find the WHOOP workout
+        that matches a Strava activity's time window (or vice versa).
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT * FROM whoop_workouts
+                WHERE NOT (end_utc < ? OR start_utc > ?)
+                ORDER BY start_utc DESC
+                """,
+                (start_utc, end_utc),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_latest_whoop_workout(
+        self, within_hours: int = 24
+    ) -> Optional[dict]:
+        """Most recent WHOOP workout within the last N hours, or None."""
+        cutoff = (datetime.utcnow() - timedelta(hours=within_hours)).strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z"
+        )
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT * FROM whoop_workouts
+                WHERE end_utc >= ?
+                ORDER BY start_utc DESC LIMIT 1
+                """,
+                (cutoff,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_whoop_workouts_for_date(self, iso_date: str) -> list[dict]:
+        """All workouts whose start_date == YYYY-MM-DD, most recent first."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM whoop_workouts WHERE start_date = ? "
+                "ORDER BY start_utc DESC",
+                (iso_date,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
 
     # ── Strava upserts ──────────────────────────────────────────────────────
 

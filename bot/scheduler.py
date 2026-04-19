@@ -166,7 +166,9 @@ class Scheduler:
 
         Same code path as the nightly sync, just a tighter window. Runs in a
         couple of seconds. Makes today's row available in the 7-day block
-        rather than relying on the live snapshot alone.
+        rather than relying on the live snapshot alone. Also refreshes
+        per-session workouts so /debrief has a warm cache even when a push
+        was missed.
         """
         whoop = self.coach.whoop
         db = self.coach.db
@@ -184,6 +186,12 @@ class Scheduler:
             date, row = whoop.normalize_cycle(rec)
             if date:
                 await db.upsert_whoop_cycle(date, row, rec)
+        async for rec in whoop.iter_all_workouts(start=start, end=end):
+            try:
+                row = whoop.normalize_workout(rec)
+                await db.upsert_whoop_workout(row, rec)
+            except Exception as e:
+                logger.debug(f"Workout upsert failed during refresh: {e}")
 
     async def _send_weekly_summary(self):
         channel = self.bot.get_channel(self.config.DISCORD_CHANNEL_DAILY)
@@ -202,19 +210,25 @@ class Scheduler:
         await channel.send(f"**Sunday Reflection**\n\n{reflection}")
 
     async def _nightly_sync(self):
-        """Pull the last few days of WHOOP + Strava into SQLite.
+        """Pull the last couple days of WHOOP + Strava into SQLite.
 
-        Uses a generous overlap window (3 days for WHOOP, 7 days for Strava)
-        so late-arriving records (WHOOP re-scoring, Strava edits, delayed sync
-        from the watch) get picked up. Upserts make this safe — re-writing an
-        existing row just refreshes it.
+        With webhooks wired up (integrations/webhook_server.py), the nightly
+        job is a safety-net catching events we missed — dropped pushes,
+        WHOOP re-scorings, Strava edits — rather than the primary ingest.
+        A 2-day window is enough overlap for that; bigger windows just burn
+        API quota without surfacing new information. Upserts make this safe.
+
+        Also pulls per-session WHOOP workouts (/v2/activity/workout), which
+        are the authoritative source for per-run HR used by /debrief — the
+        day-level /v2/cycle we were using before returns 24h averages that
+        are useless for grading a single run.
         """
         logger.info("Running nightly incremental sync…")
         try:
             whoop = self.coach.whoop
             db = self.coach.db
             now = datetime.utcnow()
-            start = (now - timedelta(days=3)).strftime("%Y-%m-%dT00:00:00.000Z")
+            start = (now - timedelta(days=2)).strftime("%Y-%m-%dT00:00:00.000Z")
             end = now.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
             count_r = 0
@@ -235,6 +249,15 @@ class Scheduler:
                 if date:
                     await db.upsert_whoop_cycle(date, row, rec)
                     count_c += 1
+            # Per-session workouts — the source /debrief reads for HR + zones.
+            count_w = 0
+            async for rec in whoop.iter_all_workouts(start=start, end=end):
+                try:
+                    row = whoop.normalize_workout(rec)
+                    await db.upsert_whoop_workout(row, rec)
+                    count_w += 1
+                except Exception as e:
+                    logger.debug(f"Workout upsert failed: {e}")
             await db.set_sync_state(
                 "whoop",
                 datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -242,11 +265,13 @@ class Scheduler:
                 note="nightly",
             )
             logger.info(
-                f"WHOOP nightly sync: {count_r} recovery, {count_s} sleep, {count_c} cycles."
+                f"WHOOP nightly sync: {count_r} recovery, {count_s} sleep, "
+                f"{count_c} cycles, {count_w} workouts."
             )
 
-            # Strava: walk back 7 days to catch edits/delayed uploads.
-            after_ts = int((now - timedelta(days=7)).timestamp())
+            # Strava: walk back 2 days to catch edits/delayed uploads.
+            # Webhooks handle everything fresh; this is the safety net only.
+            after_ts = int((now - timedelta(days=2)).timestamp())
             count_a = 0
             async for act in self.coach.strava.iter_all_activities(after=after_ts):
                 await db.upsert_strava_activity(act)

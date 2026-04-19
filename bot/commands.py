@@ -651,6 +651,39 @@ def register_commands(bot):
         text = await coach.recommend_workout()
         await _send_chunked(ctx, text)
 
+    # ── /debrief — post-workout breakdown (WHOOP + Strava merged) ─────────
+
+    @bot.hybrid_command(
+        name="debrief",
+        description="Debrief your most recent workout — WHOOP HR + Strava pace merged.",
+    )
+    @is_owner_hybrid
+    async def debrief_cmd(
+        ctx: commands.Context,
+        hours: int = 8,
+        activity_id: Optional[int] = None,
+    ):
+        """Usage: /debrief             → last 8h window.
+                  /debrief 24          → widen the lookback.
+                  /debrief activity_id=<id>  → debrief a specific Strava activity.
+
+        The debrief is WHOOP-authoritative for HR and zones and Strava-
+        authoritative for pace/distance. If Strava hasn't synced yet we still
+        return a HR/zone debrief rather than silently blocking — webhooks
+        usually catch up within a minute or two.
+        """
+        await ctx.defer()
+        try:
+            text = await coach.debrief_run(
+                hours_back=max(1, int(hours)),
+                activity_id=activity_id,
+            )
+        except Exception as e:
+            logger.error(f"/debrief failed: {e}", exc_info=True)
+            await ctx.send(f"Debrief failed: {e}")
+            return
+        await _send_chunked(ctx, text)
+
     # ── /pr — log a PR (thin wrapper over !log for now) ───────────────────
 
     @bot.hybrid_command(

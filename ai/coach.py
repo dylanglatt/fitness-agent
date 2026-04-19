@@ -26,10 +26,12 @@ Architecture notes (why this file is shaped the way it is):
    numeric enough to plausibly be a set/rep/weight line.
 """
 
+import asyncio
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import anthropic
 
@@ -87,6 +89,28 @@ _LIFT_HINT = re.compile(
     | (\d{2,4}\s*(lb|lbs|kg))           # 185 lbs, 225lb
     """,
     re.IGNORECASE | re.VERBOSE,
+)
+
+
+# ── Regex — is Dylan asking for a workout debrief? ──────────────────────────
+# Matches phrasings like "debrief my run", "break down the run", "how'd my
+# workout go", "tell me about that ride", "analyze my lift". Kept broad so
+# the router can catch intent without Claude needing a tool-call round-trip.
+_DEBRIEF_INTENT = re.compile(
+    r"""
+    \b(
+        debrief
+      | break[\s\-]?down
+      | how('d| did)\s+(my|that|the)
+      | tell\s+me\s+about\s+(my|that|the)
+      | (how\s+was|what\s+was)\s+(my|that|the)
+      | (analy[sz]e|recap|review|read)\s+(my|that|the|this)
+      | post[\s\-]?(mortem|workout|run|game)
+    )\b
+    .{0,40}?
+    \b(run|ride|cycle|workout|session|lift|training|activity|hike|ruck|game)\b
+    """,
+    re.IGNORECASE | re.VERBOSE | re.DOTALL,
 )
 
 
@@ -576,18 +600,81 @@ class Coach:
             )
 
         # ── Strava: last 14 days detail + 30/365 aggregates
+        # We merge in WHOOP per-session workouts so HR fields read from the
+        # authoritative source when available (Strava's `average_hr` can be
+        # off or missing; WHOOP strap measures HR directly). Per-activity
+        # strain also comes from WHOOP workouts — day-level /v2/cycle strain
+        # is 24h-aggregate and wrong for grading a single session.
         acts = await self.db.get_strava_activities_range(str(d14), str(today))
+        # Pull the 14-day window of per-session WHOOP workouts so we can
+        # substitute WHOOP's HR where Strava's is missing or wrong. This is
+        # the fix for the old "0.6 strain, max HR 110 for a real run" bug:
+        # those numbers came from the DAY-level /v2/cycle table, not a real
+        # per-session workout record.
+        try:
+            whoop_wos_14d = await self.db.get_whoop_workouts_in_window(
+                f"{d14}T00:00:00.000Z",
+                f"{today}T23:59:59.999Z",
+            )
+        except Exception as e:
+            logger.debug(f"WHOOP workouts-in-window fetch failed: {e}")
+            whoop_wos_14d = []
+
+        def _whoop_overlap(a: dict) -> Optional[dict]:
+            """Find a WHOOP workout whose window overlaps this Strava activity."""
+            a_raw = {}
+            try:
+                a_raw = json.loads(a.get("raw_json") or "{}") if isinstance(
+                    a.get("raw_json"), str
+                ) else (a.get("raw_json") or {})
+            except Exception:
+                a_raw = {}
+            a_start_iso = a_raw.get("start_date") or a.get("start_date")
+            if not a_start_iso:
+                return None
+            try:
+                a_start = datetime.fromisoformat(
+                    a_start_iso.replace("Z", "+00:00")
+                ).astimezone(timezone.utc)
+            except Exception:
+                return None
+            a_end = a_start + timedelta(
+                seconds=(a.get("elapsed_time_s") or a.get("moving_time_s") or 0)
+            )
+            for w in whoop_wos_14d:
+                try:
+                    w_start = datetime.fromisoformat(
+                        (w.get("start_utc") or "").replace("Z", "+00:00")
+                    ).astimezone(timezone.utc)
+                    w_end = datetime.fromisoformat(
+                        (w.get("end_utc") or "").replace("Z", "+00:00")
+                    ).astimezone(timezone.utc)
+                except Exception:
+                    continue
+                if not (w_end + timedelta(minutes=10) < a_start
+                        or a_end + timedelta(minutes=10) < w_start):
+                    return w
+            return None
+
         if acts:
             lines.append("")
-            lines.append("LAST 14 DAYS (Strava):")
+            lines.append("LAST 14 DAYS (Strava + WHOOP workout HR):")
             for a in acts[:15]:
                 mi = _m_to_mi(a.get("distance_m", 0))
                 dur = round((a.get("moving_time_s") or 0) / 60, 1)
                 parts = [a.get("date"), a.get("sport_type") or "?", f"{dur}min"]
                 if mi:
                     parts.append(f"{mi}mi")
-                if a.get("average_hr"):
-                    parts.append(f"avg HR {int(a['average_hr'])}")
+                matched = _whoop_overlap(a)
+                # Prefer WHOOP HR when available; fall back to Strava's HR.
+                avg_hr = (matched or {}).get("average_hr") or a.get("average_hr")
+                max_hr = (matched or {}).get("max_hr") or a.get("max_hr")
+                if avg_hr:
+                    parts.append(f"avg HR {int(avg_hr)}")
+                if max_hr:
+                    parts.append(f"max HR {int(max_hr)}")
+                if matched and matched.get("strain") is not None:
+                    parts.append(f"WHOOP strain {round(matched['strain'], 1)}")
                 lines.append("  - " + " | ".join(parts))
 
         s30 = await self.db.get_strava_aggregates(str(d30), str(today))
@@ -730,6 +817,292 @@ class Coach:
         )
         return await self._ask_claude(prompt, allow_tools=False, max_tokens=700)
 
+    # ── Debrief (live WHOOP workout + Strava parallel fetch) ────────────────
+
+    @staticmethod
+    def _parse_iso_utc(ts: str) -> datetime | None:
+        """Parse an ISO-8601 timestamp into an aware UTC datetime, or None."""
+        if not ts:
+            return None
+        try:
+            # fromisoformat accepts "+00:00" but not "Z" until 3.11 — normalize.
+            return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(
+                timezone.utc
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _windows_overlap(
+        a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime,
+        slack_minutes: int = 10,
+    ) -> bool:
+        """Return True if two time windows overlap within `slack_minutes`.
+
+        Strava and WHOOP sometimes disagree on start/end by a few minutes — the
+        watch starts the activity a beat before you hit go on the phone, etc.
+        A small slack here matches pairs that clearly describe the same session.
+        """
+        slack = timedelta(minutes=slack_minutes)
+        return not (a_end + slack < b_start or a_start > b_end + slack)
+
+    async def debrief_run(
+        self,
+        hours_back: int = 8,
+        activity_id: int | None = None,
+    ) -> str:
+        """Generate a post-activity debrief.
+
+        Fetches the most recent WHOOP workout AND recent Strava activities in
+        parallel. WHOOP is the authoritative source for HR (avg HR, max HR,
+        zone time, workout strain); Strava fills in pace / distance / GPS /
+        splits / elevation when it has synced. The debrief NEVER blocks on
+        Strava — if Strava is empty or errors, we still produce a WHOOP-only
+        debrief.
+
+        Args:
+            hours_back: window for the "most recent" workout lookup.
+            activity_id: optional specific Strava activity id to debrief. If
+                given, we fetch that activity directly and pair it with the
+                overlapping WHOOP workout.
+
+        Returns:
+            Coaching text, ready to send to Discord. Always returns something,
+            even if no activity was found — a single sentence is better than a
+            silent failure.
+        """
+
+        async def _fetch_whoop():
+            try:
+                return await self.whoop.get_workouts(hours=hours_back, limit=10)
+            except Exception as e:
+                logger.warning(f"WHOOP workout fetch failed in debrief: {e}")
+                return e
+
+        async def _fetch_strava():
+            try:
+                if activity_id is not None:
+                    detail = await self.strava.get_activity_detail(int(activity_id))
+                    return [detail] if detail else []
+                # Strava's `after` window; days is overkill for a post-run
+                # debrief but lets a request for "the run this morning" still
+                # hit when the run ended ~6–8 h ago.
+                days = max(1, (hours_back + 23) // 24)
+                return await self.strava.get_recent_activities(days=days)
+            except Exception as e:
+                logger.warning(f"Strava fetch failed in debrief: {e}")
+                return e
+
+        # Parallel — a Strava failure must not delay the WHOOP-only path.
+        whoop_res, strava_res = await asyncio.gather(
+            _fetch_whoop(), _fetch_strava(), return_exceptions=False
+        )
+
+        whoop_workouts = whoop_res if isinstance(whoop_res, list) else []
+        strava_acts = strava_res if isinstance(strava_res, list) else []
+
+        # Opportunistically persist anything we fetched so SQLite stays warm.
+        for rec in whoop_workouts:
+            try:
+                row = self.whoop.normalize_workout(rec)
+                await self.db.upsert_whoop_workout(row, rec)
+            except Exception as e:
+                logger.debug(f"Debrief: whoop workout upsert failed: {e}")
+        for act in strava_acts:
+            try:
+                await self.db.upsert_strava_activity(act)
+            except Exception as e:
+                logger.debug(f"Debrief: strava activity upsert failed: {e}")
+
+        # Choose the anchor workout: prefer the most recent WHOOP workout
+        # (that's our HR source), fall back to the most recent Strava activity
+        # if WHOOP has nothing.
+        whoop_workouts = sorted(
+            whoop_workouts,
+            key=lambda r: r.get("start") or "",
+            reverse=True,
+        )
+        strava_acts = sorted(
+            strava_acts,
+            key=lambda a: a.get("start_date") or a.get("start_date_local") or "",
+            reverse=True,
+        )
+
+        anchor_whoop = whoop_workouts[0] if whoop_workouts else None
+
+        # Match Strava activity to the anchor by time-window overlap.
+        matched_strava = None
+        if anchor_whoop:
+            w_start = self._parse_iso_utc(anchor_whoop.get("start"))
+            w_end = self._parse_iso_utc(anchor_whoop.get("end"))
+            if w_start and w_end:
+                for act in strava_acts:
+                    a_start = self._parse_iso_utc(act.get("start_date"))
+                    if not a_start:
+                        continue
+                    a_end = a_start + timedelta(
+                        seconds=(act.get("elapsed_time") or act.get("moving_time") or 0)
+                    )
+                    if self._windows_overlap(w_start, w_end, a_start, a_end):
+                        matched_strava = act
+                        break
+        else:
+            # WHOOP-empty path — anchor on most recent Strava if present.
+            matched_strava = strava_acts[0] if strava_acts else None
+
+        # No data at all — short, honest reply beats hallucinating a session.
+        if not anchor_whoop and not matched_strava:
+            return (
+                "No recent workout on file. WHOOP shows no session in the last "
+                f"{hours_back}h and Strava has nothing new. If you just finished, "
+                "give the phones a minute to sync and ask again."
+            )
+
+        # Build a compact data block for Claude. WHOOP numbers are preferred
+        # for HR/zone; Strava is preferred for pace/distance/splits.
+        data_lines: list[str] = []
+        if anchor_whoop:
+            w = self.whoop.normalize_workout(anchor_whoop)
+            data_lines.append("WHOOP workout (authoritative for HR + zones + workout strain):")
+            data_lines.append(f"  Sport: {w.get('sport_name')} (id {w.get('sport_id')})")
+            data_lines.append(f"  Start: {w.get('start_utc')}  End: {w.get('end_utc')}")
+            if w.get("average_hr") is not None:
+                data_lines.append(f"  Avg HR: {int(w['average_hr'])} bpm")
+            if w.get("max_hr") is not None:
+                data_lines.append(f"  Max HR: {int(w['max_hr'])} bpm")
+            if w.get("strain") is not None:
+                data_lines.append(f"  Workout strain: {round(w['strain'], 1)}")
+            if w.get("kilojoule") is not None:
+                data_lines.append(f"  Energy: {int(w['kilojoule'])} kJ")
+            # Zones — only include if at least one bucket has real time in it.
+            zone_keys = [
+                ("Z0 (<50% HRmax)", "zone0_ms"),
+                ("Z1 (50–60%)", "zone1_ms"),
+                ("Z2 (60–70%)", "zone2_ms"),
+                ("Z3 (70–80%)", "zone3_ms"),
+                ("Z4 (80–90%)", "zone4_ms"),
+                ("Z5 (90–100%)", "zone5_ms"),
+            ]
+            zone_mins = [(lbl, round((w.get(k) or 0) / 60000, 1)) for lbl, k in zone_keys]
+            if any(m for _, m in zone_mins):
+                data_lines.append(
+                    "  Zone time: "
+                    + ", ".join(f"{lbl} {m}m" for lbl, m in zone_mins if m)
+                )
+            if w.get("percent_recorded") is not None:
+                data_lines.append(f"  % recorded: {round(w['percent_recorded'], 1)}")
+
+        if matched_strava:
+            a = matched_strava
+            dist_mi = _m_to_mi(a.get("distance") or a.get("distance_m"))
+            dur_min = round((a.get("moving_time") or a.get("moving_time_s") or 0) / 60, 1)
+            elev_ft = _m_to_ft(a.get("total_elevation_gain") or a.get("total_elevation_gain_m"))
+            avg_mps = a.get("average_speed") or a.get("average_speed_mps")
+            max_mps = a.get("max_speed") or a.get("max_speed_mps")
+            pace = _mps_to_min_per_mi(avg_mps) if avg_mps else None
+            max_pace = _mps_to_min_per_mi(max_mps) if max_mps else None
+
+            data_lines.append("")
+            data_lines.append("Strava activity (authoritative for pace / distance / GPS / splits):")
+            data_lines.append(f"  Name: {a.get('name', '—')}")
+            data_lines.append(f"  Type: {a.get('sport_type') or a.get('type') or '?'}")
+            data_lines.append(f"  Start: {a.get('start_date') or a.get('start_date_local', '')}")
+            if dist_mi:
+                data_lines.append(f"  Distance: {dist_mi} mi")
+            if dur_min:
+                data_lines.append(f"  Duration: {dur_min} min")
+            if pace:
+                data_lines.append(f"  Avg pace: {pace}")
+            if max_pace:
+                data_lines.append(f"  Peak pace: {max_pace}")
+            if elev_ft:
+                data_lines.append(f"  Elevation gain: {elev_ft} ft")
+            # If we have detail-level splits (activity_id path), surface them.
+            laps = a.get("laps") or []
+            if laps:
+                data_lines.append(f"  Splits ({len(laps)}):")
+                for i, lap in enumerate(laps, 1):
+                    lap_mi = _m_to_mi(lap.get("distance"))
+                    lap_pace = _mps_to_min_per_mi(lap.get("average_speed"))
+                    lap_hr = lap.get("average_heartrate")
+                    parts = [f"    {i}: {lap_mi}mi"]
+                    if lap_pace:
+                        parts.append(lap_pace)
+                    if lap_hr:
+                        parts.append(f"avg HR {int(lap_hr)}")
+                    data_lines.append(" | ".join(parts))
+        elif anchor_whoop:
+            data_lines.append("")
+            data_lines.append(
+                "Strava activity: NOT YET SYNCED (Strava webhook may lag 30s–"
+                "several min, or the activity wasn't recorded on Strava). "
+                "Debrief HR + zones + workout strain from WHOOP; call out "
+                "that pace/splits are unavailable rather than guessing."
+            )
+
+        # Pull today's recovery for context — a hard intervals-day interpretation
+        # changes completely if recovery was 32 vs 78.
+        try:
+            today_iso = datetime.now().date().isoformat()
+            rows = await self.db.get_whoop_daily(today_iso, today_iso)
+            if not rows:
+                # Fall back to yesterday if today hasn't been synced yet.
+                y = (datetime.now().date() - timedelta(days=1)).isoformat()
+                rows = await self.db.get_whoop_daily(y, y)
+            if rows:
+                r = rows[0]
+                data_lines.append("")
+                data_lines.append("Today's recovery context:")
+                data_lines.append(
+                    f"  Recovery {r.get('recovery_score')}% | "
+                    f"HRV {r.get('hrv_rmssd_ms')}ms | "
+                    f"RHR {r.get('resting_hr')} bpm | "
+                    f"Sleep {r.get('total_asleep_hours')}h"
+                )
+        except Exception as e:
+            logger.debug(f"Debrief: recovery context fetch failed: {e}")
+
+        # Active plan session for today, if any — lets the coach read the run
+        # against what was prescribed instead of judging it in a vacuum.
+        try:
+            plan = await self.db.get_active_plan()
+            if plan:
+                day_name = datetime.now().strftime("%A").lower()
+                session = (plan.get("weekly_template") or {}).get(day_name)
+                if session:
+                    data_lines.append("")
+                    data_lines.append(
+                        f"Today's planned session: {session.get('session_type', '?').upper()} "
+                        f"— {session.get('focus', '')}"
+                    )
+                    if session.get("prescription"):
+                        data_lines.append(f"  Prescription: {session['prescription']}")
+        except Exception as e:
+            logger.debug(f"Debrief: active plan fetch failed: {e}")
+
+        data_block = "\n".join(data_lines)
+
+        prompt = (
+            "You're CoachRex debriefing Dylan's most recent workout. Rules:\n"
+            "  • WHOOP is the source of truth for HR, zones, and workout strain.\n"
+            "  • Strava is the source of truth for pace, distance, elevation, "
+            "splits. If Strava hasn't synced, say so — do not invent pace numbers.\n"
+            "  • Read the session against today's recovery and the planned "
+            "prescription (if given). Was intensity appropriate? Too hard? Too light?\n"
+            "  • Call out one specific thing he did well and one thing to tune next time.\n"
+            "  • If zone distribution says easy day, do not talk about PRs; if it was "
+            "threshold/interval, grade the work honestly.\n"
+            "  • Units: miles and pounds. Pace as mm:ss/mi.\n\n"
+            "Output shape (plain text, no markdown headers):\n"
+            "  Line 1: one-sentence verdict (\"That was a well-controlled Z2\" / "
+            "\"You blew past the prescription — here's what it cost\").\n"
+            "  Lines 2–4: the numbers that matter, in plain sentences.\n"
+            "  Lines 5–6: what to do differently / repeat next time.\n\n"
+            "Keep under ~180 words. No philosophy quotes. No 'keep pushing' filler.\n\n"
+            f"=== DATA ===\n{data_block}"
+        )
+        return await self._ask_claude(prompt, allow_tools=False, max_tokens=600)
+
     async def chat(self, message: str) -> str:
         """
         Handle a conversational message.
@@ -738,6 +1111,14 @@ class Coach:
         - Build layered context from SQLite.
         - Let Claude call history tools on demand.
         """
+        # Fast intent route: "debrief my run" / "how'd the workout go" / etc.
+        # We skip the full layered-context + tools build because the debrief
+        # path has its own, tighter data-assembly tailored to a post-session
+        # question.
+        if _DEBRIEF_INTENT.search(message):
+            logger.info("chat(): routed to debrief_run via intent regex.")
+            return await self.debrief_run()
+
         lift = await self._try_parse_lift(message)
         if lift:
             await self.db.log_lift(

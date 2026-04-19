@@ -121,7 +121,12 @@ class WhoopClient:
             return resp.json().get("records", [])
 
     async def get_strain(self, days: int = 7) -> list[dict]:
-        """Fetch strain (cycle) records for the last N days."""
+        """Fetch strain (cycle) records for the last N days.
+
+        NOTE: /v2/cycle is DAY-level, not per-workout. For per-workout HR and
+        strain (i.e. "tell me about my run"), use get_workouts / get_workout_by_id
+        instead — that's what the debrief relies on.
+        """
         await self._ensure_token()
         start = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00.000Z")
 
@@ -133,6 +138,47 @@ class WhoopClient:
             )
             resp.raise_for_status()
             return resp.json().get("records", [])
+
+    async def get_workouts(
+        self, hours: int = 24, limit: int = 25
+    ) -> list[dict]:
+        """Fetch per-workout records from /v2/activity/workout in the last N hours.
+
+        This is the authoritative source for per-run HR, zone time, and workout
+        strain — distinct from /v2/cycle which is day-level.
+
+        Requires the `read:workout` scope (granted at OAuth time by whoop_auth.py).
+        """
+        await self._ensure_token()
+        start = (datetime.utcnow() - timedelta(hours=hours)).strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z"
+        )
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(
+                f"{WHOOP_BASE}/v2/activity/workout",
+                headers=self._headers(),
+                params={"start": start, "limit": limit},
+            )
+            resp.raise_for_status()
+            return resp.json().get("records", [])
+
+    async def get_workout_by_id(self, workout_id: str) -> Optional[dict]:
+        """Fetch a single workout by its v2 UUID.
+
+        Used by the webhook handler when we receive a workout.updated event —
+        the event payload only contains the id, so we must fetch the full record.
+        Returns None on 404 (workout was deleted before we fetched).
+        """
+        await self._ensure_token()
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(
+                f"{WHOOP_BASE}/v2/activity/workout/{workout_id}",
+                headers=self._headers(),
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp.json()
 
     async def get_body_measurement(self) -> Optional[dict]:
         """Fetch the user's body measurement (height_meter, weight_kilogram, max_heart_rate).
@@ -209,6 +255,13 @@ class WhoopClient:
         async for rec in self._iter_paginated("/v2/cycle", start, end):
             yield rec
 
+    async def iter_all_workouts(
+        self, start: Optional[str] = None, end: Optional[str] = None
+    ):
+        """Paginate through /v2/activity/workout. Yields records one at a time."""
+        async for rec in self._iter_paginated("/v2/activity/workout", start, end):
+            yield rec
+
     # ── Row normalizers — raw WHOOP JSON → flat dict ready to upsert ────────
 
     @staticmethod
@@ -267,6 +320,164 @@ class WhoopClient:
             "max_hr": score.get("max_heart_rate"),
             "cycle_id": str(rec.get("id")) if rec.get("id") is not None else None,
         }
+
+    # WHOOP v2 sport_id → human name. Covers the common ones; falls back to
+    # "Activity" for ids we don't have mapped. Full list is at
+    # https://developer.whoop.com/docs/developing/user-data/workout/ .
+    _SPORT_ID_TO_NAME = {
+        -1: "Activity",
+        0: "Running",
+        1: "Cycling",
+        16: "Baseball",
+        17: "Basketball",
+        18: "Rowing",
+        19: "Fencing",
+        20: "Field Hockey",
+        21: "Football",
+        22: "Golf",
+        24: "Ice Hockey",
+        25: "Lacrosse",
+        27: "Rugby",
+        28: "Sailing",
+        29: "Skiing",
+        30: "Soccer",
+        31: "Softball",
+        32: "Squash",
+        33: "Swimming",
+        34: "Tennis",
+        35: "Track & Field",
+        36: "Volleyball",
+        37: "Water Polo",
+        38: "Wrestling",
+        39: "Boxing",
+        42: "Dance",
+        43: "Pilates",
+        44: "Yoga",
+        45: "Weightlifting",
+        47: "Cross Country Skiing",
+        48: "Functional Fitness",
+        49: "Duathlon",
+        51: "Gymnastics",
+        52: "Hiking/Rucking",
+        53: "Horseback Riding",
+        55: "Kayaking",
+        56: "Martial Arts",
+        57: "Mountain Biking",
+        59: "Powerlifting",
+        60: "Rock Climbing",
+        61: "Paddleboarding",
+        62: "Triathlon",
+        63: "Walking",
+        64: "Surfing",
+        65: "Elliptical",
+        66: "Stairmaster",
+        70: "Meditation",
+        71: "Other",
+        73: "Diving",
+        74: "Operations - Tactical",
+        75: "Operations - Medical",
+        76: "Operations - Flying",
+        77: "Operations - Water",
+        82: "Ultimate",
+        83: "Climber",
+        84: "Jumping Rope",
+        85: "Australian Football",
+        86: "Skateboarding",
+        87: "Coaching",
+        88: "Ice Bath",
+        89: "Commuting",
+        90: "Gaming",
+        91: "Snowboarding",
+        92: "Motocross",
+        93: "Caddying",
+        94: "Obstacle Course Racing",
+        95: "Motor Racing",
+        96: "HIIT",
+        97: "Spin",
+        98: "Jiu Jitsu",
+        99: "Manual Labor",
+        100: "Cricket",
+        101: "Pickleball",
+        102: "Inline Skating",
+        103: "Box Fitness",
+        104: "Spikeball",
+        105: "Wheelchair Pushing",
+        106: "Paddle Tennis",
+        107: "Barre",
+        108: "Stage Performance",
+        109: "High Stress Work",
+        110: "Parkour",
+        111: "Gaelic Football",
+        112: "Hurling / Camogie",
+        113: "Circus Arts",
+        121: "Massage Therapy",
+        125: "Watching Sports",
+        126: "Assault Bike",
+        127: "Kickboxing",
+        128: "Stretching",
+        230: "Table Tennis",
+        231: "Badminton",
+        232: "Netball",
+        233: "Sauna",
+        234: "Disc Golf",
+        235: "Yard Work",
+        236: "Air Compression",
+        237: "Percussive Massage",
+        238: "Paintball",
+        239: "Ice Skating",
+        240: "Handball",
+    }
+
+    @classmethod
+    def normalize_workout(cls, rec: dict) -> dict:
+        """Flatten a v2 workout record to the row shape that `upsert_whoop_workout`
+        expects. Start/end are preserved as ISO strings (UTC). Zone durations
+        are pulled out of score.zone_duration for easy querying without re-parsing
+        raw JSON.
+        """
+        score = rec.get("score") or {}
+        zones = score.get("zone_duration") or {}
+        start = rec.get("start") or ""
+        end = rec.get("end") or ""
+        sport_id = rec.get("sport_id")
+        return {
+            "workout_id": str(rec.get("id")) if rec.get("id") is not None else None,
+            "start_date": start[:10] if start else None,
+            "start_utc": start,
+            "end_utc": end,
+            "sport_id": sport_id,
+            "sport_name": cls._SPORT_ID_TO_NAME.get(sport_id, "Activity"),
+            "strain": score.get("strain"),
+            "kilojoule": score.get("kilojoule"),
+            "average_hr": score.get("average_heart_rate"),
+            "max_hr": score.get("max_heart_rate"),
+            "distance_m": score.get("distance_meter"),
+            "altitude_gain_m": score.get("altitude_gain_meter"),
+            "altitude_change_m": score.get("altitude_change_meter"),
+            # Zone duration keys per WHOOP v2: zone_zero_milli..zone_five_milli.
+            "zone0_ms": zones.get("zone_zero_milli"),
+            "zone1_ms": zones.get("zone_one_milli"),
+            "zone2_ms": zones.get("zone_two_milli"),
+            "zone3_ms": zones.get("zone_three_milli"),
+            "zone4_ms": zones.get("zone_four_milli"),
+            "zone5_ms": zones.get("zone_five_milli"),
+            "percent_recorded": score.get("percent_recorded"),
+        }
+
+    @classmethod
+    def summarize_workout(cls, rec: dict) -> str:
+        """Readable one-line summary of a workout (raw v2 payload)."""
+        if not rec:
+            return "No workout."
+        row = cls.normalize_workout(rec)
+        parts = [f"{row['sport_name']} @ {row['start_utc'][:16]}Z"]
+        if row.get("strain") is not None:
+            parts.append(f"strain {round(row['strain'], 1)}")
+        if row.get("average_hr"):
+            parts.append(f"avg HR {int(row['average_hr'])}")
+        if row.get("max_hr"):
+            parts.append(f"max HR {int(row['max_hr'])}")
+        return " | ".join(parts)
 
     def summarize_recovery(self, record: dict) -> str:
         """Readable summary of a recovery record."""

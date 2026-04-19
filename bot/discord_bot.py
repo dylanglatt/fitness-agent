@@ -28,6 +28,10 @@ class FitnessBot(commands.Bot):
         self.db = Database(config.DB_PATH)
         self.coach = Coach(config, self.db)
         self.scheduler = Scheduler(self, config, self.coach)
+        # Webhook server handles: None (disabled), or (runner, site) tuple.
+        # Populated in setup_hook if WEBHOOK_PORT is configured.
+        self._webhook_runner = None
+        self._webhook_site = None
 
     async def setup_hook(self):
         await self.db.initialize()
@@ -43,8 +47,31 @@ class FitnessBot(commands.Bot):
         # propagate. Set DISCORD_GUILD_ID in .env to dev-mode sync.
         await self._sync_slash_tree()
 
+        # Start the webhook receiver in the SAME event loop as the bot, so we
+        # don't end up with two processes both refreshing the same OAuth
+        # tokens (which would race and invalidate each other — WHOOP's
+        # refresh-token rotation is particularly unforgiving there).
+        try:
+            from integrations.webhook_server import start_webhook_server
+            result = await start_webhook_server(self.config, self.db, self.coach)
+            if result is not None:
+                self._webhook_runner, self._webhook_site = result
+        except Exception as e:
+            logger.error(f"Webhook server failed to start: {e}", exc_info=True)
+
         self.scheduler.start()
         logger.info("Bot setup complete.")
+
+    async def close(self):
+        """Shut down cleanly — stop the webhook server before the Discord client."""
+        try:
+            if self._webhook_site is not None:
+                await self._webhook_site.stop()
+            if self._webhook_runner is not None:
+                await self._webhook_runner.cleanup()
+        except Exception as e:
+            logger.warning(f"Webhook server shutdown error: {e}")
+        await super().close()
 
     async def _sync_slash_tree(self):
         """Sync app_commands to Discord. Guild-scoped if DISCORD_GUILD_ID is set."""

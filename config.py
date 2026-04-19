@@ -54,3 +54,22 @@ class Config:
     HOME_LAT: float = float(os.getenv("HOME_LAT", "0.0"))
     HOME_LNG: float = float(os.getenv("HOME_LNG", "0.0"))
     HOME_CITY: str = os.getenv("HOME_CITY", "New York, NY 10009")
+
+    # ── Webhook server (Strava + WHOOP push) ────────────────────────────────
+    # We co-host an aiohttp server in the same event loop as the Discord bot
+    # so Strava/WHOOP can push events as they happen instead of the bot
+    # polling on a 3 AM cron. Leave WEBHOOK_PORT=0 (or unset) to disable.
+    #
+    # The recommended deploy: Caddy terminates TLS on the public DO VPS and
+    # reverse-proxies https://<your-host>/webhooks/* to 127.0.0.1:<WEBHOOK_PORT>.
+    # Keep WEBHOOK_HOST=127.0.0.1 so the raw port isn't reachable from the
+    # internet — Caddy (or whatever TLS front) is the only ingress.
+    WEBHOOK_HOST: str = os.getenv("WEBHOOK_HOST", "127.0.0.1")
+    WEBHOOK_PORT: int = int(os.getenv("WEBHOOK_PORT", "0") or 0)
+    # The public URL Caddy maps to the local server — used by the one-time
+    # scripts/strava_subscribe.py to register the callback with Strava.
+    WEBHOOK_PUBLIC_URL: str = os.getenv("WEBHOOK_PUBLIC_URL", "")
+    # Strava's GET-verify requires us to echo a `hub.challenge` iff the
+    # `hub.verify_token` query param matches a secret we chose at subscribe
+    # time. Any sufficiently-long random string works; rotate it if leaked.
+    STRAVA_WEBHOOK_VERIFY_TOKEN: str = os.getenv("STRAVA_WEBHOOK_VERIFY_TOKEN", "")

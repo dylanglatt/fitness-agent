@@ -4,3 +4,6 @@ httpx>=0.27.0
 aiosqlite>=0.20.0
 python-dotenv>=1.0.0
 pytz>=2024.1
+# aiohttp hosts the Strava + WHOOP webhook receiver (co-located in the same
+# event loop as the Discord bot; see integrations/webhook_server.py).
+aiohttp>=3.9.0
