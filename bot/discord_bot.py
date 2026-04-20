@@ -116,4 +116,34 @@ class FitnessBot(commands.Bot):
         if not message.content.startswith("!"):
             async with message.channel.typing():
                 response = await self.coach.chat(message.content)
-                await message.channel.send(response)
+                for chunk in _chunk_for_discord(response):
+                    await message.channel.send(chunk)
+
+
+def _chunk_for_discord(text: str, limit: int = 1990) -> list[str]:
+    """
+    Split a long message into Discord-safe chunks (Discord caps at 2000 chars
+    per message). We prefer to break on paragraph boundaries, then lines, then
+    finally mid-string, so replies don't get cut mid-sentence.
+    """
+    if not text:
+        return [""]
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        # Find the latest paragraph break that fits
+        split_at = remaining.rfind("\n\n", 0, limit)
+        if split_at == -1:
+            split_at = remaining.rfind("\n", 0, limit)
+        if split_at == -1:
+            split_at = remaining.rfind(" ", 0, limit)
+        if split_at == -1 or split_at < limit // 2:
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks

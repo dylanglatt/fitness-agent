@@ -740,6 +740,101 @@ class Database:
             "by_sport": [dict(r) for r in by_sport],
         }
 
+    async def get_correlated_runs_in_range(
+        self, start_date: str, end_date: str, sport_type: str = "Run"
+    ) -> list[dict]:
+        """Return Strava runs in a date range joined with their matching WHOOP
+        workout (HR, zones, strain) when one exists.
+
+        The join is by-date + time-proximity. Strava and WHOOP both record a
+        start timestamp for the same session (Strava activities for running
+        workouts are pushed from WHOOP, so the two start times agree to within
+        a few seconds in practice). We LEFT JOIN so a run with no WHOOP match
+        still comes back — the caller can see when HR/zone data is missing.
+
+        Distances are returned in miles, pace in min/mile, durations in
+        minutes — Dylan's units throughout. Zone time is returned in minutes
+        per zone (Z1..Z5) for easy trend analysis.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT
+                    s.activity_id,
+                    s.date,
+                    s.name AS strava_name,
+                    s.sport_type,
+                    s.distance_m,
+                    s.moving_time_s,
+                    s.elapsed_time_s,
+                    s.total_elevation_gain_m,
+                    s.average_hr AS strava_avg_hr,
+                    s.max_hr AS strava_max_hr,
+                    s.average_speed_mps,
+                    s.max_speed_mps,
+                    json_extract(s.raw_json, '$.start_date') AS strava_start_utc,
+                    w.workout_id AS whoop_workout_id,
+                    w.start_utc AS whoop_start_utc,
+                    w.end_utc AS whoop_end_utc,
+                    w.sport_name AS whoop_sport_name,
+                    w.strain AS whoop_strain,
+                    w.kilojoule AS whoop_kilojoule,
+                    w.average_hr AS whoop_avg_hr,
+                    w.max_hr AS whoop_max_hr,
+                    w.zone0_ms, w.zone1_ms, w.zone2_ms,
+                    w.zone3_ms, w.zone4_ms, w.zone5_ms
+                FROM strava_activities s
+                LEFT JOIN whoop_workouts w
+                  ON w.start_date = s.date
+                 AND ABS(
+                       strftime('%s', w.start_utc) -
+                       strftime('%s', json_extract(s.raw_json, '$.start_date'))
+                     ) < 1800
+                WHERE s.date BETWEEN ? AND ?
+                  AND LOWER(s.sport_type) = LOWER(?)
+                ORDER BY s.date DESC
+                """,
+                (start_date, end_date, sport_type),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        def _ms_to_min(v):
+            return round(v / 60000.0, 1) if v is not None else None
+
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            # Strava-side unit conversion (miles, ft, min, min/mile)
+            dist_m = d.pop("distance_m", None) or 0
+            d["distance_mi"] = round(dist_m / 1609.344, 2) if dist_m else None
+            mt = d.pop("moving_time_s", None)
+            d["moving_min"] = round(mt / 60.0, 1) if mt else None
+            et = d.pop("elapsed_time_s", None)
+            d["elapsed_min"] = round(et / 60.0, 1) if et else None
+            elev_m = d.pop("total_elevation_gain_m", None) or 0
+            d["elevation_ft"] = round(elev_m * 3.28084, 0) if elev_m else None
+            mps = d.pop("average_speed_mps", None)
+            if mps and mps > 0:
+                # 26.8224 = m/s to min/mi
+                d["avg_pace_min_per_mi"] = round(26.8224 / mps, 2)
+            else:
+                d["avg_pace_min_per_mi"] = None
+            max_mps = d.pop("max_speed_mps", None)
+            if max_mps and max_mps > 0:
+                d["max_pace_min_per_mi"] = round(26.8224 / max_mps, 2)
+            else:
+                d["max_pace_min_per_mi"] = None
+            # WHOOP-side zone time to minutes
+            d["whoop_z1_min"] = _ms_to_min(d.pop("zone1_ms", None))
+            d["whoop_z2_min"] = _ms_to_min(d.pop("zone2_ms", None))
+            d["whoop_z3_min"] = _ms_to_min(d.pop("zone3_ms", None))
+            d["whoop_z4_min"] = _ms_to_min(d.pop("zone4_ms", None))
+            d["whoop_z5_min"] = _ms_to_min(d.pop("zone5_ms", None))
+            d.pop("zone0_ms", None)  # rest-zone noise — drop
+            out.append(d)
+        return out
+
     async def get_latest_whoop_date(self) -> Optional[str]:
         async with aiosqlite.connect(self.db_path) as db:
             async with db.execute("SELECT MAX(date) FROM whoop_recovery") as cursor:

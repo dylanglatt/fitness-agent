@@ -221,6 +221,33 @@ TOOLS = [
             "required": ["exercise"],
         },
     },
+    {
+        "name": "query_correlated_runs",
+        "description": (
+            "PREFER THIS for any running-performance trend question (pace over "
+            "time, HR drift, zone distribution, how fitness is progressing, "
+            "are easy runs actually easy, etc.). Returns each Strava run in "
+            "the date range joined with its matching WHOOP workout — so you "
+            "get Strava pace/distance/elevation AND WHOOP HR + Z1–Z5 time + "
+            "workout strain side-by-side per run. Dylan's Strava runs come "
+            "from WHOOP, so the match rate is near 100% when both sources "
+            "have the session. whoop_avg_hr / whoop_max_hr / whoop_z*_min "
+            "will be null for runs that weren't captured on WHOOP. Defaults "
+            "to sport_type='Run' but accepts any Strava sport_type."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "start_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "end_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "sport_type": {
+                    "type": "string",
+                    "description": "Strava sport_type (default 'Run').",
+                },
+            },
+            "required": ["start_date", "end_date"],
+        },
+    },
 ]
 
 
@@ -271,6 +298,13 @@ class Coach:
             if name == "query_lifts":
                 rows = await self.db.get_lifts_for_exercise(
                     args["exercise"], args.get("limit", 20)
+                )
+                return json.dumps(rows, default=str)
+            if name == "query_correlated_runs":
+                rows = await self.db.get_correlated_runs_in_range(
+                    args["start_date"],
+                    args["end_date"],
+                    args.get("sport_type", "Run"),
                 )
                 return json.dumps(rows, default=str)
         except Exception as e:
