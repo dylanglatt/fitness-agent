@@ -12,8 +12,8 @@ jobs:
       - name: Deploy to server
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: REDACTED_HOST
-          username: root
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DO_SSH_KEY }}
           script: |
             set -e

@@ -75,6 +75,19 @@ async def backfill_whoop(config: Config, db: Database, start: datetime, end: dat
                 logger.info(f"  WHOOP cycle: {n} records…")
     logger.info(f"WHOOP cycle: {n} records upserted.")
 
+    # Workouts (per-session HR, zones, strain). These are the rows the
+    # correlated-runs query joins against — essential for any running
+    # performance trend question.
+    n = 0
+    async for rec in whoop.iter_all_workouts(start=start_s, end=end_s):
+        row = whoop.normalize_workout(rec)
+        if row.get("workout_id"):
+            await db.upsert_whoop_workout(row, rec)
+            n += 1
+            if n % 25 == 0:
+                logger.info(f"  WHOOP workouts: {n} records…")
+    logger.info(f"WHOOP workouts: {n} records upserted.")
+
     await db.set_sync_state(
         "whoop",
         datetime.utcnow().isoformat(timespec="seconds") + "Z",
