@@ -542,17 +542,27 @@ class NotionClient:
         you have it; we'll populate Zone 1–5 % columns. Without it those
         columns stay blank (not zero — that would falsely imply you spent
         0% in each zone rather than 'data unavailable').
+
+        We embed a `[strava:<id>]` marker in the Notes field so backfill
+        scripts (and any future dedup logic) can detect which Strava
+        activities have already been imported without needing a side table.
         """
         sport_raw = activity.get("sport_type", activity.get("type", "Run"))
+        activity_id = activity.get("id")
+        marker = f"[strava:{activity_id}]" if activity_id else None
+
         if sport_raw in _STRAVA_LIFT_TYPES:
             # Lifting tracked in Strava doesn't come with sets/reps/weight
             # structure, so this path isn't very useful today. Log to Lifts
             # with the activity name and defer to the chat-log path for
             # detail.
+            lift_notes = "Auto-logged from Strava WeightTraining — set/rep detail not captured by Strava."
+            if marker:
+                lift_notes = f"{marker} {lift_notes}"
             await self.log_lift(
                 date=(activity.get("start_date_local") or "")[:10],
                 exercise=activity.get("name") or "WeightTraining",
-                notes="Auto-logged from Strava WeightTraining — set/rep detail not captured by Strava.",
+                notes=lift_notes,
             )
             return
 
@@ -579,6 +589,7 @@ class NotionClient:
             zone_4_pct=(zone_pcts or {}).get("zone_4_pct"),
             zone_5_pct=(zone_pcts or {}).get("zone_5_pct"),
             source="Strava",
+            notes=marker,  # so we can detect already-imported activities on re-run
         )
 
     # ── Daily Log writes ────────────────────────────────────────────────────
