@@ -31,6 +31,34 @@ def _parse_hhmm(s: str) -> tuple[int, int]:
     return int(hh), int(mm)
 
 
+def _chunk_for_discord(text: str, limit: int = 1990) -> list[str]:
+    """Split a long message into Discord-safe chunks (2000-char cap).
+
+    Duplicated from bot/discord_bot.py to avoid a circular import at module
+    load — bot/discord_bot.py already imports Scheduler from this module.
+    Prefer paragraph > line > space > hard-cut so replies don't split mid-word.
+    """
+    if not text:
+        return [""]
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n\n", 0, limit)
+        if split_at == -1:
+            split_at = remaining.rfind("\n", 0, limit)
+        if split_at == -1:
+            split_at = remaining.rfind(" ", 0, limit)
+        if split_at == -1 or split_at < limit // 2:
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
 class Scheduler:
     def __init__(self, bot, config, coach):
         self.bot = bot
@@ -47,6 +75,10 @@ class Scheduler:
         # Throttle the WHOOP check to once every N minutes (we're called every
         # minute by the loop; no need to hit WHOOP that often).
         self._last_whoop_check: datetime | None = None
+        # Cached owner discord.User, fetched lazily on first DM send. Scheduled
+        # briefs used to post to DISCORD_CHANNEL_DAILY; they now DM the owner
+        # directly (a channel is noise for a personal coach).
+        self._owner_user = None
 
     def start(self):
         self.check_scheduled_tasks.start()
@@ -146,11 +178,53 @@ class Scheduler:
                 return True
         return False
 
+    async def _get_owner_dm(self):
+        """Fetch the owner's discord.User for DMing, cached after first call.
+
+        Why this replaced bot.get_channel(DISCORD_CHANNEL_DAILY):
+        Dylan moved the personal training stream off a shared channel and into
+        a DM — the briefs are for one reader, not a feed. discord.py opens the
+        DM channel implicitly on the first User.send(), so we only need the
+        User object. fetch_user hits the REST API if it isn't cached; the
+        result is stable, so we memoize.
+        """
+        if self.config.OWNER_USER_ID == 0:
+            logger.warning("OWNER_USER_ID is not set — cannot DM the owner.")
+            return None
+        if self._owner_user is not None:
+            return self._owner_user
+        try:
+            self._owner_user = await self.bot.fetch_user(self.config.OWNER_USER_ID)
+            return self._owner_user
+        except Exception as e:
+            logger.error(
+                f"Failed to fetch owner user {self.config.OWNER_USER_ID}: {e}"
+            )
+            return None
+
+    async def _dm_owner(self, text: str) -> bool:
+        """Send text to the owner as a DM, chunked to Discord's 2000-char cap.
+
+        Returns True on success. On failure (DMs closed, user fetch failure,
+        Discord API error), logs and returns False so the caller can stay
+        quiet rather than crashing the scheduler loop.
+        """
+        user = await self._get_owner_dm()
+        if user is None:
+            return False
+        try:
+            for chunk in _chunk_for_discord(text):
+                await user.send(chunk)
+            return True
+        except Exception as e:
+            # Most common cause: the owner has "Allow direct messages from
+            # server members" disabled for the server the bot shares, or the
+            # bot and owner don't share a guild. We can't fix that from here
+            # — just log so the failure is visible.
+            logger.error(f"DM to owner failed: {e}")
+            return False
+
     async def _send_daily_brief(self, reason: str = ""):
-        channel = self.bot.get_channel(self.config.DISCORD_CHANNEL_DAILY)
-        if not channel:
-            logger.warning("Daily channel not found.")
-            return
         logger.info(f"Sending daily brief (reason={reason})...")
         # Upsert today (and yesterday, for safety) into SQLite so the 7-day
         # block in the context actually shows today as a row, not a gap.
@@ -159,7 +233,7 @@ class Scheduler:
         except Exception as e:
             logger.warning(f"Pre-brief WHOOP refresh failed (non-fatal): {e}")
         brief = await self.coach.daily_brief()
-        await channel.send(brief)
+        await self._dm_owner(brief)
 
     async def _refresh_recent_whoop_into_db(self, days: int = 2):
         """Quick upsert of the last N days of WHOOP data into SQLite.
@@ -194,20 +268,14 @@ class Scheduler:
                 logger.debug(f"Workout upsert failed during refresh: {e}")
 
     async def _send_weekly_summary(self):
-        channel = self.bot.get_channel(self.config.DISCORD_CHANNEL_DAILY)
-        if not channel:
-            return
         logger.info("Sending weekly training summary...")
         summary = await self.coach.weekly_summary()
-        await channel.send(f"**Weekly Training Summary**\n\n{summary}")
+        await self._dm_owner(f"**Weekly Training Summary**\n\n{summary}")
 
     async def _send_stoic_reflection(self):
-        channel = self.bot.get_channel(self.config.DISCORD_CHANNEL_DAILY)
-        if not channel:
-            return
         logger.info("Sending Sunday Stoic reflection...")
         reflection = await self.coach.stoic_reflection()
-        await channel.send(f"**Sunday Reflection**\n\n{reflection}")
+        await self._dm_owner(f"**Sunday Reflection**\n\n{reflection}")
 
     async def _nightly_sync(self):
         """Pull the last couple days of WHOOP + Strava into SQLite.

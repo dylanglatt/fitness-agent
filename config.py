@@ -32,9 +32,29 @@ class Config:
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 
-    # Notion
+    # Notion — four-database model (per user's spreadsheet mock):
+    #
+    #   SCHEDULE   — day-level index (Training Group, Workout, date). One row
+    #                per day; relates to the other three DBs.
+    #   LIFTS      — one row per exercise per day (Sets, Reps, Weight lb, RPE).
+    #   RUNS       — one row per cardio activity (Distance mi, Pace, Zone %).
+    #                Holds rides/hikes/swims/walks too, tagged by Type.
+    #   DAILY LOG  — one row per day with WHOOP physiology + morning brief text.
+    #
+    # Each DB id is independently optional; leave one blank/placeholder and the
+    # bot skips writes to that DB (no crash). See NotionClient.is_configured_*.
     NOTION_API_KEY: str = os.getenv("NOTION_API_KEY", "")
-    NOTION_DATABASE_ID: str = os.getenv("NOTION_DATABASE_ID", "")
+    NOTION_SCHEDULE_DATABASE_ID: str = os.getenv("NOTION_SCHEDULE_DATABASE_ID", "")
+    NOTION_LIFTS_DATABASE_ID: str = os.getenv("NOTION_LIFTS_DATABASE_ID", "")
+    NOTION_RUNS_DATABASE_ID: str = os.getenv("NOTION_RUNS_DATABASE_ID", "")
+    NOTION_DAILY_DATABASE_ID: str = os.getenv("NOTION_DAILY_DATABASE_ID", "")
+
+    # Backwards-compat — earlier revisions used a single NOTION_DATABASE_ID for
+    # the daily log and (briefly) a NOTION_WORKOUTS_DATABASE_ID for a unified
+    # workouts table. Honor either one for the daily DB if NOTION_DAILY_DATABASE_ID
+    # is unset, so upgrades don't silently break the morning brief.
+    if not NOTION_DAILY_DATABASE_ID:
+        NOTION_DAILY_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "")
 
     # Bot settings
     # Daily brief is triggered by WHOOP-data-arrival inside a window, not a fixed

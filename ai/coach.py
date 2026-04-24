@@ -781,7 +781,11 @@ class Coach:
         prompt = DAILY_BRIEF_PROMPT.format(data=context, stoic_quote=stoic_quote)
         brief = await self._ask_claude(prompt, allow_tools=False)
 
-        # Best-effort Notion log (unchanged behaviour)
+        # Best-effort Notion log. Two writes now — one daily-summary row, plus
+        # one row per Strava activity that came in since yesterday. Each write
+        # is independently try/except'd so a failure on one doesn't skip the
+        # others; we care more about "something got logged" than "everything
+        # was perfect" on the morning-brief path.
         try:
             snapshot = await self.whoop.get_today_snapshot()
             rec = snapshot.get("recovery", {}) or {}
@@ -792,6 +796,8 @@ class Coach:
             sleep_score = slp.get("score", {}) if slp else {}
             stage_summary = sleep_score.get("stage_summary", {}) if sleep_score else {}
 
+            # 1) Daily row (WHOOP + brief text). No activities list here —
+            # Strava activities become their own rows in the Workouts DB below.
             await self.notion.log_daily_entry(
                 date=datetime.now().strftime("%Y-%m-%d"),
                 summary={
@@ -800,10 +806,21 @@ class Coach:
                     "rhr": score.get("resting_heart_rate"),
                     "sleep_hours": round(stage_summary.get("total_in_bed_time_milli", 0) / 3_600_000, 1),
                     "sleep_efficiency": sleep_score.get("sleep_efficiency_percentage"),
-                    "activities": [self.strava.summarize_activity(a) for a in activities],
                     "daily_brief": brief,
                 },
             )
+
+            # 2) One Runs row per Strava activity. Each activity also flows
+            # into the Schedule DB (via find_or_create_schedule inside
+            # log_run) so that day's Schedule entry exists and relates back.
+            # Non-run cardio (rides/hikes/swims/walks) lands here too, tagged
+            # by Type. Dedupe-by-date isn't enforced — if the same activity
+            # lands twice, user can delete the dupe row manually.
+            for a in activities:
+                try:
+                    await self.notion.log_strava_activity(a)
+                except Exception as e:
+                    logger.debug(f"Notion run log skipped for activity {a.get('id')}: {e}")
         except Exception as e:
             logger.warning(f"Notion log failed silently: {e}")
 
@@ -1162,10 +1179,19 @@ class Coach:
                 raw=message,
             )
             try:
+                # Writes to the Lifts DB. The parser now returns optional
+                # structured `sets`, `reps`, `weight_lb`, `workout` fields
+                # when Haiku can extract them — when it can't, those cells
+                # stay blank and the raw message in Notes preserves the
+                # original phrasing so nothing is lost.
                 await self.notion.log_lift(
                     date=datetime.now().strftime("%Y-%m-%d"),
                     exercise=lift["exercise"],
-                    sets_reps_weight=lift["details"],
+                    workout=lift.get("workout"),
+                    sets=lift.get("sets"),
+                    reps=lift.get("reps"),
+                    weight_lb=lift.get("weight_lb"),
+                    notes=message,
                 )
             except Exception:
                 pass
@@ -1195,33 +1221,84 @@ class Coach:
     async def _try_parse_lift(self, message: str) -> dict | None:
         """Fast pre-filter: if the message has no numbers or lift keywords, skip
         the model call entirely. Saves roughly one Claude round-trip per chat.
+
+        Returns a dict with:
+          exercise (str, required), details (str, free-form backup),
+          sets, reps, weight_lb (numbers, optional — missing if ambiguous),
+          workout (Push/Pull/Legs/Other, optional — model's best guess).
+
+        The structured fields feed the Notion Lifts DB columns directly. The
+        details string is kept as a fallback so partial parses (e.g. Haiku
+        extracts exercise but can't pin sets/reps) still record the raw lift.
         """
         if not _LIFT_HINT.search(message):
             return None
 
+        # Prompt tightened so Haiku returns numbers we can put straight into
+        # number columns. Unit note is critical — "135" in a bench context
+        # is pounds in the US; the model defaults to whatever the message
+        # says, and we coerce below.
         parse_prompt = f"""
-Does this message describe a weightlifting exercise? If yes, extract:
-- exercise name
-- details (sets, reps, weight as described)
+Does this message describe a weightlifting exercise? If yes, extract the structured fields.
 
 Message: "{message}"
 
-Respond with JSON only. If it's a lift: {{"is_lift": true, "exercise": "...", "details": "..."}}
-If not: {{"is_lift": false}}
+Respond with JSON ONLY. Schema:
+{{
+  "is_lift": true | false,
+  "exercise": "<lift name, e.g. 'Bench press', 'Back squat'>",
+  "details": "<original sets/reps/weight phrasing, e.g. '3x10 @ 145'>",
+  "sets": <int or null>,
+  "reps": <int or null — if sets are a scheme like 5x5, this is reps per set>,
+  "weight_lb": <number or null — assume pounds unless message says 'kg'>,
+  "workout": "Push" | "Pull" | "Legs" | "Other" | null
+}}
+
+Rules:
+  • If the message describes a lift but you can't confidently pin a field, set it to null.
+  • For push/pull/legs: Bench/OHP/Dips/Push-ups = Push. Rows/Pull-ups/Chin-ups/Curls = Pull.
+    Squat/Deadlift/Lunge/Leg press = Legs. Core/accessory/mixed = Other.
+  • "185" in a bench context means 185 lb. If the message says "60 kg", convert: kg*2.2046, rounded.
+  • If it's not a lift, return {{"is_lift": false}}.
 """.strip()
 
         try:
             resp = await self.claude.messages.create(
                 model=self.cheap_model,  # Haiku — ~10x cheaper than Sonnet
-                max_tokens=200,
+                max_tokens=300,
                 messages=[{"role": "user", "content": parse_prompt}],
             )
             raw = resp.content[0].text
             start = raw.find("{")
             end = raw.rfind("}") + 1
             data = json.loads(raw[start:end])
-            if data.get("is_lift"):
-                return {"exercise": data["exercise"], "details": data["details"]}
+            if not data.get("is_lift"):
+                return None
+
+            def _coerce_int(v):
+                if v is None:
+                    return None
+                try:
+                    return int(float(v))
+                except (TypeError, ValueError):
+                    return None
+
+            def _coerce_float(v):
+                if v is None:
+                    return None
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+
+            return {
+                "exercise": data.get("exercise") or "",
+                "details": data.get("details") or "",
+                "sets": _coerce_int(data.get("sets")),
+                "reps": _coerce_int(data.get("reps")),
+                "weight_lb": _coerce_float(data.get("weight_lb")),
+                "workout": data.get("workout") if data.get("workout") in ("Push", "Pull", "Legs", "Other") else None,
+            }
         except Exception as e:
             logger.debug(f"Lift parse failed: {e}")
         return None

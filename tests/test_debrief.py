@@ -122,7 +122,10 @@ def _build_coach(db: Database) -> Coach:
     cfg.WHOOP_CLIENT_SECRET = "x"
     cfg.WHOOP_REFRESH_TOKEN = "x"
     cfg.NOTION_API_KEY = ""
-    cfg.NOTION_DATABASE_ID = ""
+    cfg.NOTION_SCHEDULE_DATABASE_ID = ""
+    cfg.NOTION_LIFTS_DATABASE_ID = ""
+    cfg.NOTION_RUNS_DATABASE_ID = ""
+    cfg.NOTION_DAILY_DATABASE_ID = ""
     cfg.HOME_LAT = 40.0
     cfg.HOME_LNG = -73.0
     cfg.HOME_CITY = "Test"
