@@ -339,9 +339,17 @@ class Scheduler:
 
             # Strava: walk back 2 days to catch edits/delayed uploads.
             # Webhooks handle everything fresh; this is the safety net only.
+            # We enrich each activity with /activities/{id} + zones so HR
+            # data lands even when this safety-net path is what wrote the row.
             after_ts = int((now - timedelta(days=2)).timestamp())
             count_a = 0
             async for act in self.coach.strava.iter_all_activities(after=after_ts):
+                try:
+                    act = await self.coach.strava.enrich_activity(act)
+                except Exception as e:
+                    logger.debug(
+                        f"Nightly enrichment skipped for {act.get('id')}: {e}"
+                    )
                 await db.upsert_strava_activity(act)
                 count_a += 1
             await db.set_sync_state(

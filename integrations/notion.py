@@ -348,8 +348,16 @@ class NotionClient:
         workout: str | None = None,
         notes: str | None = None,
     ) -> str | None:
-        """Create one Schedule row for `date`. Returns the page URL (relation
-        target) on success, None otherwise.
+        """Create one Schedule row for `date`. Returns the page UUID on
+        success (suitable for use as a Relation target), None otherwise.
+
+        IMPORTANT: returns page["id"], NOT page["url"]. Notion's Relation
+        property requires a UUID; passing a URL silently breaks the entire
+        page write that's trying to use this as its relation target. The
+        earlier version of this method returned `url or id` and that bug
+        caused ~80% of backfill writes to silently 400 because every newly
+        created Schedule got a URL back, then the Daily/Run row that
+        referenced it failed validation.
 
         Training Group and Workout values outside the known Select options are
         silently dropped rather than written; see _VALID_TRAINING_GROUPS and
@@ -371,7 +379,7 @@ class NotionClient:
         page = await self._create_page(self.schedule_db_id, props)
         if page:
             logger.info(f"Notion Schedule row created for {date}.")
-            return page.get("url") or page.get("id")
+            return page.get("id")
         return None
 
     async def find_schedule_for_date(self, date: str) -> str | None:
@@ -438,8 +446,8 @@ class NotionClient:
         weight_lb: float | None = None,
         rpe: float | None = None,
         notes: str | None = None,
-    ) -> None:
-        """Write one Lifts row.
+    ) -> bool:
+        """Write one Lifts row. Returns True on success, False on failure.
 
         All numeric fields are optional — when the chat-log parser can't
         extract structured sets/reps/weight, pass `notes=<raw message>` so
@@ -448,7 +456,7 @@ class NotionClient:
         """
         if not self.is_configured_lifts():
             logger.debug("Notion Lifts DB not configured — skipping.")
-            return
+            return False
 
         # Auto-create / fetch the Schedule row for this date so we can wire
         # the Relation. If Schedule isn't configured, skip the relation and
@@ -474,6 +482,8 @@ class NotionClient:
         page = await self._create_page(self.lifts_db_id, props)
         if page:
             logger.info(f"Notion Lift row created: {exercise} ({date}).")
+            return True
+        return False
 
     # ── Runs DB writes ──────────────────────────────────────────────────────
 
@@ -495,11 +505,14 @@ class NotionClient:
         zone_5_pct: float | None = None,
         source: str = "Manual",
         notes: str | None = None,
-    ) -> None:
-        """Write one Runs row (covers all cardio — runs, rides, hikes, swims, walks)."""
+    ) -> bool:
+        """Write one Runs row (covers all cardio — runs, rides, hikes, swims, walks).
+
+        Returns True on success, False on failure.
+        """
         if not self.is_configured_runs():
             logger.debug("Notion Runs DB not configured — skipping.")
-            return
+            return False
 
         # Match to a Schedule row for this date (Training Group='Run' for
         # cardio — the user can edit the schedule entry if they want
@@ -530,13 +543,17 @@ class NotionClient:
         page = await self._create_page(self.runs_db_id, props)
         if page:
             logger.info(f"Notion Run row created: {type} {name} ({date}).")
+            return True
+        return False
 
     async def log_strava_activity(
         self,
         activity: dict,
         zones: list[dict] | None = None,
-    ) -> None:
-        """Convert a raw Strava activity dict → Runs row.
+    ) -> bool:
+        """Convert a raw Strava activity dict → Runs row. Returns True on
+        success, False on failure (so backfill scripts can detect silent
+        write failures rather than logging OK on a Notion 400).
 
         `zones` is the optional /activities/{id}/zones response. Pass it when
         you have it; we'll populate Zone 1–5 % columns. Without it those
@@ -559,12 +576,11 @@ class NotionClient:
             lift_notes = "Auto-logged from Strava WeightTraining — set/rep detail not captured by Strava."
             if marker:
                 lift_notes = f"{marker} {lift_notes}"
-            await self.log_lift(
+            return await self.log_lift(
                 date=(activity.get("start_date_local") or "")[:10],
                 exercise=activity.get("name") or "WeightTraining",
                 notes=lift_notes,
             )
-            return
 
         distance_mi = _meters_to_miles(activity.get("distance"))
         duration_min = _seconds_to_minutes(activity.get("moving_time"))
@@ -574,7 +590,7 @@ class NotionClient:
 
         zone_pcts = _zones_from_strava_distribution(zones, activity.get("moving_time"))
 
-        await self.log_run(
+        return await self.log_run(
             date=(activity.get("start_date_local") or "")[:10],
             name=activity.get("name") or sport_raw,
             type=type_label,
@@ -594,8 +610,8 @@ class NotionClient:
 
     # ── Daily Log writes ────────────────────────────────────────────────────
 
-    async def log_daily_entry(self, date: str, summary: dict) -> None:
-        """Write one Daily Log row.
+    async def log_daily_entry(self, date: str, summary: dict) -> bool:
+        """Write one Daily Log row. Returns True on success, False on failure.
 
         summary keys (all optional):
           recovery_score, hrv, rhr, sleep_hours, sleep_efficiency (numbers)
@@ -603,7 +619,7 @@ class NotionClient:
         """
         if not self.is_configured_daily():
             logger.debug("Notion Daily Log DB not configured — skipping.")
-            return
+            return False
 
         schedule_page_id = await self.find_or_create_schedule(date=date)
 
@@ -623,3 +639,5 @@ class NotionClient:
         page = await self._create_page(self.daily_db_id, props)
         if page:
             logger.info(f"Notion Daily Log row created for {date}.")
+            return True
+        return False

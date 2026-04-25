@@ -88,7 +88,12 @@ class StravaClient:
                 page += 1
 
     async def get_activity_detail(self, activity_id: int) -> dict:
-        """Fetch full detail for a single activity."""
+        """Fetch full detail for a single activity.
+
+        The Detailed activity response includes fields the list endpoint
+        omits — most importantly `average_heartrate` and `max_heartrate`.
+        Without this enrichment, all HR columns end up null.
+        """
         await self._ensure_token()
         async with httpx.AsyncClient() as client:
             resp = await client.get(
@@ -97,6 +102,67 @@ class StravaClient:
             )
             resp.raise_for_status()
             return resp.json()
+
+    async def get_activity_zones(self, activity_id: int) -> list[dict] | None:
+        """Fetch the per-zone time distribution for an activity.
+
+        Returns the raw Strava response (a list of zone-type dicts, each
+        with `distribution_buckets`). Returns None on any failure — zones
+        are optional context, never worth crashing the caller for. Activities
+        without a paired HR sensor will return an empty list (200 OK with []),
+        which we also normalize to None so downstream code can treat
+        "no zones" uniformly.
+        """
+        await self._ensure_token()
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{STRAVA_BASE}/activities/{activity_id}/zones",
+                    headers={"Authorization": f"Bearer {self._access_token}"},
+                )
+        except Exception as e:
+            logger.debug(f"Strava zones fetch failed for {activity_id}: {e}")
+            return None
+        if resp.status_code != 200:
+            logger.debug(
+                f"Strava zones {activity_id} returned {resp.status_code}: {resp.text[:200]}"
+            )
+            return None
+        data = resp.json() or []
+        return data or None
+
+    async def enrich_activity(
+        self, activity: dict, *, fetch_zones: bool = True
+    ) -> dict:
+        """Take a Summary activity dict and return an enriched copy with
+        Detailed fields merged in (for HR), plus optionally the HR-zone
+        distribution stored under the `_zones` key for downstream use.
+
+        Use this in any code path that gets activities from the list endpoint
+        and writes them to the database — it's the difference between Notion
+        rows with an Avg HR and rows without.
+
+        `fetch_zones=False` skips the second API call. Useful when you want
+        HR but the zones data isn't critical and you want to halve API cost.
+        """
+        activity_id = activity.get("id")
+        if not activity_id:
+            return activity
+        out = dict(activity)  # shallow copy so caller's dict isn't mutated
+        try:
+            detail = await self.get_activity_detail(int(activity_id))
+            if detail:
+                # Detailed is a superset of Summary; merge with detail winning.
+                out = {**out, **detail}
+        except Exception as e:
+            logger.debug(f"Enrichment detail fetch failed for {activity_id}: {e}")
+        if fetch_zones:
+            zones = await self.get_activity_zones(int(activity_id))
+            if zones is not None:
+                # Stash under "_zones" inside the same dict that gets serialized
+                # to raw_json — backfill_notion.py reads this back.
+                out["_zones"] = zones
+        return out
 
     def summarize_activity(self, activity: dict) -> str:
         """Convert a raw Strava activity dict into a readable summary string."""

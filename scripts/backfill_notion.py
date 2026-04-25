@@ -80,25 +80,83 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return con
 
 
+def _whoop_workouts_table_exists(con: sqlite3.Connection) -> bool:
+    cur = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='whoop_workouts'"
+    )
+    return cur.fetchone() is not None
+
+
 def read_strava(con: sqlite3.Connection, start: str | None, end: str | None) -> list[dict]:
     """Return Strava activities as raw-ish dicts compatible with
-    log_strava_activity(). We prefer raw_json (which preserves fields like
-    start_date_local) and fall back to reconstructing from columns.
+    log_strava_activity(), enriched with WHOOP workout HR + HR-zones when
+    a matching WHOOP workout exists.
+
+    JOIN strategy (mirrors database.get_correlated_runs_in_range):
+      - Same calendar day (s.date = w.start_date)
+      - Within ±30 min of start time (Strava and WHOOP timestamps for the
+        same physical workout typically agree within seconds, but a 30-min
+        window cushions clock skew, lap-button delays, and edits).
+
+    Why prefer WHOOP HR over Strava HR: WHOOP captures HR continuously from
+    the wrist with zone math tuned to the user's max HR. Strava HR depends
+    on whether you paired a sensor at recording time and uses generic zone
+    cutoffs. When WHOOP has the workout, its numbers are the right call.
+
+    Strava HR (from Strava API) is used as a fallback when WHOOP didn't
+    record the workout (e.g., you took the strap off for a swim).
     """
-    q = "SELECT * FROM strava_activities"
+    have_whoop_workouts = _whoop_workouts_table_exists(con)
+
+    if have_whoop_workouts:
+        # The ±1800-second match is best-effort — Strava's start_date in
+        # raw_json is UTC ISO, WHOOP's start_utc is also UTC ISO, so direct
+        # epoch subtraction is meaningful. If raw_json lacks start_date we
+        # fall back to date-only matching, which is fine for users with at
+        # most one workout per day per sport (the common case for runners).
+        q = """
+            SELECT
+                s.activity_id, s.date, s.sport_type, s.name,
+                s.distance_m, s.moving_time_s, s.total_elevation_gain_m,
+                s.average_hr AS strava_avg_hr,
+                s.raw_json,
+                w.average_hr  AS whoop_avg_hr,
+                w.max_hr      AS whoop_max_hr,
+                w.zone0_ms,   w.zone1_ms, w.zone2_ms,
+                w.zone3_ms,   w.zone4_ms, w.zone5_ms,
+                w.workout_id  AS whoop_workout_id
+            FROM strava_activities s
+            LEFT JOIN whoop_workouts w
+              ON w.start_date = s.date
+             AND ABS(
+                   strftime('%s', w.start_utc)
+                   - COALESCE(
+                       strftime('%s', json_extract(s.raw_json, '$.start_date')),
+                       strftime('%s', s.date || ' 00:00:00')
+                     )
+                 ) < 1800
+        """
+    else:
+        q = "SELECT *, NULL AS whoop_avg_hr, NULL AS whoop_max_hr, "
+        q += "NULL AS zone0_ms, NULL AS zone1_ms, NULL AS zone2_ms, "
+        q += "NULL AS zone3_ms, NULL AS zone4_ms, NULL AS zone5_ms, "
+        q += "NULL AS whoop_workout_id, average_hr AS strava_avg_hr "
+        q += "FROM strava_activities s"
+
+    where: list[str] = []
     params: list = []
-    clauses: list[str] = []
     if start:
-        clauses.append("date >= ?")
+        where.append("s.date >= ?")
         params.append(start)
     if end:
-        clauses.append("date <= ?")
+        where.append("s.date <= ?")
         params.append(end)
-    if clauses:
-        q += " WHERE " + " AND ".join(clauses)
-    q += " ORDER BY date ASC"
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY s.date ASC"
 
     activities: list[dict] = []
+    matched_whoop = 0
     for row in con.execute(q, params):
         raw = row["raw_json"]
         if raw:
@@ -108,19 +166,64 @@ def read_strava(con: sqlite3.Connection, start: str | None, end: str | None) -> 
                 act = {}
         else:
             act = {}
-        # Fill in anything missing from the normalized columns.
+
         act.setdefault("id", row["activity_id"])
         act.setdefault("name", row["name"])
         act.setdefault("sport_type", row["sport_type"])
         act.setdefault("distance", row["distance_m"])
         act.setdefault("moving_time", row["moving_time_s"])
         act.setdefault("total_elevation_gain", row["total_elevation_gain_m"])
-        act.setdefault("average_heartrate", row["average_hr"])
-        # log_strava_activity takes start_date_local and slices the date; if
-        # raw_json didn't have it, synthesize from our `date` column.
         if not act.get("start_date_local") and row["date"]:
             act["start_date_local"] = f"{row['date']}T00:00:00"
+
+        # ── HR resolution: WHOOP > Strava-detail > Strava-summary ───────────
+        # raw_json may carry average_heartrate (from sync_history's enrich
+        # path). WHOOP's avg HR is more authoritative when present, so we
+        # override unconditionally rather than just-fill-on-null.
+        if row["whoop_avg_hr"] is not None:
+            act["average_heartrate"] = row["whoop_avg_hr"]
+            matched_whoop += 1
+        elif act.get("average_heartrate") is None and row["strava_avg_hr"] is not None:
+            act["average_heartrate"] = row["strava_avg_hr"]
+
+        # ── HR zones from WHOOP (zone0..zone5 milliseconds) ────────────────
+        # We collapse zone0 + zone1 (WHOOP labels Z0=warmup-before-Z1) into
+        # a single "Zone 1" so the Notion view stays five-zone like Strava
+        # convention. Otherwise the user would see a Z0 column they didn't
+        # ask for.
+        zone_ms = [
+            row["zone0_ms"], row["zone1_ms"], row["zone2_ms"],
+            row["zone3_ms"], row["zone4_ms"], row["zone5_ms"],
+        ]
+        if any(z is not None for z in zone_ms):
+            zone_ms = [z or 0 for z in zone_ms]
+            total_ms = sum(zone_ms)
+            if total_ms > 0:
+                z1 = round(100.0 * (zone_ms[0] + zone_ms[1]) / total_ms, 1)
+                z2 = round(100.0 * zone_ms[2] / total_ms, 1)
+                z3 = round(100.0 * zone_ms[3] / total_ms, 1)
+                z4 = round(100.0 * zone_ms[4] / total_ms, 1)
+                z5 = round(100.0 * zone_ms[5] / total_ms, 1)
+                # Stash under _whoop_zone_pcts so log_strava_activity (which
+                # reads from positional kwargs) can pull them. We pop this
+                # in the writer loop below.
+                act["_whoop_zone_pcts"] = {
+                    "zone_1_pct": z1, "zone_2_pct": z2, "zone_3_pct": z3,
+                    "zone_4_pct": z4, "zone_5_pct": z5,
+                }
+
         activities.append(act)
+
+    if have_whoop_workouts:
+        logger.info(
+            f"  WHOOP-HR matched: {matched_whoop}/{len(activities)} Strava activities "
+            "(rest fall back to Strava HR if available)"
+        )
+    else:
+        logger.warning(
+            "  whoop_workouts table doesn't exist — run `python sync_history.py "
+            "--whoop-only` first to populate it, otherwise HR will be Strava-only."
+        )
     return activities
 
 
@@ -317,6 +420,7 @@ async def run_backfill(args: argparse.Namespace) -> int:
             logger.info(f"  → {len(done_dates)} dates already in Daily Log")
 
     # ── Strava → Runs ───────────────────────────────────────────────────────
+    strava_ok = strava_fail = 0
     if not args.whoop_only:
         activities = read_strava(con, start, end)
         to_write = [a for a in activities if str(a.get("id")) not in done_strava]
@@ -327,13 +431,73 @@ async def run_backfill(args: argparse.Namespace) -> int:
                 logger.info(f"DRY {label}")
                 continue
             try:
-                await notion.log_strava_activity(act)
-                logger.info(f"OK  {label}")
+                # WHOOP-derived zone percentages (preferred) take precedence;
+                # if missing, fall back to Strava-derived zones from raw_json.
+                whoop_zone_pcts = act.pop("_whoop_zone_pcts", None) if isinstance(act, dict) else None
+                strava_zones_raw = act.pop("_zones", None) if isinstance(act, dict) else None
+                # Route WeightTraining activities to the Lifts DB regardless
+                # of whether we have WHOOP zones for them. Earlier this fell
+                # through to the WHOOP-zones path below and stuffed lifts
+                # into the Runs DB — which is wrong; the Lifts DB has its
+                # own column shape and the Runs DB shouldn't carry strength
+                # work mixed in with cardio. Lifts get logged without zones
+                # because the Lifts DB schema doesn't have zone columns.
+                from integrations.notion import _STRAVA_LIFT_TYPES
+                sport_raw = act.get("sport_type", act.get("type", "Run"))
+                if sport_raw in _STRAVA_LIFT_TYPES:
+                    ok = await notion.log_strava_activity(act)  # routes to log_lift internally
+                elif whoop_zone_pcts:
+                    # Cardio with WHOOP zones — call log_run directly so we
+                    # can pass the WHOOP-derived zone percentages instead of
+                    # whatever Strava might have. We recompute name/distance/
+                    # pace/etc. here so the row shape matches log_strava_activity.
+                    from integrations.notion import (
+                        _meters_to_miles, _meters_to_feet,
+                        _seconds_to_minutes, _format_pace, _STRAVA_TYPE_MAP,
+                    )
+                    type_label = _STRAVA_TYPE_MAP.get(sport_raw, "Run")
+                    distance_mi = _meters_to_miles(act.get("distance"))
+                    duration_min = _seconds_to_minutes(act.get("moving_time"))
+                    elevation_ft = _meters_to_feet(act.get("total_elevation_gain"))
+                    pace = _format_pace(duration_min, distance_mi) if type_label in ("Run", "Hike", "Walk") else None
+                    aid = act.get("id")
+                    ok = await notion.log_run(
+                        date=(act.get("start_date_local") or "")[:10],
+                        name=act.get("name") or sport_raw,
+                        type=type_label,
+                        distance_mi=distance_mi,
+                        pace=pace,
+                        duration_min=duration_min,
+                        avg_hr=act.get("average_heartrate"),
+                        elevation_gain_ft=elevation_ft,
+                        zone_1_pct=whoop_zone_pcts.get("zone_1_pct"),
+                        zone_2_pct=whoop_zone_pcts.get("zone_2_pct"),
+                        zone_3_pct=whoop_zone_pcts.get("zone_3_pct"),
+                        zone_4_pct=whoop_zone_pcts.get("zone_4_pct"),
+                        zone_5_pct=whoop_zone_pcts.get("zone_5_pct"),
+                        source="WHOOP" if act.get("average_heartrate") else "Strava",
+                        notes=f"[strava:{aid}]" if aid else None,
+                    )
+                else:
+                    # Cardio without WHOOP zones — let log_strava_activity
+                    # handle Strava zones (if any) the original way.
+                    ok = await notion.log_strava_activity(act, zones=strava_zones_raw)
             except Exception as e:
-                logger.warning(f"ERR {label} — {e}")
+                ok = False
+                logger.warning(f"EXC {label} — {e}")
+            if ok:
+                strava_ok += 1
+                logger.info(f"OK  {label}")
+            else:
+                strava_fail += 1
+                # Notion-side failure (4xx/5xx) was already logged as a
+                # warning by _create_page; this surfaces it at the row level
+                # so the final summary count means something.
+                logger.warning(f"FAIL {label} — Notion rejected the write (see warnings above)")
             await asyncio.sleep(WRITE_DELAY_S)
 
     # ── WHOOP → Daily Log ───────────────────────────────────────────────────
+    whoop_ok = whoop_fail = 0
     if not args.strava_only:
         days = read_whoop_days(con, start, end)
         to_write = [d for d in days if d["date"] not in done_dates]
@@ -344,14 +508,23 @@ async def run_backfill(args: argparse.Namespace) -> int:
                 logger.info(f"DRY {label}")
                 continue
             try:
-                await notion.log_daily_entry(summary["date"], summary)
-                logger.info(f"OK  {label}")
+                ok = await notion.log_daily_entry(summary["date"], summary)
             except Exception as e:
-                logger.warning(f"ERR {label} — {e}")
+                ok = False
+                logger.warning(f"EXC {label} — {e}")
+            if ok:
+                whoop_ok += 1
+                logger.info(f"OK  {label}")
+            else:
+                whoop_fail += 1
+                logger.warning(f"FAIL {label} — Notion rejected the write (see warnings above)")
             await asyncio.sleep(WRITE_DELAY_S)
 
     con.close()
-    logger.info("Done.")
+    logger.info("=" * 60)
+    logger.info(f"Done. Strava: {strava_ok} ok / {strava_fail} failed.  WHOOP: {whoop_ok} ok / {whoop_fail} failed.")
+    if strava_fail or whoop_fail:
+        logger.info("Re-run the same command — failures are skipped on re-run, only the missing rows will be retried.")
     return 0
 
 

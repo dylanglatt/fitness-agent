@@ -436,7 +436,11 @@ class WhoopClient:
         raw JSON.
         """
         score = rec.get("score") or {}
-        zones = score.get("zone_duration") or {}
+        # WHOOP v2 uses 'zone_durations' (plural). An older revision of this
+        # code looked for 'zone_duration' (singular) and silently captured
+        # zero zones for every workout — leaving HR populated but zone
+        # percentages blank in downstream Notion rows. Accept either form.
+        zones = score.get("zone_durations") or score.get("zone_duration") or {}
         start = rec.get("start") or ""
         end = rec.get("end") or ""
         sport_id = rec.get("sport_id")

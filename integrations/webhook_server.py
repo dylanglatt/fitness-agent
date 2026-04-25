@@ -131,9 +131,13 @@ async def _strava_event(request: web.Request) -> web.Response:
                 return
             if not object_id:
                 return
-            detail = await coach.strava.get_activity_detail(int(object_id))
-            if detail:
-                await db.upsert_strava_activity(detail)
+            # Enrich (Detail + zones) so HR fields and HR-zone distribution
+            # land in raw_json on first write — same shape the backfill produces,
+            # so downstream code (Notion sync, coach analytics) doesn't need
+            # to special-case webhook-sourced rows.
+            enriched = await coach.strava.enrich_activity({"id": int(object_id)})
+            if enriched and enriched.get("id"):
+                await db.upsert_strava_activity(enriched)
                 logger.info("Strava activity %s upserted from webhook.", object_id)
         except Exception as e:
             logger.error("Strava webhook fetch/upsert failed: %s", e, exc_info=True)
