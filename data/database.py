@@ -538,6 +538,49 @@ class Database:
                 rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def find_whoop_workout_for_strava_activity(
+        self,
+        activity: dict,
+        plus_minus_seconds: int = 1800,
+    ) -> Optional[dict]:
+        """Find the WHOOP workout that overlaps with a Strava activity in time.
+
+        Match on (same calendar day) AND (start time within ±30 minutes by
+        default). Returns the whoop_workouts row dict (with all the zone_*
+        and HR columns) or None when no workout matches.
+
+        Used by the live morning-brief and webhook write paths to get HR +
+        zones from WHOOP at the moment a new Strava activity comes in,
+        instead of waiting for backfill_notion.py to be re-run.
+
+        The ±30 min window matches the same threshold used by
+        get_correlated_runs_in_range — Strava and WHOOP timestamps for the
+        same physical workout typically agree within seconds, but the
+        cushion handles clock skew, lap-button delays, and post-hoc edits.
+        """
+        # Pull the activity's date + start time from raw_json or fall back
+        # to top-level fields. start_date is UTC ISO; start_date_local
+        # could mislead us by an hour around DST, so prefer UTC.
+        start_iso = activity.get("start_date") or activity.get("start_date_local") or ""
+        if not start_iso:
+            return None
+        date = start_iso[:10]
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT *
+                FROM whoop_workouts
+                WHERE start_date = ?
+                  AND ABS(strftime('%s', start_utc) - strftime('%s', ?)) < ?
+                ORDER BY ABS(strftime('%s', start_utc) - strftime('%s', ?)) ASC
+                LIMIT 1
+                """,
+                (date, start_iso, plus_minus_seconds, start_iso),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return dict(row) if row else None
+
     # ── Strava upserts ──────────────────────────────────────────────────────
 
     async def upsert_strava_activity(self, activity: dict):

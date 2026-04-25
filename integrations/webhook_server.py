@@ -139,6 +139,18 @@ async def _strava_event(request: web.Request) -> web.Response:
             if enriched and enriched.get("id"):
                 await db.upsert_strava_activity(enriched)
                 logger.info("Strava activity %s upserted from webhook.", object_id)
+
+                # Push to Notion immediately so the row appears in real time
+                # rather than waiting for the next morning brief. Look up the
+                # matching WHOOP workout (if WHOOP recorded the same session)
+                # and pass it so HR + zones come from WHOOP's wrist data.
+                # Wrapped in its own try/except — a Notion failure shouldn't
+                # roll back the SQLite write that's already succeeded.
+                try:
+                    whoop_match = await db.find_whoop_workout_for_strava_activity(enriched)
+                    await coach.notion.log_strava_activity(enriched, whoop_workout=whoop_match)
+                except Exception as e:
+                    logger.warning("Notion write from webhook failed for %s: %s", object_id, e)
         except Exception as e:
             logger.error("Strava webhook fetch/upsert failed: %s", e, exc_info=True)
 

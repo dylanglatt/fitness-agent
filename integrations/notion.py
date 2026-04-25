@@ -112,6 +112,39 @@ def _format_pace(duration_min: float | None, distance_mi: float | None) -> str |
     return f"{whole}:{secs:02d}/mi"
 
 
+def zone_pcts_from_whoop_row(row: dict | None) -> dict[str, float] | None:
+    """Convert a whoop_workouts SQLite row's zone0_ms..zone5_ms into the
+    five zone percentages we put into Notion.
+
+    Collapses WHOOP's Z0 (warmup-before-Z1) into Z1 so the Notion view
+    stays five-zone. Returns None when no zone data is available so the
+    caller can skip writing those columns and leave them blank rather
+    than 0%-which would falsely imply you spent zero time in each zone.
+
+    Used by both the offline backfill and the live daily-brief / webhook
+    paths — keeping the math in one place avoids drift between them.
+    """
+    if not row:
+        return None
+    zone_ms = [
+        row.get("zone0_ms"), row.get("zone1_ms"), row.get("zone2_ms"),
+        row.get("zone3_ms"), row.get("zone4_ms"), row.get("zone5_ms"),
+    ]
+    if not any(z is not None for z in zone_ms):
+        return None
+    zone_ms = [z or 0 for z in zone_ms]
+    total_ms = sum(zone_ms)
+    if total_ms <= 0:
+        return None
+    return {
+        "zone_1_pct": round(100.0 * (zone_ms[0] + zone_ms[1]) / total_ms, 1),
+        "zone_2_pct": round(100.0 * zone_ms[2] / total_ms, 1),
+        "zone_3_pct": round(100.0 * zone_ms[3] / total_ms, 1),
+        "zone_4_pct": round(100.0 * zone_ms[4] / total_ms, 1),
+        "zone_5_pct": round(100.0 * zone_ms[5] / total_ms, 1),
+    }
+
+
 def _zones_from_strava_distribution(
     zones: list[dict] | None,
     total_seconds: float | int | None,
@@ -550,15 +583,26 @@ class NotionClient:
         self,
         activity: dict,
         zones: list[dict] | None = None,
+        whoop_workout: dict | None = None,
     ) -> bool:
         """Convert a raw Strava activity dict → Runs row. Returns True on
         success, False on failure (so backfill scripts can detect silent
         write failures rather than logging OK on a Notion 400).
 
-        `zones` is the optional /activities/{id}/zones response. Pass it when
-        you have it; we'll populate Zone 1–5 % columns. Without it those
-        columns stay blank (not zero — that would falsely imply you spent
-        0% in each zone rather than 'data unavailable').
+        `zones` is the optional /activities/{id}/zones Strava response. Pass
+        it when you have it; we'll populate Zone 1–5 % columns from Strava's
+        zone math.
+
+        `whoop_workout` is the OPTIONAL matched WHOOP workout row from
+        SQLite (use Database.find_whoop_workout_for_strava_activity to look
+        it up). When provided, WHOOP HR and WHOOP-derived zone percentages
+        take precedence over the Strava equivalents — WHOOP's continuous
+        wrist HR with user-tuned zones is the more authoritative source.
+        Falls back to Strava data when WHOOP didn't capture the workout.
+
+        Without either zone source, columns stay blank (not zero — that
+        would falsely imply you spent 0% in each zone rather than 'data
+        unavailable').
 
         We embed a `[strava:<id>]` marker in the Notes field so backfill
         scripts (and any future dedup logic) can detect which Strava
@@ -588,7 +632,17 @@ class NotionClient:
         type_label = _STRAVA_TYPE_MAP.get(sport_raw, "Run")
         avg_pace = _format_pace(duration_min, distance_mi) if type_label in ("Run", "Hike", "Walk") else None
 
-        zone_pcts = _zones_from_strava_distribution(zones, activity.get("moving_time"))
+        # Source priority: WHOOP > Strava-zones > nothing.
+        whoop_zone_pcts = zone_pcts_from_whoop_row(whoop_workout)
+        if whoop_zone_pcts:
+            zone_pcts = whoop_zone_pcts
+            source = "WHOOP"
+        else:
+            zone_pcts = _zones_from_strava_distribution(zones, activity.get("moving_time")) or {}
+            source = "Strava"
+
+        # HR: prefer WHOOP avg when the workout matched; fall back to Strava.
+        avg_hr = (whoop_workout or {}).get("average_hr") or activity.get("average_heartrate")
 
         return await self.log_run(
             date=(activity.get("start_date_local") or "")[:10],
@@ -597,14 +651,14 @@ class NotionClient:
             distance_mi=distance_mi,
             pace=avg_pace,
             duration_min=duration_min,
-            avg_hr=activity.get("average_heartrate"),
+            avg_hr=avg_hr,
             elevation_gain_ft=elevation_ft,
-            zone_1_pct=(zone_pcts or {}).get("zone_1_pct"),
-            zone_2_pct=(zone_pcts or {}).get("zone_2_pct"),
-            zone_3_pct=(zone_pcts or {}).get("zone_3_pct"),
-            zone_4_pct=(zone_pcts or {}).get("zone_4_pct"),
-            zone_5_pct=(zone_pcts or {}).get("zone_5_pct"),
-            source="Strava",
+            zone_1_pct=zone_pcts.get("zone_1_pct"),
+            zone_2_pct=zone_pcts.get("zone_2_pct"),
+            zone_3_pct=zone_pcts.get("zone_3_pct"),
+            zone_4_pct=zone_pcts.get("zone_4_pct"),
+            zone_5_pct=zone_pcts.get("zone_5_pct"),
+            source=source,
             notes=marker,  # so we can detect already-imported activities on re-run
         )
 

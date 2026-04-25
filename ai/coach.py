@@ -816,9 +816,16 @@ class Coach:
             # Non-run cardio (rides/hikes/swims/walks) lands here too, tagged
             # by Type. Dedupe-by-date isn't enforced — if the same activity
             # lands twice, user can delete the dupe row manually.
+            #
+            # For each activity we look up the matching WHOOP workout by
+            # (date + ±30min) and pass it to log_strava_activity, which
+            # prefers WHOOP's continuous-wrist HR + zone math over Strava's
+            # numbers. Without this, new Runs rows would land with HR but
+            # no zones — same gap the offline backfill closed.
             for a in activities:
                 try:
-                    await self.notion.log_strava_activity(a)
+                    whoop_match = await self.db.find_whoop_workout_for_strava_activity(a)
+                    await self.notion.log_strava_activity(a, whoop_workout=whoop_match)
                 except Exception as e:
                     logger.debug(f"Notion run log skipped for activity {a.get('id')}: {e}")
         except Exception as e:
