@@ -37,6 +37,7 @@ import anthropic
 
 from ai.prompts import (
     SYSTEM_PROMPT,
+    CHAT_SYSTEM_PROMPT,
     DAILY_BRIEF_PROMPT,
     WEEKLY_SUMMARY_PROMPT,
     SUNDAY_REFLECTION_PROMPT,
@@ -111,6 +112,50 @@ _DEBRIEF_INTENT = re.compile(
     \b(run|ride|cycle|workout|session|lift|training|activity|hike|ruck|game)\b
     """,
     re.IGNORECASE | re.VERBOSE | re.DOTALL,
+)
+
+
+# ── Regex — does this chat message want trend / historical detail? ──────────
+# When TRUE, the chat path falls through to the full layered context (last
+# 7d detail + 30d/12-mo aggregates + 14d activities). When FALSE, it uses
+# the small "today + last 3 days" snapshot — enough for "how am I today",
+# "log this lift", "what should I do this morning", which is the long tail
+# of chat traffic.
+_TREND_INTENT = re.compile(
+    r"""
+    \b(
+        trend|trending|progression|progress|improving|declining
+      | history|historical|baseline
+      | (last|past|over\s+the)\s+(week|month|year|\d+\s*(days?|weeks?|months?))
+      | (in|during|for)\s+(january|february|march|april|may|june|july|
+                          august|september|october|november|december)
+      | year[\s\-]?to[\s\-]?date|ytd|yoy|year[\s\-]?over[\s\-]?year
+      | compared?\s+to|versus|vs\.?
+      | average|avg|mean|median
+      | hrv\s+(over|across|in)
+    )\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+# ── Regex — is the user asking an educational/conceptual question? ──────────
+# Only when TRUE do we hit the knowledge retriever (which adds 1–2K tokens
+# and a sentence-transformer encode call). For "log my bench", "how am I
+# today", a knowledge dump is wasted tokens.
+_KNOWLEDGE_INTENT = re.compile(
+    r"""
+    \b(
+        why\b|what\s+is|what's|what\s+does|how\s+does|how\s+do
+      | explain|tell\s+me\s+about
+      | difference\s+between|compared?\s+to
+      | should\s+i|is\s+it\s+(better|worse|safe|ok)
+      | meaning|principle|concept|theory
+      | zone\s*\d|polari[sz]ed|hypertrophy|periodi[sz]ation
+      | vo2\s*max|lactate|threshold
+    )\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 
@@ -261,11 +306,24 @@ class Coach:
         self.weather = WeatherClient(config)
         self.claude = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
         self.model = config.CLAUDE_MODEL
-        # Haiku is ~10x cheaper — great for the "is this a lift?" classifier.
+        # Haiku is ~3× cheaper — great for the "is this a lift?" classifier and,
+        # when COACH_CHEAP_MODE is on, the conversational chat path too.
         self.cheap_model = "claude-haiku-4-5-20251001"
+        # Chat path model — Haiku by default, falls back to the heavier model
+        # if the user explicitly turns cheap-mode off. Independent of self.model
+        # so the morning brief / weekly summary / Sunday reflection keep using
+        # Sonnet (where prose quality matters most).
+        self.chat_model = (
+            getattr(config, "CHAT_MODEL", self.cheap_model)
+            if getattr(config, "COACH_CHEAP_MODE", True)
+            else self.model
+        )
 
-        # Conversation history for multi-turn chat
+        # Conversation history for multi-turn chat. Capped tight: long history
+        # buys little for a personal coach and inflates input tokens on every
+        # turn (no caching saves you on the messages list).
         self._conversation: list[dict] = []
+        self._conversation_max = 12  # 6 user/assistant pairs
 
     # ── Tool execution — called when Claude asks for data ───────────────────
 
@@ -321,15 +379,41 @@ class Coach:
         use_history: bool = False,
         allow_tools: bool = False,
         max_tokens: int = 1024,
+        model: Optional[str] = None,
+        system: Optional[str] = None,
+        max_tool_iters: int = 3,
     ) -> str:
-        """Send a message to Claude, handling any tool calls it makes."""
+        """Send a message to Claude, handling any tool calls it makes.
+
+        Cost-aware notes:
+          * `system` is wrapped in cache_control so the system prompt costs
+            ~10% of normal after the first call in a 5-minute window. Big win
+            on the chat path where SYSTEM_PROMPT dominates each turn.
+          * `model` lets callers route the chat path to Haiku while the
+            scheduled briefs (daily / weekly / Sunday) stay on Sonnet.
+          * `max_tool_iters` is now 3 (was 6). Real tool-use plans rarely
+            need more than 2 round-trips; 6 just paid for runaway loops.
+        """
         messages: list = list(self._conversation) if use_history else []
         messages.append({"role": "user", "content": user_message})
 
+        # Wrap the system prompt in a cache_control block so identical
+        # consecutive calls hit the prompt cache instead of reprocessing
+        # the prompt from scratch. The Anthropic SDK accepts this shape
+        # directly on the `system` field.
+        sys_text = system if system is not None else SYSTEM_PROMPT
+        cached_system = [
+            {
+                "type": "text",
+                "text": sys_text,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
         create_kwargs = dict(
-            model=self.model,
+            model=model or self.model,
             max_tokens=max_tokens,
-            system=SYSTEM_PROMPT,
+            system=cached_system,
             messages=messages,
         )
         if allow_tools:
@@ -337,8 +421,9 @@ class Coach:
 
         # Tool-use loop: keep responding to tool_use blocks until Claude
         # returns plain text (stop_reason != "tool_use"). Cap iterations so a
-        # buggy model can't spin forever.
-        for _ in range(6):
+        # buggy model can't spin forever AND so we don't pay for 6 round-trips
+        # on a question that only needed one.
+        for _ in range(max_tool_iters):
             response = await self.claude.messages.create(**create_kwargs)
 
             if response.stop_reason != "tool_use":
@@ -350,8 +435,8 @@ class Coach:
                 if use_history:
                     self._conversation.append({"role": "user", "content": user_message})
                     self._conversation.append({"role": "assistant", "content": reply})
-                    if len(self._conversation) > 40:
-                        self._conversation = self._conversation[-40:]
+                    if len(self._conversation) > self._conversation_max:
+                        self._conversation = self._conversation[-self._conversation_max:]
                 return reply
 
             # Claude wants to call one or more tools. Append the assistant
@@ -490,6 +575,98 @@ class Coach:
             )
 
         return lines
+
+    # ── Tiered context (cheap-mode) ─────────────────────────────────────────
+
+    async def _build_tiered_context(self, message: str) -> str:
+        """Pick a context tier based on what the message actually needs.
+
+        Tier 1 (default): today's recovery + 3-day daily summary + most
+        recent 3 activities. ~250–400 tokens. Covers the long tail —
+        "how am I today", "log my bench", "what should I run this morning".
+
+        Tier 2 (trend / date-range / multi-month questions): full layered
+        context (~2,000–3,000 tokens). The full context is also the right
+        choice when no recovery row exists for today, since the small
+        builder doesn't have the sleep/strain/HRV cross-references the
+        model needs to be useful at all.
+
+        We pay for the bigger build only when a regex on the user message
+        suggests we'll actually use it. This is the single biggest input-
+        token lever after prompt caching.
+        """
+        if _TREND_INTENT.search(message or ""):
+            return await self._build_layered_context()
+
+        today = datetime.now().date()
+        d3 = today - timedelta(days=3)
+        lines: list[str] = [f"TODAY: {today.strftime('%A, %B %d, %Y')}"]
+
+        # Live WHOOP snapshot — same call the layered builder makes first.
+        try:
+            snap = await self.whoop.get_today_snapshot()
+            rec_line = self.whoop.summarize_recovery(snap.get("recovery"))
+            slp_line = self.whoop.summarize_sleep(snap.get("sleep"))
+            if rec_line:
+                lines.append(f"  {rec_line}")
+            if slp_line:
+                lines.append(f"  {slp_line}")
+        except Exception as e:
+            logger.debug(f"Tiered context: live WHOOP snapshot unavailable: {e}")
+
+        # Last-3-days WHOOP daily rows. If we got fewer than 2 rows back,
+        # the user is clearly asking from a sparse-data state — escalate
+        # to the full builder so we don't answer from nothing.
+        try:
+            daily = await self.db.get_whoop_daily(str(d3), str(today))
+        except Exception as e:
+            logger.debug(f"Tiered context: WHOOP daily fetch failed: {e}")
+            daily = []
+        if len(daily) < 2:
+            return await self._build_layered_context()
+
+        lines.append("")
+        lines.append("LAST 3 DAYS (WHOOP):")
+        for r in daily:
+            parts = [r.get("date")]
+            if r.get("recovery_score") is not None:
+                parts.append(f"rec {int(r['recovery_score'])}%")
+            if r.get("hrv_rmssd_ms") is not None:
+                parts.append(f"hrv {r['hrv_rmssd_ms']}ms")
+            if r.get("resting_hr") is not None:
+                parts.append(f"rhr {int(r['resting_hr'])}")
+            if r.get("strain") is not None:
+                parts.append(f"strain {round(r['strain'], 1)}")
+            if r.get("total_asleep_hours") is not None:
+                parts.append(f"sleep {r['total_asleep_hours']}h")
+            lines.append("  " + " | ".join(parts))
+
+        # Last 3 Strava activities for "what did I just do" follow-ups.
+        try:
+            acts = await self.db.get_strava_activities_range(str(d3), str(today))
+        except Exception as e:
+            logger.debug(f"Tiered context: Strava range fetch failed: {e}")
+            acts = []
+        if acts:
+            lines.append("")
+            lines.append("RECENT ACTIVITIES (last 3 days):")
+            for a in acts[:3]:
+                mi = _m_to_mi(a.get("distance_m", 0))
+                dur = round((a.get("moving_time_s") or 0) / 60, 1)
+                parts = [a.get("date"), a.get("sport_type") or "?", f"{dur}min"]
+                if mi:
+                    parts.append(f"{mi}mi")
+                if a.get("average_hr"):
+                    parts.append(f"avg HR {int(a['average_hr'])}")
+                lines.append("  - " + " | ".join(parts))
+
+        lines.append("")
+        lines.append(
+            "NOTE: This is a quick snapshot. For trend / multi-week / month-over-"
+            "month / specific-date questions, call get_whoop_aggregates / "
+            "query_correlated_runs / get_strava_aggregates directly."
+        )
+        return "\n".join(lines)
 
     # ── Layered context builder ─────────────────────────────────────────────
 
@@ -1216,12 +1393,39 @@ class Coach:
                 raw=message,
             )
 
-        context = await self._build_layered_context()
-        knowledge = self._retrieve_knowledge(message)
+        # Tiered context: cheap "today + 3 days" by default, full layered
+        # build only when the user's message hints at trend / date-range
+        # questions. Single biggest input-token lever after prompt caching.
+        context = await self._build_tiered_context(message)
+
+        # Knowledge retrieval is conditional — skip it for "log my bench" /
+        # "how am I today" / "good morning" since those don't need a fitness
+        # textbook in the prompt. Adds 1–2K tokens when on; we only pay it
+        # when the message asks an educational/conceptual question.
+        knowledge = (
+            self._retrieve_knowledge(message)
+            if _KNOWLEDGE_INTENT.search(message or "")
+            else ""
+        )
+
+        # Tools are off by default. Enable only when the message looks like
+        # it'll need a database lookup (trend question or knowledge question
+        # with date phrases). Most chat ("log my squat", "how am I today")
+        # never enters a tool loop. With 3-iter cap and lean chat system
+        # prompt, the savings stack.
+        wants_tools = bool(_TREND_INTENT.search(message or ""))
+
         prompt = CHAT_PROMPT.format(
             message=message, context=context, knowledge=knowledge
         )
-        return await self._ask_claude(prompt, use_history=True, allow_tools=True)
+        return await self._ask_claude(
+            prompt,
+            use_history=True,
+            allow_tools=wants_tools,
+            model=self.chat_model,
+            system=CHAT_SYSTEM_PROMPT,
+            max_tool_iters=3,
+        )
 
     # ── Lift parsing (regex pre-filter + cheap model) ───────────────────────
 

@@ -29,8 +29,20 @@ class Config:
     WHOOP_REFRESH_TOKEN: str = os.getenv("WHOOP_REFRESH_TOKEN", "")
 
     # Anthropic (Claude)
+    #
+    # Two-model split (cost lever — see ai/coach.py):
+    #   CLAUDE_MODEL  — used for the morning brief, weekly summary, Sunday
+    #                   reflection, and post-workout debriefs. Quality of
+    #                   prose matters here; Sonnet pays for itself.
+    #   CHAT_MODEL    — used for the conversational chat path. Most chats
+    #                   are short ("log this lift", "how was my HRV") and
+    #                   Haiku does them just as well at ~3× lower cost.
+    # COACH_CHEAP_MODE flips the chat path on/off without redeploying — when
+    # set to 0 the coach uses CLAUDE_MODEL for chat too. Default is 1 (cheap).
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+    CHAT_MODEL: str = os.getenv("CHAT_MODEL", "claude-haiku-4-5-20251001")
+    COACH_CHEAP_MODE: bool = os.getenv("COACH_CHEAP_MODE", "1") not in ("0", "false", "False", "")
 
     # Notion — four-database model (per user's spreadsheet mock):
     #
