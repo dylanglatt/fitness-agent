@@ -173,12 +173,20 @@ class WeatherClient:
 
     # ── Public summarizer ───────────────────────────────────────────────────
 
+    def _is_configured(self) -> bool:
+        """True iff a real home location is set. (0.0, 0.0) is the null-island
+        default — treat that as 'unset' and skip weather entirely."""
+        return not (self.lat == 0.0 and self.lng == 0.0) and bool(self.city)
+
     async def summarize_today(self) -> str:
         """Return a multi-line weather block for the coach's context.
 
         Never raises — on failure, returns an empty string so the rest of
-        the brief still goes out.
+        the brief still goes out. Also returns empty string when the home
+        location isn't configured.
         """
+        if not self._is_configured():
+            return ""
         try:
             fc = await self._fetch_forecast()
             air = await self._fetch_air()

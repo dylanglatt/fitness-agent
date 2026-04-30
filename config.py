@@ -81,11 +81,14 @@ class Config:
     # Database
     DB_PATH: str = os.getenv("DB_PATH", "data/fitness_bot.db")
 
-    # Home location (for weather forecast + air quality). Default is
-    # East Village, Manhattan (10009); override per user.
-    HOME_LAT: float = float(os.getenv("HOME_LAT", "0.0"))
-    HOME_LNG: float = float(os.getenv("HOME_LNG", "0.0"))
-    HOME_CITY: str = os.getenv("HOME_CITY", "New York, NY 10009")
+    # Home location (for weather forecast + air quality).
+    # Set HOME_LAT, HOME_LNG, HOME_CITY in .env. If the lat/lng pair is
+    # 0.0/0.0 or HOME_CITY is empty, weather + AQI are skipped from the
+    # morning brief (the rest of the bot still works). See
+    # integrations/weather.py for the skip logic.
+    HOME_LAT: float = float(os.getenv("HOME_LAT", "0.0") or 0.0)
+    HOME_LNG: float = float(os.getenv("HOME_LNG", "0.0") or 0.0)
+    HOME_CITY: str = os.getenv("HOME_CITY", "")
 
     # ── Webhook server (Strava + WHOOP push) ────────────────────────────────
     # We co-host an aiohttp server in the same event loop as the Discord bot
