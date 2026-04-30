@@ -1,27 +1,67 @@
-# Secrets
+# ─── Secrets ─────────────────────────────────────────────────────────────────
 .env
+.env.local
+.env.*.local
 
-# Python
+# ─── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
+*.so
+.Python
 venv/
+.venv/
+env/
 .python-version
+*.egg
+*.egg-info/
+build/
+dist/
+pip-wheel-metadata/
 
-# Local data / databases
+# ─── Tests / coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+pytest-cache-files-*/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+
+# ─── Local data / databases ──────────────────────────────────────────────────
 data/fitness_bot.db
+data/fitness_bot.db-journal
+data/fitness_bot.db-wal
+data/fitness_bot.db-shm
 data/chroma_db/
 
-# OS / editor
+# ─── Logs ────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ─── OS / editor ─────────────────────────────────────────────────────────────
 .DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# ─── Claude Code / agent scratch ─────────────────────────────────────────────
 .claude/
 
-# Node (legacy)
+# ─── Legacy / scratch (kept gitignored to prevent accidental re-add) ─────────
+knowledge/fitness-bot-knowledge/
+setup_coachrex.py
+
+# ─── Node (legacy / unused) ──────────────────────────────────────────────────
 node_modules/
 dist/
 build/
 .next/
 .cache/
-
-# Logs
-*.log
