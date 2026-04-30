@@ -53,7 +53,7 @@ def main():
     if not (cfg.STRAVA_CLIENT_ID and cfg.STRAVA_CLIENT_SECRET):
         sys.exit("STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET missing from .env")
     if not cfg.WEBHOOK_PUBLIC_URL:
-        sys.exit("WEBHOOK_PUBLIC_URL must be set (e.g. https://coachrex.example.com)")
+        sys.exit("WEBHOOK_PUBLIC_URL must be set (e.g. https://fitness-bot.example.com)")
     if not cfg.STRAVA_WEBHOOK_VERIFY_TOKEN:
         sys.exit(
             "STRAVA_WEBHOOK_VERIFY_TOKEN must be set. Generate one with:\n"

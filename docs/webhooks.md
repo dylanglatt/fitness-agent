@@ -47,9 +47,9 @@ ufw allow 80,443/tcp
 ufw --force enable
 
 # App user + directory
-useradd -m -s /bin/bash coachrex
-su - coachrex
-git clone <your-repo> fitness-bot && cd fitness-bot
+useradd -m -s /bin/bash fitness-bot
+su - fitness-bot
+git clone https://github.com/dylanglatt/fitness-bot.git && cd fitness-bot
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -64,12 +64,12 @@ cp .env.example .env
 Edit `/etc/caddy/Caddyfile`:
 
 ```caddy
-coachrex.example.com {
+fitness-bot.example.com {
     # Let's Encrypt kicks in automatically; you need an A record pointing
     # to the droplet's IP before this will renew.
     encode zstd gzip
     log {
-        output file /var/log/caddy/coachrex.log
+        output file /var/log/caddy/fitness-bot.log
         format console
     }
 
@@ -91,7 +91,7 @@ Then:
 ```bash
 systemctl reload caddy
 # …Caddy will fetch a cert on first access. Trigger it once:
-curl -I https://coachrex.example.com/healthz
+curl -I https://fitness-bot.example.com/healthz
 ```
 
 ## systemd service for the bot
@@ -100,15 +100,15 @@ curl -I https://coachrex.example.com/healthz
 
 ```ini
 [Unit]
-Description=CoachRex fitness bot (Discord + webhook receiver)
+Description=fitness-bot (Discord + webhook receiver)
 After=network.target
 
 [Service]
 Type=simple
-User=coachrex
-WorkingDirectory=/home/coachrex/fitness-bot
-EnvironmentFile=/home/coachrex/fitness-bot/.env
-ExecStart=/home/coachrex/fitness-bot/venv/bin/python main.py
+User=fitness-bot
+WorkingDirectory=/home/fitness-bot/fitness-bot
+EnvironmentFile=/home/fitness-bot/fitness-bot/.env
+ExecStart=/home/fitness-bot/fitness-bot/venv/bin/python main.py
 Restart=on-failure
 RestartSec=5
 
@@ -134,7 +134,7 @@ Both services require a one-time registration step after the bot is running.
 **Strava:**
 
 ```bash
-su - coachrex
+su - fitness-bot
 cd fitness-bot
 source venv/bin/activate
 python scripts/strava_subscribe.py
@@ -149,7 +149,7 @@ dashboard steps.
 
 ```bash
 # From the droplet — should be "ok"
-curl -s https://coachrex.example.com/healthz
+curl -s https://fitness-bot.example.com/healthz
 
 # Tail the logs and do a workout. You should see:
 #   Strava event: create activity id=<id> owner=<id>

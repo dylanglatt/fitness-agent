@@ -7,7 +7,7 @@ so you don't have to re-figure it out each deploy.
 ## Prereqs
 
 - `WEBHOOK_PUBLIC_URL` in `.env` is set to your HTTPS base (e.g.
-  `https://coachrex.example.com`).
+  `https://fitness-bot.example.com`).
 - The bot is running and reachable — WHOOP sends a test POST when you save
   the webhook URL, and your server needs to verify the signature for that
   test to succeed.
