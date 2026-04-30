@@ -1,27 +1,42 @@
-name: Deploy to Digital Ocean
+name: Deploy to DigitalOcean
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
+# Minimum permissions — this workflow only needs to read the repo. The deploy
+# happens over SSH using a separate secret, not the GITHUB_TOKEN.
+permissions:
+  contents: read
+
+# Don't run two deploys at once, and don't cancel an in-flight one — letting a
+# half-finished `git reset --hard` get torn down mid-pull would be worse than
+# waiting.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Deploy to server
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Deploy to server over SSH
+        # Pinned to v1.2.5 by full SHA. Bumping this is a security-relevant
+        # change — review release notes and update the SHA.
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2  # v1.2.5
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DO_SSH_KEY }}
           script: |
-            set -e
+            set -euo pipefail
 
             cd ~/fitness-bot
 
-            # Defensive backup of .env in case anything ever touches it
-            # (git reset --hard won't touch gitignored files, but belt + suspenders)
+            # Defensive backup of .env in case anything ever touches it.
+            # `git reset --hard` won't touch gitignored files, but belt + braces.
             cp .env /tmp/fitness_bot_env_backup 2>/dev/null || true
 
             git fetch origin
@@ -44,8 +59,10 @@ jobs:
             # Restart the bot via systemd
             systemctl restart fitness-bot
             sleep 2
-            systemctl is-active --quiet fitness-bot && echo "✅ Deploy successful — fitness-bot is running" || {
-              echo "❌ fitness-bot failed to start — recent logs:"
+            if systemctl is-active --quiet fitness-bot; then
+              echo "Deploy successful — fitness-bot is running"
+            else
+              echo "fitness-bot failed to start — recent logs:"
               journalctl -u fitness-bot -n 30 --no-pager
               exit 1
-            }
+            fi
