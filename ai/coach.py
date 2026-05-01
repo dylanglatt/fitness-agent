@@ -660,6 +660,59 @@ class Coach:
                     parts.append(f"avg HR {int(a['average_hr'])}")
                 lines.append("  - " + " | ".join(parts))
 
+        # Active training plan + today's prescribed session. Cheap (one
+        # SQLite read) and load-bearing for mid-session questions like
+        # "shouldn't I do one more set?" — without this, the model
+        # correctly says it doesn't have access to the program. Only
+        # injected in Tier 1; Tier 2 builds the same block itself.
+        try:
+            plan = await self.db.get_active_plan()
+        except Exception as e:
+            logger.debug(f"Tiered context: active plan lookup failed: {e}")
+            plan = None
+        if plan:
+            day_name = today.strftime("%A").lower()
+            session = (plan.get("weekly_template") or {}).get(day_name)
+            lines.append("")
+            lines.append(f"ACTIVE PLAN: {plan.get('name')}")
+            if plan.get("goal"):
+                lines.append(f"  Goal: {plan.get('goal')}")
+            if session:
+                stype = session.get("session_type", "?")
+                focus = session.get("focus", "")
+                presc = session.get("prescription", "")
+                notes = session.get("notes", "")
+                lines.append(
+                    f"  Today ({today.strftime('%A')}): {stype}"
+                    + (f" — {focus}" if focus else "")
+                )
+                if presc:
+                    lines.append(f"    Prescription: {presc}")
+                if notes:
+                    lines.append(f"    Notes: {notes}")
+            else:
+                lines.append(
+                    f"  Today ({today.strftime('%A')}): no session in template "
+                    "(rest day or unscheduled)."
+                )
+
+        # Recent self-reported lifts. 14-day window so questions like "what
+        # was my push workout last week" find something in Tier 1 without
+        # escalating. Capped at 20 rows to keep the prompt lean.
+        try:
+            recent_lifts = await self.db.get_recent_lifts(days=14)
+        except Exception as e:
+            logger.debug(f"Tiered context: recent-lifts fetch failed: {e}")
+            recent_lifts = []
+        if recent_lifts:
+            lines.append("")
+            lines.append("RECENT LIFTS (last 14 days, self-reported):")
+            for lift in recent_lifts[:20]:
+                lines.append(
+                    f"  - {lift.get('date')} | "
+                    f"{lift.get('exercise')} | {lift.get('details')}"
+                )
+
         lines.append("")
         lines.append(
             "NOTE: This is a quick snapshot. For trend / multi-week / month-over-"
@@ -1350,7 +1403,15 @@ class Coach:
         # We skip the full layered-context + tools build because the debrief
         # path has its own, tighter data-assembly tailored to a post-session
         # question.
-        if _DEBRIEF_INTENT.search(message):
+        #
+        # Guard: if the message ALSO matches a trend/temporal qualifier
+        # ("last week", "in March", "over the past month"), the user is
+        # asking a historical question, not a post-session debrief. The
+        # debrief path only looks back 8h by default and would answer
+        # "no recent workout on file". Let trend questions fall through
+        # to the layered-context + tools path, which can actually query
+        # arbitrary date ranges.
+        if _DEBRIEF_INTENT.search(message) and not _TREND_INTENT.search(message):
             logger.info("chat(): routed to debrief_run via intent regex.")
             return await self.debrief_run()
 
