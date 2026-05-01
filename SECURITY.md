@@ -3,9 +3,9 @@
 ## Reporting a vulnerability
 
 If you find a security issue in this project, **please don't open a public
-GitHub issue.** Instead, email the details to:
+GitHub issue.** Instead, use GitHub's private vulnerability reporting:
 
-> 270753641+dylanglatt@users.noreply.github.com
+> Repo → **Security** tab → **Report a vulnerability**
 
 Include:
 
