@@ -651,6 +651,44 @@ def register_commands(bot):
         text = await coach.recommend_workout()
         await _send_chunked(ctx, text)
 
+    # ── /liftstart — begin a guided, set-by-set lift session ──────────────
+
+    @bot.hybrid_command(
+        name="liftstart",
+        description="Start a guided lift session. The bot prompts each set with a recommended weight.",
+    )
+    @is_owner_hybrid
+    async def liftstart_cmd(ctx: commands.Context, force: Optional[str] = None):
+        """Begin a guided lift session.
+
+        Pulls today's planned session from the active plan, parses the
+        prescription into a structured exercise list, and walks Dylan
+        through each set: bot says "Bench, set 1 — recommended 155 x 6",
+        Dylan replies with what he actually did ("150 x 6"), bot logs
+        and moves to the next set.
+
+        While a session is active, ALL non-command messages route through
+        the session handler — not the general chat coach. /liftend (or
+        replying "stop") closes it; 2h of silence auto-ends it.
+
+        Pass `force:true` to start a session on a non-lift day (e.g. you
+        decided to lift on a planned rest day).
+        """
+        await ctx.defer()
+        force_flag = (force or "").strip().lower() in ("true", "1", "yes", "force")
+        text = await coach.start_lift_session(force=force_flag)
+        await _send_chunked(ctx, text)
+
+    @bot.hybrid_command(
+        name="liftend",
+        description="End the active lift session and get a recap.",
+    )
+    @is_owner_hybrid
+    async def liftend_cmd(ctx: commands.Context):
+        await ctx.defer()
+        text = await coach.end_lift_session()
+        await _send_chunked(ctx, text)
+
     # ── /debrief — post-workout breakdown (WHOOP + Strava merged) ─────────
 
     @bot.hybrid_command(

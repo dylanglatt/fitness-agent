@@ -602,6 +602,18 @@ class Coach:
         d3 = today - timedelta(days=3)
         lines: list[str] = [f"TODAY: {today.strftime('%A, %B %d, %Y')}"]
 
+        # Active lift session block — stays at the top so the model can
+        # never miss it. When present, it overrides any plan-day default
+        # and bans off-topic activity suggestions.
+        try:
+            session_block = await self.active_session_context_block()
+        except Exception as e:
+            logger.debug(f"Active session block failed: {e}")
+            session_block = ""
+        if session_block:
+            lines.append("")
+            lines.append(session_block)
+
         # Live WHOOP snapshot — same call the layered builder makes first.
         try:
             snap = await self.whoop.get_today_snapshot()
@@ -748,6 +760,17 @@ class Coach:
 
         lines: list[str] = []
         lines.append(f"TODAY: {today.strftime('%A, %B %d, %Y')}")
+
+        # Active lift session block — same as in the tiered builder, kept
+        # at the top so the model can never miss it.
+        try:
+            session_block = await self.active_session_context_block()
+        except Exception as e:
+            logger.debug(f"Active session block failed: {e}")
+            session_block = ""
+        if session_block:
+            lines.append("")
+            lines.append(session_block)
 
         # ── Today snapshot (live, since nightly sync may not have today yet)
         try:
@@ -1622,3 +1645,451 @@ If not (e.g. "headed to the sauna later" — no completion, no data): {{"is_sess
         except Exception as e:
             logger.debug(f"Recovery-session parse failed: {e}")
         return None
+
+    # ── Active lift session (set-by-set guided workout) ────────────────────
+    #
+    # Driven by /liftstart and /liftend. While a session is active, the
+    # Discord message handler routes every user message through
+    # handle_session_message() instead of chat(). Each message is interpreted
+    # as the result of the current set ("155 x 6", "6 reps", "skip", "done"),
+    # logged to the lifts table, and replied to with the next prompt.
+    #
+    # Session state lives in the active_lift_session table (singleton).
+    # 2-hour silence auto-ends the session on next interaction.
+
+    LIFT_SESSION_TIMEOUT_HOURS = 2
+
+    async def _parse_prescription_to_exercises(
+        self, prescription: str
+    ) -> list[dict]:
+        """Use Haiku to turn a freeform prescription string into a structured
+        exercise list.
+
+        Input example:
+          "Main: bench press 4x6-8 working up to RPE 8. Assistance:
+           overhead press 3x8, incline DB press 3x10..."
+
+        Output:
+          [{"name": "Bench press", "sets": 4, "reps": "6-8",
+            "notes": "Main, work up to RPE 8"}, ...]
+        """
+        if not prescription:
+            return []
+        parse_prompt = f"""
+Parse this lift workout prescription into a structured list of exercises in
+the order they should be performed.
+
+Prescription:
+\"\"\"{prescription}\"\"\"
+
+Respond with JSON only. Schema:
+{{
+  "exercises": [
+    {{
+      "name": "<exercise name, capitalize properly e.g. 'Bench press'>",
+      "sets": <integer>,
+      "reps": "<rep target as string — '6', '6-8', '5', '12', 'AMRAP'>",
+      "notes": "<short note like 'Main, RPE 8' or 'Assistance' or empty>"
+    }}
+  ]
+}}
+
+Rules:
+  • One entry per distinct exercise.
+  • If sets aren't stated, default to 3.
+  • If reps aren't stated, use "?".
+  • Skip warmup-only items unless they have a load.
+  • Skip non-lift items (cardio, mobility) — only return weighted resistance work.
+  • Order matches the order in the prescription.
+""".strip()
+        try:
+            resp = await self.claude.messages.create(
+                model=self.cheap_model,
+                max_tokens=800,
+                messages=[{"role": "user", "content": parse_prompt}],
+            )
+            raw = resp.content[0].text
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            data = json.loads(raw[start:end])
+            out: list[dict] = []
+            for ex in data.get("exercises") or []:
+                name = (ex.get("name") or "").strip()
+                if not name:
+                    continue
+                try:
+                    sets = int(ex.get("sets") or 3)
+                except (TypeError, ValueError):
+                    sets = 3
+                reps = str(ex.get("reps") or "?").strip()
+                notes = (ex.get("notes") or "").strip()
+                out.append({"name": name, "sets": sets, "reps": reps, "notes": notes})
+            return out
+        except Exception as e:
+            logger.warning(f"Prescription parse failed: {e}")
+            return []
+
+    @staticmethod
+    def _extract_weight_from_details(details: str) -> Optional[float]:
+        """Pull the first plausible 'weight in lb' number out of a free-form
+        details string like '3x10 at 145' or '5x5 @ 185 lb' or '3x10 145lb'.
+
+        Conservative: returns None on anything ambiguous so we don't
+        recommend off a misparse.
+        """
+        if not details:
+            return None
+        # Prefer "@ NUMBER" or "at NUMBER", then a NUMBERlb pattern, then any
+        # 3-digit number that isn't a set/rep scheme.
+        m = re.search(r"(?:@|at)\s*(\d{2,4}(?:\.\d+)?)", details, re.I)
+        if not m:
+            m = re.search(r"(\d{2,4}(?:\.\d+)?)\s*(?:lb|lbs|pounds)\b", details, re.I)
+        if not m:
+            # Last resort: last standalone number not adjacent to 'x'
+            candidates = re.findall(r"(?<![x×])\b(\d{2,4}(?:\.\d+)?)\b(?![x×])", details)
+            if candidates:
+                m_val = candidates[-1]
+                try:
+                    return float(m_val)
+                except ValueError:
+                    return None
+            return None
+        try:
+            return float(m.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    async def _recommend_for_exercise(self, exercise_name: str) -> tuple[Optional[float], str]:
+        """Return (recommended_weight_lb, human_readable_note).
+
+        Strategy: look at the most recent logged session for this exercise.
+        If we hit our reps cleanly last time, suggest +5 lb. Otherwise,
+        suggest the same weight again. If we have nothing on file, return
+        (None, "No history yet — pick a working weight.").
+        """
+        rows = await self.db.get_lifts_for_exercise(exercise_name, limit=3)
+        if not rows:
+            return None, "No history yet — pick a working weight."
+        last = rows[0]
+        last_w = self._extract_weight_from_details(last.get("details") or "")
+        if last_w is None:
+            return None, f"Last time ({last['date']}): {last['details']}. Pick from feel."
+        # Simple progression rule: small jump for upper body, slightly bigger
+        # for lower body. Big compounds like squat/deadlift get +10; everything
+        # else +5. This is a hint, not a prescription — Dylan can override.
+        big_lower = re.search(r"\bsquat|deadlift\b", exercise_name, re.I)
+        bump = 10 if big_lower else 5
+        suggestion = last_w + bump
+        return suggestion, (
+            f"Last time ({last['date']}): {last['details']}. "
+            f"Try {suggestion:g} lb — push to +{bump} if last set felt clean."
+        )
+
+    def _session_expired(self, session: dict) -> bool:
+        """True if the session has been idle past the timeout."""
+        try:
+            last = datetime.fromisoformat(session["last_activity_at"])
+        except Exception:
+            return False
+        return datetime.now() - last > timedelta(hours=self.LIFT_SESSION_TIMEOUT_HOURS)
+
+    async def _format_next_set_prompt(self, session: dict) -> str:
+        """Render the 'Bench, set 2 — recommended X x Y' prompt for the
+        current cursor position. Pulls a recommendation from history.
+        """
+        ex_idx = session["current_exercise_idx"]
+        set_idx = session["current_set_idx"]
+        exercises = session["exercises"]
+        if ex_idx >= len(exercises):
+            return "All planned exercises done. `/liftend` to close out."
+        ex = exercises[ex_idx]
+        name = ex.get("name", "Exercise")
+        total_sets = ex.get("sets", 3)
+        reps = ex.get("reps", "?")
+        notes = ex.get("notes", "")
+        rec_w, rec_note = await self._recommend_for_exercise(name)
+        head = f"**{name}** — set {set_idx + 1}/{total_sets} · target {reps} reps"
+        if notes:
+            head += f"  _({notes})_"
+        if rec_w is not None:
+            line2 = f"Recommended: **{rec_w:g} lb × {reps}**"
+        else:
+            line2 = "Recommended: pick a working weight"
+        line3 = f"_{rec_note}_"
+        line4 = "Reply with what you actually did (e.g. `155 x 6`, `6`, `skip`, `done`)."
+        return "\n".join([head, line2, line3, line4])
+
+    async def start_lift_session(self, force: bool = False) -> str:
+        """Begin a guided lift session from today's planned prescription.
+
+        Returns the first set's prompt as a Discord-ready string. If a
+        session is already in progress, ends it first (the new one wins).
+        If today's plan day isn't a lift day, returns an error message
+        unless force=True.
+        """
+        plan = await self.db.get_active_plan()
+        if not plan:
+            return "No active training plan. Set one up before starting a session."
+        today_name = datetime.now().strftime("%A").lower()
+        sess_def = (plan.get("weekly_template") or {}).get(today_name)
+        if not sess_def:
+            return f"No session defined for {today_name}. `/plan week` to see what's scheduled."
+        stype = (sess_def.get("session_type") or "").lower()
+        if stype != "lift" and not force:
+            focus = sess_def.get("focus", "")
+            return (
+                f"Today ({today_name}) is a **{stype}** day ({focus}), not a lift day.\n"
+                "If you're lifting anyway, run `/liftstart force:true`."
+            )
+        prescription = sess_def.get("prescription", "")
+        exercises = await self._parse_prescription_to_exercises(prescription)
+        if not exercises:
+            return (
+                "Couldn't parse today's prescription into structured exercises. "
+                "Check `/plan today` and try again."
+            )
+        focus = sess_def.get("focus", "lift")
+        await self.db.start_lift_session(workout_label=focus, exercises=exercises)
+        session = await self.db.get_active_lift_session()
+        ex_summary = ", ".join(
+            f"{e['name']} {e['sets']}x{e['reps']}" for e in exercises[:5]
+        )
+        if len(exercises) > 5:
+            ex_summary += f", +{len(exercises) - 5} more"
+        header = (
+            f"💪 Lift session started — **{focus}**\n"
+            f"Plan: {ex_summary}\n"
+            "—\n"
+        )
+        return header + await self._format_next_set_prompt(session)
+
+    async def handle_session_message(self, message: str) -> str:
+        """Interpret a message as the result of the current set.
+
+        Recognized inputs:
+          - 'NUMBER x NUMBER'  → weight x reps   ("155 x 6", "155x6")
+          - 'NUMBER'           → reps at the recommended weight ("6")
+          - 'NUMBER lb'        → weight (assume the target reps)
+          - 'skip'             → skip this set, advance one
+          - 'done' / 'next'    → mark this exercise complete, advance to next
+          - 'stop' / 'end'     → end the session
+          - anything else      → re-prompt with help text
+
+        Returns the next prompt as a Discord-ready string.
+        """
+        session = await self.db.get_active_lift_session()
+        if not session:
+            return "No active lift session. Start one with `/liftstart`."
+        if self._session_expired(session):
+            await self.db.end_lift_session()
+            return (
+                f"Last session timed out after {self.LIFT_SESSION_TIMEOUT_HOURS}h "
+                "of silence. `/liftstart` to begin a fresh one."
+            )
+
+        msg = (message or "").strip()
+        low = msg.lower()
+        ex_idx = session["current_exercise_idx"]
+        set_idx = session["current_set_idx"]
+        exercises = session["exercises"]
+        history = session["history"]
+
+        if ex_idx >= len(exercises):
+            return "All planned exercises done. `/liftend` to close out."
+        ex = exercises[ex_idx]
+        ex_name = ex["name"]
+        total_sets = ex["sets"]
+
+        # ── Stop ───────────────────────────────────────────────────────────
+        if low in ("stop", "end", "/liftend", "liftend"):
+            return await self.end_lift_session()
+
+        # ── Skip a set ─────────────────────────────────────────────────────
+        if low in ("skip", "pass"):
+            history.append({
+                "exercise": ex_name,
+                "set": set_idx + 1,
+                "skipped": True,
+                "ts": datetime.now().isoformat(timespec="seconds"),
+            })
+            new_set_idx = set_idx + 1
+            new_ex_idx = ex_idx
+            if new_set_idx >= total_sets:
+                new_set_idx = 0
+                new_ex_idx = ex_idx + 1
+            await self.db.update_lift_session_position(
+                current_exercise_idx=new_ex_idx,
+                current_set_idx=new_set_idx,
+                history=history,
+            )
+            session = await self.db.get_active_lift_session()
+            return "Skipped.\n—\n" + await self._format_next_set_prompt(session)
+
+        # ── Done with this exercise (advance to next) ──────────────────────
+        if low in ("done", "next", "next exercise"):
+            new_ex_idx = ex_idx + 1
+            await self.db.update_lift_session_position(
+                current_exercise_idx=new_ex_idx,
+                current_set_idx=0,
+                history=history,
+            )
+            session = await self.db.get_active_lift_session()
+            if new_ex_idx >= len(exercises):
+                return await self.end_lift_session()
+            return f"Marking **{ex_name}** complete.\n—\n" + await self._format_next_set_prompt(session)
+
+        # ── Parse "WEIGHT x REPS" or "REPS" or "WEIGHT lb" ─────────────────
+        weight: Optional[float] = None
+        reps: Optional[int] = None
+
+        m = re.match(r"^\s*(\d{1,4}(?:\.\d+)?)\s*[x×]\s*(\d{1,3})\s*$", msg, re.I)
+        if m:
+            weight = float(m.group(1))
+            reps = int(m.group(2))
+        else:
+            m = re.match(r"^\s*(\d{1,4}(?:\.\d+)?)\s*(?:lb|lbs|pounds)\b\s*$", msg, re.I)
+            if m:
+                weight = float(m.group(1))
+            else:
+                m = re.match(r"^\s*(\d{1,3})\s*(?:reps?)?\s*$", msg, re.I)
+                if m:
+                    reps = int(m.group(1))
+
+        if weight is None and reps is None:
+            return (
+                "Couldn't read that as a set result. Reply with one of:\n"
+                "  `155 x 6`  (weight × reps)\n"
+                "  `6`        (reps at the recommended weight)\n"
+                "  `155 lb`   (weight at the target reps)\n"
+                "  `skip` / `done` / `stop`"
+            )
+
+        # If only reps given, fall back to the recommended weight; if only
+        # weight given, fall back to the rep target.
+        if weight is None:
+            rec_w, _ = await self._recommend_for_exercise(ex_name)
+            weight_str = f"{rec_w:g}" if rec_w is not None else "bw"
+        else:
+            weight_str = f"{weight:g}"
+        if reps is None:
+            reps_str = str(ex.get("reps") or "?")
+        else:
+            reps_str = str(reps)
+
+        details = f"set {set_idx + 1}/{total_sets} · {weight_str} lb × {reps_str}"
+        # Persist into the same lifts table the rest of the bot reads.
+        await self.db.log_lift(
+            date=datetime.now().strftime("%Y-%m-%d"),
+            exercise=ex_name,
+            details=details,
+            raw=f"[liftstart] {message}",
+        )
+        # Mirror to Notion if wired (best-effort; never blocks).
+        try:
+            await self.notion.log_lift(
+                date=datetime.now().strftime("%Y-%m-%d"),
+                exercise=ex_name,
+                workout=session.get("workout_label"),
+                sets=1,
+                reps=reps,
+                weight_lb=weight,
+                notes=f"[liftstart] set {set_idx + 1}/{total_sets} · target {ex.get('reps')}",
+            )
+        except Exception:
+            pass
+
+        history.append({
+            "exercise": ex_name,
+            "set": set_idx + 1,
+            "weight_lb": weight,
+            "reps": reps,
+            "ts": datetime.now().isoformat(timespec="seconds"),
+        })
+        new_set_idx = set_idx + 1
+        new_ex_idx = ex_idx
+        finished_exercise = False
+        if new_set_idx >= total_sets:
+            finished_exercise = True
+            new_set_idx = 0
+            new_ex_idx = ex_idx + 1
+
+        await self.db.update_lift_session_position(
+            current_exercise_idx=new_ex_idx,
+            current_set_idx=new_set_idx,
+            history=history,
+        )
+
+        ack = f"Logged: **{ex_name}** set {set_idx + 1}/{total_sets} · {weight_str} lb × {reps_str}."
+        if new_ex_idx >= len(exercises):
+            return ack + "\n—\n" + await self.end_lift_session()
+        session = await self.db.get_active_lift_session()
+        sep = "\n—\n"
+        if finished_exercise:
+            sep = f"\n✅ {ex_name} done.\n—\n"
+        return ack + sep + await self._format_next_set_prompt(session)
+
+    async def end_lift_session(self) -> str:
+        """Close the active session and return a short summary."""
+        session = await self.db.end_lift_session()
+        if not session:
+            return "No active session to end."
+        history = session.get("history") or []
+        label = session.get("workout_label") or "lift"
+        if not history:
+            return f"Session ended — **{label}**. No sets logged."
+        # Group by exercise for the recap.
+        by_ex: dict[str, list[dict]] = {}
+        for entry in history:
+            by_ex.setdefault(entry.get("exercise", "?"), []).append(entry)
+        lines = [f"✅ Session complete — **{label}**", ""]
+        for ex_name, entries in by_ex.items():
+            sets_done = sum(1 for e in entries if not e.get("skipped"))
+            skipped = sum(1 for e in entries if e.get("skipped"))
+            tail = ""
+            real = [e for e in entries if not e.get("skipped")]
+            if real:
+                last = real[-1]
+                if last.get("weight_lb") and last.get("reps"):
+                    tail = f" — top: {last['weight_lb']:g} lb × {last['reps']}"
+            skip_str = f" ({skipped} skipped)" if skipped else ""
+            lines.append(f"  • {ex_name}: {sets_done} sets{skip_str}{tail}")
+        return "\n".join(lines)
+
+    async def active_session_context_block(self) -> str:
+        """Render a context block describing the in-flight session, for
+        injection into chat context. Returns '' if no session is active.
+
+        Consumed by _build_tiered_context and _build_layered_context so the
+        free-form chat path (e.g. when Dylan asks 'how's my recovery' mid-
+        workout) knows there's a workout in progress and doesn't suggest a
+        run or unrelated activity.
+        """
+        session = await self.db.get_active_lift_session()
+        if not session:
+            return ""
+        if self._session_expired(session):
+            await self.db.end_lift_session()
+            return ""
+        ex_idx = session["current_exercise_idx"]
+        set_idx = session["current_set_idx"]
+        exercises = session["exercises"]
+        label = session.get("workout_label") or "lift"
+        lines = [
+            f"ACTIVE LIFT SESSION IN PROGRESS — {label}",
+            f"  Started: {session['started_at']}",
+        ]
+        if ex_idx < len(exercises):
+            ex = exercises[ex_idx]
+            lines.append(
+                f"  Currently on: {ex['name']} (set {set_idx + 1}/{ex['sets']})"
+            )
+        remaining = exercises[ex_idx:]
+        if remaining:
+            lines.append("  Remaining: " + ", ".join(
+                f"{e['name']} {e['sets']}x{e['reps']}" for e in remaining
+            ))
+        lines.append(
+            "  → Do NOT suggest cardio, runs, or unrelated activities. "
+            "Stay focused on the in-progress workout."
+        )
+        return "\n".join(lines)

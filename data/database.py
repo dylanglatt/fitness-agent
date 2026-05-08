@@ -256,6 +256,28 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_whoop_workouts_start "
                 "ON whoop_workouts(start_utc)"
             )
+            # active_lift_session: singleton (id always 1) tracking a lift
+            # workout in progress. Driven by /liftstart and /liftend. While
+            # this row exists, the bot's on_message handler routes user
+            # replies through the session handler instead of the general
+            # chat path — so each message is interpreted as "logging the
+            # next set" rather than free-form chat. Auto-expires after
+            # 2h of silence (checked on next interaction). exercises_json
+            # is the structured plan parsed from the active plan's
+            # prescription text at session start; history_json is the
+            # rolling log of completed sets in this session.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS active_lift_session (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    started_at TEXT NOT NULL,
+                    last_activity_at TEXT NOT NULL,
+                    workout_label TEXT,
+                    exercises_json TEXT NOT NULL,
+                    current_exercise_idx INTEGER DEFAULT 0,
+                    current_set_idx INTEGER DEFAULT 0,
+                    history_json TEXT DEFAULT '[]'
+                )
+            """)
             await db.commit()
         # Seed a default balanced-concurrent plan if no plan exists yet.
         await self._seed_default_plan_if_empty()
@@ -293,6 +315,91 @@ class Database:
             ) as cursor:
                 rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    # ── Active lift session (singleton state machine) ──────────────────────
+    #
+    # While a session row exists, on_message routes user text through the
+    # session handler in coach.py instead of the general chat path. The
+    # session is explicit (started by /liftstart, ended by /liftend or by
+    # 2-hour inactivity timeout) — no inference, so the bot never confuses
+    # "I'm in the middle of squats" with "I want a chat about squats".
+
+    async def start_lift_session(
+        self,
+        workout_label: str,
+        exercises: list[dict],
+    ) -> None:
+        """Begin a new lift session. Replaces any prior in-flight session."""
+        now = datetime.now().isoformat(timespec="seconds")
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM active_lift_session WHERE id = 1")
+            await db.execute(
+                "INSERT INTO active_lift_session "
+                "(id, started_at, last_activity_at, workout_label, "
+                " exercises_json, current_exercise_idx, current_set_idx, history_json) "
+                "VALUES (1, ?, ?, ?, ?, 0, 0, '[]')",
+                (now, now, workout_label, json.dumps(exercises)),
+            )
+            await db.commit()
+
+    async def get_active_lift_session(self) -> Optional[dict]:
+        """Return the in-flight session as a dict, or None if no session."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM active_lift_session WHERE id = 1"
+            ) as cursor:
+                row = await cursor.fetchone()
+        if not row:
+            return None
+        s = dict(row)
+        try:
+            s["exercises"] = json.loads(s.pop("exercises_json") or "[]")
+        except Exception:
+            s["exercises"] = []
+        try:
+            s["history"] = json.loads(s.pop("history_json") or "[]")
+        except Exception:
+            s["history"] = []
+        return s
+
+    async def touch_lift_session(self) -> None:
+        """Update last_activity_at — call after any user interaction."""
+        now = datetime.now().isoformat(timespec="seconds")
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE active_lift_session SET last_activity_at = ? WHERE id = 1",
+                (now,),
+            )
+            await db.commit()
+
+    async def update_lift_session_position(
+        self,
+        current_exercise_idx: int,
+        current_set_idx: int,
+        history: list[dict],
+    ) -> None:
+        """Move the cursor (next exercise/set) and append to the history log."""
+        now = datetime.now().isoformat(timespec="seconds")
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE active_lift_session "
+                "SET current_exercise_idx = ?, current_set_idx = ?, "
+                "    history_json = ?, last_activity_at = ? "
+                "WHERE id = 1",
+                (current_exercise_idx, current_set_idx, json.dumps(history), now),
+            )
+            await db.commit()
+
+    async def end_lift_session(self) -> Optional[dict]:
+        """Close out the session. Returns the final state for summarizing."""
+        session = await self.get_active_lift_session()
+        if not session:
+            return None
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM active_lift_session WHERE id = 1")
+            await db.commit()
+        return session
 
     async def log_note(self, date: str, content: str):
         async with aiosqlite.connect(self.db_path) as db:

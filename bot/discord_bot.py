@@ -112,10 +112,20 @@ class FitnessBot(commands.Bot):
         # Process commands first (e.g., !status)
         await self.process_commands(message)
 
-        # If not a command, treat as a conversational message to the coach
+        # If not a command, treat as a conversational message to the coach.
+        # BUT: if a guided lift session is active, route the message through
+        # the session handler instead — every reply during a session is a
+        # set log ("155 x 6"), a control word ("skip", "done", "stop"), or
+        # an unparseable input that the session handler re-prompts. This is
+        # the explicit-state design that makes the bot reliable mid-workout
+        # rather than guessing from inferred context.
         if not message.content.startswith("!"):
             async with message.channel.typing():
-                response = await self.coach.chat(message.content)
+                active_session = await self.db.get_active_lift_session()
+                if active_session is not None:
+                    response = await self.coach.handle_session_message(message.content)
+                else:
+                    response = await self.coach.chat(message.content)
                 for chunk in _chunk_for_discord(response):
                     await message.channel.send(chunk)
 
