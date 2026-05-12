@@ -584,17 +584,28 @@ class Coach:
     # reasons as if Monday's legs occurred, even when the Strava activity for
     # that day clearly shows a run. The fix is to compute adherence here,
     # server-side, and hand the model a ledger it can't ignore.
+    #
+    # Week boundary: weeks are Monday → Sunday. A rolling 7-day window
+    # straddles week boundaries — on Tuesday it would mix the prior week's
+    # Wed–Sun with this week's Mon–Tue, making the WEEKLY TARGETS counts
+    # nonsensical ("you're under on lifts" when the under is two days into
+    # a fresh week). Anchoring to Monday makes WEEKLY TARGETS week-to-date,
+    # which is what a coach actually reasons about.
     def _compute_plan_adherence(
         self,
         plan: Optional[dict],
-        acts_7d: list[dict],
-        lifts_7d: list[dict],
-        days: int = 7,
+        acts: list[dict],
+        lifts: list[dict],
     ) -> list[str]:
-        """Reconcile prescribed plan vs actual completed sessions over `days`.
+        """Reconcile prescribed plan vs actual completed sessions.
 
-        Returns a list of context lines: a row-per-day ledger plus a
-        week-to-date count against the plan's weekly targets.
+        Builds a per-day ledger for the current calendar week (Mon → today)
+        and a one-line summary of the previous full week (Mon → Sun) for
+        context when it's early in the week. Returns a list of lines for
+        the PLAN ADHERENCE block.
+
+        Callers should pass at least 14 days of activities + lifts so the
+        last-week summary has data to work with.
         """
         if not plan:
             return []
@@ -603,16 +614,20 @@ class Coach:
             return []
 
         today = datetime.now().date()
+        # Monday-anchored week boundaries. weekday(): Mon=0 ... Sun=6.
+        this_monday = today - timedelta(days=today.weekday())
+        last_monday = this_monday - timedelta(days=7)
+        last_sunday = this_monday - timedelta(days=1)
 
         # Bucket actuals by date string ('YYYY-MM-DD').
         by_date: dict[str, dict] = {}
-        for a in acts_7d or []:
+        for a in acts or []:
             d = a.get("date")
             if not d:
                 continue
             slot = by_date.setdefault(d, {"acts": [], "lifts": []})
             slot["acts"].append(a)
-        for l in lifts_7d or []:
+        for l in lifts or []:
             d = l.get("date")
             if not d:
                 continue
@@ -674,36 +689,54 @@ class Coach:
                 return "OTHER", detail
             return "REST", detail
 
-        # Walk the window oldest → newest so the ledger reads naturally.
+        def _counts_for_range(start_date, end_date) -> dict:
+            """Tally LIFT/RUN/REST/OTHER actuals from start..end inclusive."""
+            tally = {"LIFT": 0, "RUN": 0, "REST": 0, "OTHER": 0, "CROSS": 0}
+            d = start_date
+            while d <= end_date:
+                actual, _ = _classify_actual(by_date.get(d.isoformat()))
+                if actual == "LIFT+RUN":
+                    tally["LIFT"] += 1
+                    tally["RUN"] += 1
+                else:
+                    key = actual if actual in tally else "OTHER"
+                    tally[key] += 1
+                d += timedelta(days=1)
+            return tally
+
+        # ── Per-day ledger for THIS WEEK (Monday → today) ──────────────────
         rows: list[str] = []
-        counts_actual = {"LIFT": 0, "RUN": 0, "REST": 0, "OTHER": 0, "CROSS": 0}
+        counts_this_week = {"LIFT": 0, "RUN": 0, "REST": 0, "OTHER": 0, "CROSS": 0}
         deviation_count = 0
 
-        for i in range(days - 1, -1, -1):
-            d = today - timedelta(days=i)
+        d = this_monday
+        while d <= today:
             day_name = d.strftime("%A").lower()
             prescribed = _classify_prescribed(template.get(day_name))
             actual, detail = _classify_actual(by_date.get(d.isoformat()))
 
             if actual == "LIFT+RUN":
-                counts_actual["LIFT"] += 1
-                counts_actual["RUN"] += 1
+                counts_this_week["LIFT"] += 1
+                counts_this_week["RUN"] += 1
             else:
-                key = actual if actual in counts_actual else "OTHER"
-                counts_actual[key] += 1
+                key = actual if actual in counts_this_week else "OTHER"
+                counts_this_week[key] += 1
 
-            # LIFT+RUN satisfies either a LIFT or RUN prescription.
             satisfied = (
                 actual == prescribed
                 or (actual == "LIFT+RUN" and prescribed in ("LIFT", "RUN"))
             )
-            # Don't flag today (i == 0) as a deviation — the day isn't over.
-            if not satisfied and i > 0:
+            is_today = (d == today)
+            # Don't flag today as a deviation — the day isn't over yet.
+            if not satisfied and not is_today:
                 deviation_count += 1
 
-            marker = "OK" if satisfied or i == 0 else "DEVIATION"
-            if i == 0:
+            if is_today:
                 marker = "TODAY"
+            elif satisfied:
+                marker = "OK"
+            else:
+                marker = "DEVIATION"
             date_label = d.strftime("%a %b %d")
             row = (
                 f"{date_label}: prescribed {prescribed:<5} | "
@@ -712,13 +745,9 @@ class Coach:
             if detail:
                 row += f" ({detail})"
             rows.append(row)
+            d += timedelta(days=1)
 
-        lines: list[str] = []
-        lines.append("PLAN ADHERENCE (last 7 days, oldest → newest):")
-        for r in rows:
-            lines.append(f"  {r}")
-
-        # Weekly targets from the template.
+        # ── Weekly targets from the template ───────────────────────────────
         target_lifts = sum(
             1 for s in template.values() if _classify_prescribed(s) == "LIFT"
         )
@@ -729,40 +758,79 @@ class Coach:
             1 for s in template.values() if _classify_prescribed(s) == "REST"
         )
 
-        summary = (
-            f"WEEKLY TARGETS vs LAST 7d ACTUAL: "
-            f"lifts {counts_actual['LIFT']}/{target_lifts}, "
-            f"runs {counts_actual['RUN']}/{target_runs}, "
-            f"rest {counts_actual['REST']}/{target_rest}"
+        # ── LAST WEEK summary (full Mon → Sun) ─────────────────────────────
+        last_week_counts = _counts_for_range(last_monday, last_sunday)
+
+        # ── Compose output ─────────────────────────────────────────────────
+        lines: list[str] = []
+        days_in = (today - this_monday).days + 1
+        lines.append(
+            f"PLAN ADHERENCE — THIS WEEK ({this_monday.strftime('%a %b %d')} "
+            f"→ {today.strftime('%a %b %d')}, day {days_in} of 7):"
         )
+        for r in rows:
+            lines.append(f"  {r}")
+
+        wk_summary = (
+            f"WEEK-TO-DATE vs TARGETS: "
+            f"lifts {counts_this_week['LIFT']}/{target_lifts}, "
+            f"runs {counts_this_week['RUN']}/{target_runs}, "
+            f"rest {counts_this_week['REST']}/{target_rest}"
+        )
+        # Pro-rate the under/over flags so we don't yell "UNDER on lifts" on
+        # Monday morning when the week has barely started. A category is
+        # only "under" if the days remaining in the week aren't enough to
+        # close the gap.
+        days_remaining = 7 - days_in  # full days after today
         deficits: list[str] = []
-        if counts_actual["LIFT"] < target_lifts:
+        lift_short = target_lifts - counts_this_week["LIFT"]
+        run_short = target_runs - counts_this_week["RUN"]
+        if lift_short > days_remaining:
             deficits.append(
-                f"UNDER on lifts ({target_lifts - counts_actual['LIFT']} short)"
+                f"UNDER on lifts (need {lift_short} more in {days_remaining} "
+                f"day{'s' if days_remaining != 1 else ''} left — tight)"
             )
-        if counts_actual["RUN"] < target_runs:
+        elif lift_short > 0:
             deficits.append(
-                f"UNDER on runs ({target_runs - counts_actual['RUN']} short)"
+                f"behind on lifts ({lift_short} to go, {days_remaining} "
+                f"day{'s' if days_remaining != 1 else ''} left)"
             )
-        if counts_actual["LIFT"] > target_lifts + 1:
+        if run_short > days_remaining:
+            deficits.append(
+                f"UNDER on runs (need {run_short} more in {days_remaining} left)"
+            )
+        elif run_short > 0:
+            deficits.append(
+                f"behind on runs ({run_short} to go, {days_remaining} left)"
+            )
+        if counts_this_week["LIFT"] > target_lifts + 1:
             deficits.append("OVER on lifts")
-        if counts_actual["RUN"] > target_runs + 1:
+        if counts_this_week["RUN"] > target_runs + 1:
             deficits.append("OVER on runs")
         if deficits:
-            summary += " — " + ", ".join(deficits)
-        lines.append(f"  {summary}")
+            wk_summary += " — " + ", ".join(deficits)
+        lines.append(f"  {wk_summary}")
 
-        # Loud guard rail when adherence has drifted enough that the model
-        # would otherwise narrate the prescribed sequence as fact.
+        last_week_summary = (
+            f"LAST WEEK ({last_monday.strftime('%b %d')} → "
+            f"{last_sunday.strftime('%b %d')}): "
+            f"lifts {last_week_counts['LIFT']}/{target_lifts}, "
+            f"runs {last_week_counts['RUN']}/{target_runs}, "
+            f"rest {last_week_counts['REST']}/{target_rest}"
+        )
+        lines.append(f"  {last_week_summary}")
+
+        # ── Loud guard rail when adherence has drifted enough that the
+        # model would otherwise narrate the prescribed sequence as fact.
         if deviation_count >= 2:
             lines.append(
-                f"  ⚠ {deviation_count} deviations from plan in the last "
-                f"{days - 1} days — the ACTIVE PLAN block describes what was "
-                f"PRESCRIBED, not what HAPPENED. Use the row-by-row actuals "
-                f"above (and RECENT LIFTS / LAST 14 DAYS Strava below) for "
-                f"any reasoning about prior sessions. If Dylan is under on a "
-                f"category (e.g. lifts) and wants to do that category today, "
-                f"that's the plan re-asserting itself — support it."
+                f"  ⚠ {deviation_count} deviation{'s' if deviation_count != 1 else ''} "
+                f"from plan so far this week — the ACTIVE PLAN block describes "
+                f"what was PRESCRIBED, not what HAPPENED. Use the row-by-row "
+                f"actuals above (and RECENT LIFTS / LAST 14 DAYS Strava below) "
+                f"for any reasoning about prior sessions. If Dylan is under "
+                f"on a category (e.g. lifts) and wants to do that category "
+                f"today, that's the plan re-asserting itself — support it."
             )
 
         return lines
@@ -908,21 +976,23 @@ class Coach:
             logger.debug(f"Tiered context: recent-lifts fetch failed: {e}")
             recent_lifts = []
 
-        # PLAN ADHERENCE — only when a plan exists. Pulls 7 days of Strava
+        # PLAN ADHERENCE — only when a plan exists. Pulls 14 days of Strava
         # activities (one extra DB read, cheap) and reuses the 14-day lifts
-        # already in hand. This is what stops the model from treating the
+        # already in hand. 14 days covers last week's Mon → today, so the
+        # LAST WEEK summary line has data to render even when it's early
+        # in the week. This is what stops the model from treating the
         # plan template as a record of what happened.
         if plan:
-            d7 = (today - timedelta(days=7)).isoformat()
+            d14 = (today - timedelta(days=14)).isoformat()
             try:
-                acts_7d = await self.db.get_strava_activities_range(
-                    d7, str(today)
+                acts_14d = await self.db.get_strava_activities_range(
+                    d14, str(today)
                 )
             except Exception as e:
-                logger.debug(f"Tiered context: 7-day Strava fetch failed: {e}")
-                acts_7d = []
+                logger.debug(f"Tiered context: 14-day Strava fetch failed: {e}")
+                acts_14d = []
             adherence_lines = self._compute_plan_adherence(
-                plan, acts_7d, recent_lifts
+                plan, acts_14d, recent_lifts
             )
             if adherence_lines:
                 lines.append("")
@@ -1060,17 +1130,28 @@ class Coach:
             for t in trend_lines:
                 lines.append(f"  {t}")
 
-        # ── PLAN ADHERENCE block (prescribed vs actual, last 7 days)
-        # Without this explicit reconciliation, the model conflates the plan
-        # template with what actually happened — e.g. assumes Monday was legs
-        # because the template says so, even when the Strava activity for
-        # that day clearly shows a run.
+        # ── PLAN ADHERENCE block (prescribed vs actual, current Mon-Sun
+        # week + last full week summary). Without this explicit
+        # reconciliation, the model conflates the plan template with what
+        # actually happened — e.g. assumes Monday was legs because the
+        # template says so, even when the Strava activity for that day
+        # clearly shows a run. We fetch 14 days so the LAST WEEK summary
+        # line has data to render even when it's early in the week.
         try:
-            lifts_7d = await self.db.get_recent_lifts(days=7)
+            lifts_14d = await self.db.get_recent_lifts(days=14)
         except Exception as e:
-            logger.debug(f"7-day lifts fetch for adherence failed: {e}")
-            lifts_7d = []
-        adherence_lines = self._compute_plan_adherence(plan, acts_7d, lifts_7d)
+            logger.debug(f"14-day lifts fetch for adherence failed: {e}")
+            lifts_14d = []
+        try:
+            acts_14d_for_adherence = await self.db.get_strava_activities_range(
+                str(d14), str(today)
+            )
+        except Exception as e:
+            logger.debug(f"14-day Strava fetch for adherence failed: {e}")
+            acts_14d_for_adherence = []
+        adherence_lines = self._compute_plan_adherence(
+            plan, acts_14d_for_adherence, lifts_14d
+        )
         if adherence_lines:
             lines.append("")
             for a in adherence_lines:
