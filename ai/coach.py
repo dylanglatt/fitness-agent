@@ -576,6 +576,197 @@ class Coach:
 
         return lines
 
+    # ── Plan adherence (prescribed vs actual) ───────────────────────────────
+    #
+    # The bug this exists to fix: without an explicit reconciliation between
+    # the plan template and the activity log, the model treats the plan as a
+    # record of what happened. It reads "Monday: legs" in the template and
+    # reasons as if Monday's legs occurred, even when the Strava activity for
+    # that day clearly shows a run. The fix is to compute adherence here,
+    # server-side, and hand the model a ledger it can't ignore.
+    def _compute_plan_adherence(
+        self,
+        plan: Optional[dict],
+        acts_7d: list[dict],
+        lifts_7d: list[dict],
+        days: int = 7,
+    ) -> list[str]:
+        """Reconcile prescribed plan vs actual completed sessions over `days`.
+
+        Returns a list of context lines: a row-per-day ledger plus a
+        week-to-date count against the plan's weekly targets.
+        """
+        if not plan:
+            return []
+        template = plan.get("weekly_template") or {}
+        if not template:
+            return []
+
+        today = datetime.now().date()
+
+        # Bucket actuals by date string ('YYYY-MM-DD').
+        by_date: dict[str, dict] = {}
+        for a in acts_7d or []:
+            d = a.get("date")
+            if not d:
+                continue
+            slot = by_date.setdefault(d, {"acts": [], "lifts": []})
+            slot["acts"].append(a)
+        for l in lifts_7d or []:
+            d = l.get("date")
+            if not d:
+                continue
+            slot = by_date.setdefault(d, {"acts": [], "lifts": []})
+            slot["lifts"].append(l)
+
+        def _classify_prescribed(session: Optional[dict]) -> str:
+            if not session:
+                return "REST"
+            stype = (session.get("session_type") or "").lower()
+            if stype in ("lift", "strength"):
+                return "LIFT"
+            if stype in ("run", "long_run", "easy_run", "interval", "tempo"):
+                return "RUN"
+            if stype in ("rest", "off"):
+                return "REST"
+            if stype == "cross":
+                return "CROSS"
+            # Unknown session_type — keep the raw value so it's visible.
+            return stype.upper() if stype else "?"
+
+        def _classify_actual(slot: Optional[dict]) -> tuple[str, str]:
+            """Return (bucket, detail-string) for a day's activities + lifts."""
+            if not slot:
+                return "REST", ""
+            has_lift = bool(slot.get("lifts"))
+            running: list[dict] = []
+            other: list[dict] = []
+            for a in slot.get("acts", []):
+                sp = (a.get("sport_type") or "").lower()
+                if "weight" in sp or "strength" in sp:
+                    has_lift = True
+                elif "run" in sp:
+                    running.append(a)
+                else:
+                    other.append(a)
+
+            detail_bits: list[str] = []
+            for a in running + other:
+                mi = _m_to_mi(a.get("distance_m") or 0)
+                dur = round((a.get("moving_time_s") or 0) / 60, 1)
+                sp = a.get("sport_type") or "?"
+                if mi:
+                    detail_bits.append(f"{sp} {mi}mi {dur}min")
+                else:
+                    detail_bits.append(f"{sp} {dur}min")
+            for l in slot.get("lifts", []):
+                ex = l.get("exercise") or "lift"
+                detail_bits.append(f"LIFT {ex}")
+            detail = "; ".join(detail_bits)
+
+            if has_lift and running:
+                return "LIFT+RUN", detail
+            if has_lift:
+                return "LIFT", detail
+            if running:
+                return "RUN", detail
+            if other:
+                return "OTHER", detail
+            return "REST", detail
+
+        # Walk the window oldest → newest so the ledger reads naturally.
+        rows: list[str] = []
+        counts_actual = {"LIFT": 0, "RUN": 0, "REST": 0, "OTHER": 0, "CROSS": 0}
+        deviation_count = 0
+
+        for i in range(days - 1, -1, -1):
+            d = today - timedelta(days=i)
+            day_name = d.strftime("%A").lower()
+            prescribed = _classify_prescribed(template.get(day_name))
+            actual, detail = _classify_actual(by_date.get(d.isoformat()))
+
+            if actual == "LIFT+RUN":
+                counts_actual["LIFT"] += 1
+                counts_actual["RUN"] += 1
+            else:
+                key = actual if actual in counts_actual else "OTHER"
+                counts_actual[key] += 1
+
+            # LIFT+RUN satisfies either a LIFT or RUN prescription.
+            satisfied = (
+                actual == prescribed
+                or (actual == "LIFT+RUN" and prescribed in ("LIFT", "RUN"))
+            )
+            # Don't flag today (i == 0) as a deviation — the day isn't over.
+            if not satisfied and i > 0:
+                deviation_count += 1
+
+            marker = "OK" if satisfied or i == 0 else "DEVIATION"
+            if i == 0:
+                marker = "TODAY"
+            date_label = d.strftime("%a %b %d")
+            row = (
+                f"{date_label}: prescribed {prescribed:<5} | "
+                f"actual {actual:<8} | {marker}"
+            )
+            if detail:
+                row += f" ({detail})"
+            rows.append(row)
+
+        lines: list[str] = []
+        lines.append("PLAN ADHERENCE (last 7 days, oldest → newest):")
+        for r in rows:
+            lines.append(f"  {r}")
+
+        # Weekly targets from the template.
+        target_lifts = sum(
+            1 for s in template.values() if _classify_prescribed(s) == "LIFT"
+        )
+        target_runs = sum(
+            1 for s in template.values() if _classify_prescribed(s) == "RUN"
+        )
+        target_rest = sum(
+            1 for s in template.values() if _classify_prescribed(s) == "REST"
+        )
+
+        summary = (
+            f"WEEKLY TARGETS vs LAST 7d ACTUAL: "
+            f"lifts {counts_actual['LIFT']}/{target_lifts}, "
+            f"runs {counts_actual['RUN']}/{target_runs}, "
+            f"rest {counts_actual['REST']}/{target_rest}"
+        )
+        deficits: list[str] = []
+        if counts_actual["LIFT"] < target_lifts:
+            deficits.append(
+                f"UNDER on lifts ({target_lifts - counts_actual['LIFT']} short)"
+            )
+        if counts_actual["RUN"] < target_runs:
+            deficits.append(
+                f"UNDER on runs ({target_runs - counts_actual['RUN']} short)"
+            )
+        if counts_actual["LIFT"] > target_lifts + 1:
+            deficits.append("OVER on lifts")
+        if counts_actual["RUN"] > target_runs + 1:
+            deficits.append("OVER on runs")
+        if deficits:
+            summary += " — " + ", ".join(deficits)
+        lines.append(f"  {summary}")
+
+        # Loud guard rail when adherence has drifted enough that the model
+        # would otherwise narrate the prescribed sequence as fact.
+        if deviation_count >= 2:
+            lines.append(
+                f"  ⚠ {deviation_count} deviations from plan in the last "
+                f"{days - 1} days — the ACTIVE PLAN block describes what was "
+                f"PRESCRIBED, not what HAPPENED. Use the row-by-row actuals "
+                f"above (and RECENT LIFTS / LAST 14 DAYS Strava below) for "
+                f"any reasoning about prior sessions. If Dylan is under on a "
+                f"category (e.g. lifts) and wants to do that category today, "
+                f"that's the plan re-asserting itself — support it."
+            )
+
+        return lines
+
     # ── Tiered context (cheap-mode) ─────────────────────────────────────────
 
     async def _build_tiered_context(self, message: str) -> str:
@@ -716,6 +907,28 @@ class Coach:
         except Exception as e:
             logger.debug(f"Tiered context: recent-lifts fetch failed: {e}")
             recent_lifts = []
+
+        # PLAN ADHERENCE — only when a plan exists. Pulls 7 days of Strava
+        # activities (one extra DB read, cheap) and reuses the 14-day lifts
+        # already in hand. This is what stops the model from treating the
+        # plan template as a record of what happened.
+        if plan:
+            d7 = (today - timedelta(days=7)).isoformat()
+            try:
+                acts_7d = await self.db.get_strava_activities_range(
+                    d7, str(today)
+                )
+            except Exception as e:
+                logger.debug(f"Tiered context: 7-day Strava fetch failed: {e}")
+                acts_7d = []
+            adherence_lines = self._compute_plan_adherence(
+                plan, acts_7d, recent_lifts
+            )
+            if adherence_lines:
+                lines.append("")
+                for a in adherence_lines:
+                    lines.append(a)
+
         if recent_lifts:
             lines.append("")
             lines.append("RECENT LIFTS (last 14 days, self-reported):")
@@ -846,6 +1059,22 @@ class Coach:
             lines.append("TRENDS:")
             for t in trend_lines:
                 lines.append(f"  {t}")
+
+        # ── PLAN ADHERENCE block (prescribed vs actual, last 7 days)
+        # Without this explicit reconciliation, the model conflates the plan
+        # template with what actually happened — e.g. assumes Monday was legs
+        # because the template says so, even when the Strava activity for
+        # that day clearly shows a run.
+        try:
+            lifts_7d = await self.db.get_recent_lifts(days=7)
+        except Exception as e:
+            logger.debug(f"7-day lifts fetch for adherence failed: {e}")
+            lifts_7d = []
+        adherence_lines = self._compute_plan_adherence(plan, acts_7d, lifts_7d)
+        if adherence_lines:
+            lines.append("")
+            for a in adherence_lines:
+                lines.append(a)
 
         # ── Last 7 days detail
         if daily:
