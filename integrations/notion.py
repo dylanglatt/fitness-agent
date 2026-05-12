@@ -27,13 +27,23 @@ user's preference). All unit conversion from Strava's metric API happens
 in this module, not in callers.
 """
 
-import httpx
+import json
 import logging
+import re
+from datetime import datetime, timedelta
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
 NOTION_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
+
+# Markers we embed in Notion's Notes field so the reconciliation pass can
+# detect which SQLite rows have already been imported without needing a
+# side table. Match the patterns used by log_lift / log_strava_activity.
+_LIFTROW_MARKER = re.compile(r"\[liftrow:(\d+)\]")
+_STRAVA_MARKER = re.compile(r"\[strava:(\d+)\]")
 
 # Valid Notion Select option sets. Kept in sync with the SQL DDL used to
 # create the databases. If you change the schema in Notion, update here too.
@@ -479,6 +489,7 @@ class NotionClient:
         weight_lb: float | None = None,
         rpe: float | None = None,
         notes: str | None = None,
+        lift_id: int | None = None,
     ) -> bool:
         """Write one Lifts row. Returns True on success, False on failure.
 
@@ -486,6 +497,14 @@ class NotionClient:
         extract structured sets/reps/weight, pass `notes=<raw message>` so
         the original phrasing is preserved and we can still create a row
         that's useful as a record (even if not chartable).
+
+        `lift_id` is the SQLite lifts.id of the row this Notion entry
+        corresponds to. When provided, we prefix Notes with
+        `[liftrow:<id>]` — the same dedup-marker pattern used for Strava
+        activities. The recurring reconciliation pass scans for this
+        marker to figure out which SQLite lifts haven't made it into
+        Notion yet, so we don't write duplicates when the real-time push
+        and the safety-net pass both fire.
         """
         if not self.is_configured_lifts():
             logger.debug("Notion Lifts DB not configured — skipping.")
@@ -497,6 +516,12 @@ class NotionClient:
         schedule_page_id = await self.find_or_create_schedule(
             date=date, training_group="Lift", workout=workout
         )
+
+        # Prefix the dedup marker so reconciliation can detect this row by
+        # SQLite id even when the user later edits the notes manually.
+        if lift_id is not None:
+            marker = f"[liftrow:{lift_id}]"
+            notes = f"{marker} {notes}" if notes else marker
 
         props: dict = {}
         title = f"{exercise} {date}" if exercise else f"Lift {date}"
@@ -695,3 +720,186 @@ class NotionClient:
             logger.info(f"Notion Daily Log row created for {date}.")
             return True
         return False
+
+    # ── Reconciliation — fill gaps the real-time path missed ────────────────
+    #
+    # Background: the real-time push (Strava webhook for runs, in-chat
+    # parser + /liftstart for lifts) writes both SQLite AND Notion. But
+    # the webhook can be down, the subscription can expire silently, a
+    # Notion call can transiently 5xx — and historically those failures
+    # left the row in SQLite with no Notion counterpart and no retry.
+    # The nightly sync now writes activities to Notion too, but it ALSO
+    # invokes this reconciliation pass as a final backstop: anything
+    # SQLite has but Notion doesn't (matched by dedup markers in Notes)
+    # gets written here. Idempotent — safe to run as often as we like.
+
+    async def _query_pages_since(
+        self, db_id: str, date_property: str, since_iso: str
+    ) -> list[dict]:
+        """Paginate POST /v1/databases/{id}/query for rows where the given
+        date property is on/after `since_iso`. Returns the raw page dicts."""
+        out: list[dict] = []
+        cursor: str | None = None
+        while True:
+            body: dict = {
+                "page_size": 100,
+                "filter": {
+                    "property": date_property,
+                    "date": {"on_or_after": since_iso},
+                },
+            }
+            if cursor:
+                body["start_cursor"] = cursor
+            try:
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    resp = await client.post(
+                        f"{NOTION_BASE}/databases/{db_id}/query",
+                        headers=self._headers(),
+                        json=body,
+                    )
+            except Exception as e:
+                logger.warning(f"Notion reconcile query network error: {e}")
+                return out
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Notion reconcile query {db_id} failed "
+                    f"{resp.status_code}: {resp.text[:200]}"
+                )
+                return out
+            data = resp.json()
+            out.extend(data.get("results", []))
+            if not data.get("has_more"):
+                return out
+            cursor = data.get("next_cursor")
+
+    @staticmethod
+    def _notes_text(page: dict) -> str:
+        """Pull the concatenated plain_text of the 'Notes' property out of a
+        Notion page. Returns '' when the property is absent or empty."""
+        notes = page.get("properties", {}).get("Notes", {})
+        rt = notes.get("rich_text") or []
+        return "".join(r.get("plain_text", "") for r in rt)
+
+    async def reconcile_recent(self, db, days: int = 7) -> dict:
+        """Find SQLite lifts + Strava activities that don't have a Notion
+        counterpart in the last `days` days, and write the missing ones.
+
+        Dedup keys: `[liftrow:<sqlite_id>]` for lifts, `[strava:<id>]` for
+        activities. Both are embedded in the Notion Notes field by the
+        primary writers. Anything in SQLite whose marker isn't found in
+        Notion gets written. Anything in Notion with no matching SQLite
+        row is left alone — this pass only fills gaps, never deletes.
+
+        Returns {'lifts': N_written, 'activities': N_written}.
+        """
+        result = {"lifts": 0, "activities": 0}
+        since = (datetime.now().date() - timedelta(days=days)).isoformat()
+
+        # ── Lifts ───────────────────────────────────────────────────────────
+        if self.is_configured_lifts():
+            # 1. What's already in Notion (by [liftrow:<id>] marker)?
+            existing_lift_ids: set[int] = set()
+            for page in await self._query_pages_since(
+                self.lifts_db_id, "Date", since
+            ):
+                text = self._notes_text(page)
+                for m in _LIFTROW_MARKER.finditer(text):
+                    try:
+                        existing_lift_ids.add(int(m.group(1)))
+                    except ValueError:
+                        pass
+
+            # 2. What does SQLite have for the same window?
+            try:
+                sqlite_lifts = await db.get_recent_lifts(days=days)
+            except Exception as e:
+                logger.warning(f"reconcile_recent: SQLite lifts read failed: {e}")
+                sqlite_lifts = []
+
+            # 3. Write whatever's in SQLite but not in Notion.
+            for lift in sqlite_lifts:
+                lid = lift.get("id")
+                if not lid or lid in existing_lift_ids:
+                    continue
+                try:
+                    ok = await self.log_lift(
+                        date=lift.get("date"),
+                        exercise=lift.get("exercise") or "lift",
+                        notes=lift.get("raw_message") or lift.get("details") or "",
+                        lift_id=lid,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"reconcile_recent: log_lift({lid}) raised {e}"
+                    )
+                    continue
+                if ok:
+                    result["lifts"] += 1
+
+        # ── Strava activities ───────────────────────────────────────────────
+        if self.is_configured_runs():
+            existing_strava_ids: set[str] = set()
+            for page in await self._query_pages_since(
+                self.runs_db_id, "Date", since
+            ):
+                text = self._notes_text(page)
+                for m in _STRAVA_MARKER.finditer(text):
+                    existing_strava_ids.add(m.group(1))
+
+            try:
+                sqlite_acts = await db.get_strava_activities_range(
+                    since, datetime.now().date().isoformat()
+                )
+            except Exception as e:
+                logger.warning(f"reconcile_recent: SQLite acts read failed: {e}")
+                sqlite_acts = []
+
+            for row in sqlite_acts:
+                aid = row.get("activity_id")
+                if not aid or str(aid) in existing_strava_ids:
+                    continue
+                # The DB row's raw_json field has the full Strava payload that
+                # log_strava_activity expects (start_date_local, distance,
+                # moving_time, …). Fall back to a thin dict built from the
+                # SQLite columns if raw_json is missing.
+                payload: dict = {}
+                raw = row.get("raw_json")
+                if raw:
+                    try:
+                        payload = json.loads(raw) if isinstance(raw, str) else raw
+                    except Exception:
+                        payload = {}
+                if not payload:
+                    payload = {
+                        "id": aid,
+                        "sport_type": row.get("sport_type"),
+                        "name": row.get("name"),
+                        "distance": row.get("distance_m"),
+                        "moving_time": row.get("moving_time_s"),
+                        "total_elevation_gain": row.get("total_elevation_gain_m"),
+                        "average_heartrate": row.get("average_hr"),
+                        "max_heartrate": row.get("max_hr"),
+                        "start_date_local": (row.get("date") or "") + "T00:00:00",
+                    }
+                else:
+                    # Make sure the id is set (some payloads use 'id', others
+                    # don't include it after upsert) — the marker needs it.
+                    payload.setdefault("id", aid)
+
+                try:
+                    whoop_match = await db.find_whoop_workout_for_strava_activity(row)
+                except Exception:
+                    whoop_match = None
+                try:
+                    ok = await self.log_strava_activity(
+                        payload, whoop_workout=whoop_match
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"reconcile_recent: log_strava_activity({aid}) raised {e}"
+                    )
+                    continue
+                if ok:
+                    result["activities"] += 1
+
+        return result

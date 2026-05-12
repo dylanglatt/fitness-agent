@@ -285,21 +285,31 @@ class Database:
 
     # ── Lifts / notes (unchanged behaviour) ─────────────────────────────────
 
-    async def log_lift(self, date: str, exercise: str, details: str, raw: str = ""):
+    async def log_lift(self, date: str, exercise: str, details: str, raw: str = "") -> int:
+        """Insert one lifts row. Returns the auto-increment id of the new row.
+
+        The id is the dedup key for the Notion reconciliation pass: it gets
+        embedded as `[liftrow:<id>]` in the Notion Notes field so the
+        recurring "what's in SQLite but not in Notion?" check can match
+        deterministically without relying on text similarity.
+        """
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute(
+            cursor = await db.execute(
                 "INSERT INTO lifts (date, exercise, details, raw_message) VALUES (?, ?, ?, ?)",
                 (date, exercise, details, raw),
             )
+            new_id = cursor.lastrowid
             await db.commit()
-        logger.info(f"Lift logged: {exercise} — {details}")
+        logger.info(f"Lift logged (id={new_id}): {exercise} — {details}")
+        return int(new_id)
 
     async def get_recent_lifts(self, days: int = 7) -> list[dict]:
         since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
-                "SELECT date, exercise, details FROM lifts WHERE date >= ? ORDER BY date DESC",
+                "SELECT id, date, exercise, details, raw_message FROM lifts "
+                "WHERE date >= ? ORDER BY date DESC",
                 (since,),
             ) as cursor:
                 rows = await cursor.fetchall()

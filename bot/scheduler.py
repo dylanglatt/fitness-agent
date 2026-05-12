@@ -232,6 +232,21 @@ class Scheduler:
             await self._refresh_recent_whoop_into_db(days=2)
         except Exception as e:
             logger.warning(f"Pre-brief WHOOP refresh failed (non-fatal): {e}")
+        # Reconcile any lifts / activities the real-time path missed since
+        # the last brief. Walks SQLite vs Notion for the last 7 days and
+        # writes only the gaps (dedup by [liftrow:<id>] / [strava:<id>]
+        # markers). Tighter loop than waiting for the 3:05 AM nightly job,
+        # which matters when a lift logged at 9 AM never made it to Notion.
+        try:
+            missing = await self.coach.notion.reconcile_recent(self.coach.db, days=7)
+            if missing.get("lifts") or missing.get("activities"):
+                logger.info(
+                    f"Pre-brief Notion reconciliation: wrote "
+                    f"{missing.get('lifts', 0)} missing lifts and "
+                    f"{missing.get('activities', 0)} missing activities."
+                )
+        except Exception as e:
+            logger.warning(f"Pre-brief Notion reconciliation failed: {e}")
         brief = await self.coach.daily_brief()
         await self._dm_owner(brief)
 
@@ -341,8 +356,16 @@ class Scheduler:
             # Webhooks handle everything fresh; this is the safety net only.
             # We enrich each activity with /activities/{id} + zones so HR
             # data lands even when this safety-net path is what wrote the row.
+            #
+            # Before today, this loop wrote to SQLite only — so if the Strava
+            # webhook ever missed a delivery, the activity would land in
+            # SQLite at 3:05am but never reach Notion. The nightly sync is
+            # the safety net for everything downstream, including Notion,
+            # so we now push to Notion here too (best-effort: a Notion
+            # failure must never break the SQLite-side sync).
             after_ts = int((now - timedelta(days=2)).timestamp())
             count_a = 0
+            count_notion = 0
             async for act in self.coach.strava.iter_all_activities(after=after_ts):
                 try:
                     act = await self.coach.strava.enrich_activity(act)
@@ -352,13 +375,49 @@ class Scheduler:
                     )
                 await db.upsert_strava_activity(act)
                 count_a += 1
+                # Mirror to Notion. log_strava_activity embeds [strava:<id>]
+                # in the Notes field, so writing twice produces two visible
+                # rows — that's why we ALSO run the reconciliation pass,
+                # which dedupes by that marker. Here we just take the
+                # cheapest swing: if Notion is up, write it.
+                try:
+                    whoop_match = await db.find_whoop_workout_for_strava_activity(act)
+                    notion_ok = await self.coach.notion.log_strava_activity(
+                        act, whoop_workout=whoop_match
+                    )
+                    if notion_ok:
+                        count_notion += 1
+                except Exception as e:
+                    logger.warning(
+                        f"Nightly Notion push failed for activity {act.get('id')}: {e}"
+                    )
             await db.set_sync_state(
                 "strava",
                 datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 last_record_date=datetime.utcnow().strftime("%Y-%m-%d"),
                 note="nightly",
             )
-            logger.info(f"Strava nightly sync: {count_a} activities touched.")
+            logger.info(
+                f"Strava nightly sync: {count_a} activities touched, "
+                f"{count_notion} mirrored to Notion."
+            )
+
+            # ── Notion reconciliation — fills any gaps the real-time
+            # webhook + nightly push both missed. Walks the last N days of
+            # SQLite lifts + activities and writes whatever isn't already
+            # in Notion (matched by [liftrow:<id>] / [strava:<id>]
+            # markers). Cheap query + write only the missing rows.
+            try:
+                missing = await self.coach.notion.reconcile_recent(
+                    db, days=7
+                )
+                logger.info(
+                    f"Notion reconciliation: wrote {missing.get('lifts', 0)} "
+                    f"missing lifts and {missing.get('activities', 0)} "
+                    f"missing activities."
+                )
+            except Exception as e:
+                logger.warning(f"Notion reconciliation failed: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Nightly sync failed: {e}", exc_info=True)
 

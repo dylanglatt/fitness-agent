@@ -1669,7 +1669,7 @@ class Coach:
 
         lift = await self._try_parse_lift(message)
         if lift:
-            await self.db.log_lift(
+            lift_id = await self.db.log_lift(
                 date=datetime.now().strftime("%Y-%m-%d"),
                 exercise=lift["exercise"],
                 details=lift["details"],
@@ -1681,7 +1681,7 @@ class Coach:
                 # when Haiku can extract them — when it can't, those cells
                 # stay blank and the raw message in Notes preserves the
                 # original phrasing so nothing is lost.
-                await self.notion.log_lift(
+                ok = await self.notion.log_lift(
                     date=datetime.now().strftime("%Y-%m-%d"),
                     exercise=lift["exercise"],
                     workout=lift.get("workout"),
@@ -1689,9 +1689,23 @@ class Coach:
                     reps=lift.get("reps"),
                     weight_lb=lift.get("weight_lb"),
                     notes=message,
+                    lift_id=lift_id,
                 )
-            except Exception:
-                pass
+                if not ok:
+                    logger.warning(
+                        "Notion lift write returned False for %r — the row is "
+                        "in SQLite but did NOT land in Notion. The nightly "
+                        "reconciliation pass will retry it.",
+                        message[:80],
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Notion lift write raised %s: %s — the row is in SQLite "
+                    "but did NOT land in Notion. The nightly reconciliation "
+                    "pass will retry it.",
+                    type(e).__name__,
+                    e,
+                )
 
         # Recovery session logging runs independently — a single message can
         # describe both a lift AND a post-lift sauna.
@@ -2207,15 +2221,17 @@ Rules:
 
         details = f"set {set_idx + 1}/{total_sets} · {weight_str} lb × {reps_str}"
         # Persist into the same lifts table the rest of the bot reads.
-        await self.db.log_lift(
+        lift_id = await self.db.log_lift(
             date=datetime.now().strftime("%Y-%m-%d"),
             exercise=ex_name,
             details=details,
             raw=f"[liftstart] {message}",
         )
-        # Mirror to Notion if wired (best-effort; never blocks).
+        # Mirror to Notion if wired (best-effort; never blocks). Failure is
+        # logged at WARNING so we hear about it — the reconciliation pass
+        # picks up anything we miss here on its next run.
         try:
-            await self.notion.log_lift(
+            ok = await self.notion.log_lift(
                 date=datetime.now().strftime("%Y-%m-%d"),
                 exercise=ex_name,
                 workout=session.get("workout_label"),
@@ -2223,9 +2239,20 @@ Rules:
                 reps=reps,
                 weight_lb=weight,
                 notes=f"[liftstart] set {set_idx + 1}/{total_sets} · target {ex.get('reps')}",
+                lift_id=lift_id,
             )
-        except Exception:
-            pass
+            if not ok:
+                logger.warning(
+                    "Notion lift write returned False for %s set %d/%d — "
+                    "row in SQLite but not Notion; reconciliation will retry.",
+                    ex_name, set_idx + 1, total_sets,
+                )
+        except Exception as e:
+            logger.warning(
+                "Notion lift write raised %s for %s set %d/%d: %s — "
+                "row in SQLite but not Notion; reconciliation will retry.",
+                type(e).__name__, ex_name, set_idx + 1, total_sets, e,
+            )
 
         history.append({
             "exercise": ex_name,
