@@ -653,7 +653,15 @@ class Coach:
             """Return (bucket, detail-string) for a day's activities + lifts."""
             if not slot:
                 return "REST", ""
-            has_lift = bool(slot.get("lifts"))
+            # Only count lift rows with non-blank details as real sessions.
+            # Blank-detail rows are phantoms from chat parses of
+            # conversational mentions ("what's my deadlift today?") and
+            # must not satisfy the day — they're the gaslighting source.
+            real_lifts = [
+                l for l in slot.get("lifts", [])
+                if (l.get("details") or "").strip()
+            ]
+            has_lift = bool(real_lifts)
             running: list[dict] = []
             other: list[dict] = []
             for a in slot.get("acts", []):
@@ -674,7 +682,7 @@ class Coach:
                     detail_bits.append(f"{sp} {mi}mi {dur}min")
                 else:
                     detail_bits.append(f"{sp} {dur}min")
-            for l in slot.get("lifts", []):
+            for l in real_lifts:
                 ex = l.get("exercise") or "lift"
                 detail_bits.append(f"LIFT {ex}")
             detail = "; ".join(detail_bits)
@@ -999,13 +1007,36 @@ class Coach:
                 for a in adherence_lines:
                     lines.append(a)
 
-        if recent_lifts:
-            lines.append("")
-            lines.append("RECENT LIFTS (last 14 days, self-reported):")
-            for lift in recent_lifts[:20]:
+        # Split today's lifts from earlier ones. LIFTS LOGGED TODAY is the
+        # ONLY source of truth for whether Dylan lifted today — collapsing
+        # the two into one "RECENT LIFTS" list let the model conflate a
+        # row dated today with "he lifted today" even when the row was a
+        # phantom or a placeholder. Blank-detail rows never qualify as
+        # "today's work."
+        today_iso = datetime.now().strftime("%Y-%m-%d")
+        todays_lifts = [
+            l for l in (recent_lifts or [])
+            if l.get("date") == today_iso and (l.get("details") or "").strip()
+        ]
+        earlier_lifts = [
+            l for l in (recent_lifts or [])
+            if l.get("date") != today_iso
+        ]
+        lines.append("")
+        if todays_lifts:
+            lines.append("LIFTS LOGGED TODAY:")
+            for l in todays_lifts:
+                lines.append(f"  - {l.get('exercise')} | {l.get('details')}")
+        else:
+            lines.append(
+                "LIFTS LOGGED TODAY: NONE — Dylan has not completed a lift today."
+            )
+        if earlier_lifts:
+            lines.append("LIFTS EARLIER (last 14 days, self-reported):")
+            for l in earlier_lifts[:15]:
                 lines.append(
-                    f"  - {lift.get('date')} | "
-                    f"{lift.get('exercise')} | {lift.get('details')}"
+                    f"  - {l.get('date')} | "
+                    f"{l.get('exercise')} | {l.get('details')}"
                 )
 
         lines.append("")
@@ -1291,10 +1322,30 @@ class Coach:
         # ── Lifts + notes (last 14 days)
         lifts = await self.db.get_recent_lifts(days=14)
         notes = await self.db.get_recent_notes(days=14)
-        if lifts:
-            lines.append("")
-            lines.append("RECENT LIFTS (self-reported, last 14 days):")
-            for l in lifts[:15]:
+        # Same split-by-today logic as the tiered builder. LIFTS LOGGED
+        # TODAY is the only block that answers "did Dylan lift today?" —
+        # everything else is historical and must not be conflated with it.
+        today_iso = datetime.now().strftime("%Y-%m-%d")
+        todays_lifts = [
+            l for l in (lifts or [])
+            if l.get("date") == today_iso and (l.get("details") or "").strip()
+        ]
+        earlier_lifts = [
+            l for l in (lifts or [])
+            if l.get("date") != today_iso
+        ]
+        lines.append("")
+        if todays_lifts:
+            lines.append("LIFTS LOGGED TODAY:")
+            for l in todays_lifts:
+                lines.append(f"  - {l['exercise']} | {l['details']}")
+        else:
+            lines.append(
+                "LIFTS LOGGED TODAY: NONE — Dylan has not completed a lift today."
+            )
+        if earlier_lifts:
+            lines.append("LIFTS EARLIER (last 14 days, self-reported):")
+            for l in earlier_lifts[:15]:
                 lines.append(f"  - {l['date']} | {l['exercise']} | {l['details']}")
 
         # ── Recovery sessions (sauna / plunge / etc.) — last 14 days
@@ -1749,7 +1800,17 @@ class Coach:
             return await self.debrief_run()
 
         lift = await self._try_parse_lift(message)
-        if lift:
+        # Guard: only log when Haiku found at least one structured number.
+        # Without this, conversational mentions like "what's my leg lift
+        # today, main lift being trap bar deadlift" produce phantom rows
+        # with blank details. Those rows are then re-read by the next
+        # context build as "Dylan already lifted today" — the chain that
+        # gaslights the plan-adherence ledger and the morning brief.
+        if lift and (
+            lift.get("weight_lb") is not None
+            or lift.get("reps") is not None
+            or lift.get("sets") is not None
+        ):
             lift_id = await self.db.log_lift(
                 date=datetime.now().strftime("%Y-%m-%d"),
                 exercise=lift["exercise"],
@@ -1874,6 +1935,11 @@ Respond with JSON ONLY. Schema:
 }}
 
 Rules:
+  • A lift LOG requires AT LEAST ONE of: a number of reps, a number of sets,
+    or a weight. Questions ABOUT lifting ("what's my leg lift today?"),
+    references to past sessions ("I do have trap bar deadlift logged once"),
+    future plans, or any mention without a quantified set/rep/weight number
+    is NOT a lift log. In those cases return {{"is_lift": false}}.
   • If the message describes a lift but you can't confidently pin a field, set it to null.
   • For push/pull/legs: Bench/OHP/Dips/Push-ups = Push. Rows/Pull-ups/Chin-ups/Curls = Pull.
     Squat/Deadlift/Lunge/Leg press = Legs. Core/accessory/mixed = Other.
@@ -2168,9 +2234,23 @@ Rules:
         prescription = sess_def.get("prescription", "")
         exercises = await self._parse_prescription_to_exercises(prescription)
         if not exercises:
+            # When force=True is used on a non-lift day, the parser
+            # correctly returns no exercises (its rules skip cardio +
+            # mobility). Don't tell the user the prescription is
+            # unparseable — tell them the truth: it's not a lift day.
+            if stype != "lift":
+                focus = sess_def.get("focus", "")
+                return (
+                    f"Today's plan is a **{stype}** day"
+                    + (f" ({focus})" if focus else "")
+                    + " with no lifting prescribed. To lift anyway, tell me "
+                    "which lift to centre the session on (e.g. `squat day`, "
+                    "`bench day`) or run `/workout` for a recovery-modulated "
+                    "suggestion."
+                )
             return (
-                "Couldn't parse today's prescription into structured exercises. "
-                "Check `/plan today` and try again."
+                "Couldn't parse today's lift prescription into structured "
+                "exercises. Check `/plan today` and try again."
             )
         focus = sess_def.get("focus", "lift")
         await self.db.start_lift_session(workout_label=focus, exercises=exercises)
