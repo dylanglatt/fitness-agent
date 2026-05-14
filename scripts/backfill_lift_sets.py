@@ -201,6 +201,82 @@ def _safe_float(v) -> Optional[float]:
         return None
 
 
+# ── Same-day context fill ───────────────────────────────────────────────────
+#
+# Roughly 40% of historical chat-path lift rows were logged with empty or
+# 'Unknown' exercise names because the message itself didn't name the lift
+# ("2nd set, 205 for 6 reps. Tough but I got all 6"). At chat-time the bot
+# could infer the exercise from prior conversation turns, but that context
+# never made it into the SQLite lifts table — so a per-row backfill in
+# isolation can't recover the exercise name either.
+#
+# Fix: before backfilling, walk all lifts chronologically by (date, id) and
+# fill each unknown row's exercise from the nearest same-day known row. We
+# prefer the most recent prior known row (forward fill); if none, we fall
+# back to the next known row on that day (backward fill). Cross-day fill is
+# intentionally NOT done — exercises change between sessions and there's no
+# guarantee yesterday's last lift is today's first.
+
+_UNKNOWN_EX = {"", "unknown", "unknown exercise"}
+
+
+def _is_known_exercise(name: str | None) -> bool:
+    if not name:
+        return False
+    return name.strip().lower() not in _UNKNOWN_EX
+
+
+def build_exercise_context_map(rows: list[dict]) -> dict[int, tuple[str, bool]]:
+    """Walk rows by (date, id) and return {lift_id: (resolved_exercise, was_filled)}.
+
+    was_filled is True if the resolved exercise came from a same-day sibling
+    rather than the row's own `exercise` column. Used to (1) tag context-
+    filled rows with a `[context-filled]` notes prefix for auditability and
+    (2) report a separate stat in the summary.
+    """
+    from collections import defaultdict
+    by_date: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        by_date[r["date"]].append(r)
+
+    resolved: dict[int, tuple[str, bool]] = {}
+    for date, day_rows in by_date.items():
+        day_rows.sort(key=lambda r: r["id"])
+        # Forward fill: most recent prior known exercise on this day.
+        last_known: str | None = None
+        forward: dict[int, str] = {}
+        for r in day_rows:
+            ex = (r.get("exercise") or "").strip()
+            if _is_known_exercise(ex):
+                last_known = ex
+                forward[r["id"]] = ex
+            elif last_known:
+                forward[r["id"]] = last_known
+        # Backward fill: next known exercise on this day, for rows that
+        # forward fill didn't cover (i.e. the day started with unknowns).
+        next_known: str | None = None
+        backward: dict[int, str] = {}
+        for r in reversed(day_rows):
+            ex = (r.get("exercise") or "").strip()
+            if _is_known_exercise(ex):
+                next_known = ex
+                backward[r["id"]] = ex
+            elif next_known:
+                backward[r["id"]] = next_known
+        # Combine: forward wins, then backward, then leave as Unknown.
+        for r in day_rows:
+            own = (r.get("exercise") or "").strip()
+            if _is_known_exercise(own):
+                resolved[r["id"]] = (own, False)
+            else:
+                filled = forward.get(r["id"]) or backward.get(r["id"])
+                if filled:
+                    resolved[r["id"]] = (filled, True)
+                else:
+                    resolved[r["id"]] = ("Unknown", False)
+    return resolved
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 async def run(args: argparse.Namespace) -> int:
@@ -217,6 +293,20 @@ async def run(args: argparse.Namespace) -> int:
 
     logger.info("Candidate lift rows: %d (since=%s)", len(rows), args.since or "all")
 
+    # Same-day forward/backward fill of empty/Unknown exercise names. About
+    # 40% of historical rows have no exercise on the row itself because the
+    # chat message was a continuation ('2nd set, 205 for 6 reps'). Without
+    # this step those rows would land in lift_sets as 'Unknown' and never
+    # show up in query_lift_progression('bench').
+    context_map = build_exercise_context_map(rows)
+    n_filled = sum(1 for _, was in context_map.values() if was)
+    n_unrecoverable = sum(1 for ex, _ in context_map.values() if ex == "Unknown")
+    logger.info(
+        "Context-fill: %d rows had exercise resolved from same-day siblings; "
+        "%d rows still Unknown (no same-day reference).",
+        n_filled, n_unrecoverable,
+    )
+
     stats = {
         "scanned": 0,
         "skipped_existing": 0,
@@ -224,6 +314,7 @@ async def run(args: argparse.Namespace) -> int:
         "chat_parsed": 0,
         "unparsable": 0,
         "sets_written": 0,
+        "context_filled": 0,
     }
     samples: list[dict] = []
 
@@ -236,7 +327,16 @@ async def run(args: argparse.Namespace) -> int:
 
         raw = row.get("raw_message") or ""
         details = row.get("details") or ""
-        exercise = row.get("exercise") or "Unknown"
+        # Resolve exercise via the same-day context map — this replaces the
+        # row's own (often empty) exercise with a forward/backward-filled
+        # known name. was_filled lets us tag the row's notes for audit and
+        # bump the context_filled stat.
+        resolved_exercise, was_filled = context_map.get(
+            lift_id, (row.get("exercise") or "Unknown", False),
+        )
+        exercise = resolved_exercise
+        if was_filled:
+            stats["context_filled"] += 1
         date = row["date"]
 
         # ── Deterministic /liftstart path ────────────────────────────────
@@ -278,12 +378,23 @@ async def run(args: argparse.Namespace) -> int:
         # ── Persist or sample-print ─────────────────────────────────────
         for s in sets_to_write:
             stats["sets_written"] += 1
+            # Stamp a `[context-filled]` prefix on notes when the exercise
+            # came from a same-day sibling rather than the row itself.
+            # Lets future audits / Notion viewers see at a glance which
+            # rows had their exercise inferred.
+            row_notes = s.get("notes") or ""
+            if was_filled:
+                row_notes = (
+                    f"[context-filled] {row_notes}" if row_notes
+                    else "[context-filled]"
+                )
             if args.dry_run or (args.sample and len(samples) < args.sample):
                 samples.append({
                     "lift_id": lift_id,
                     "date": date,
                     "exercise": exercise,
-                    **s,
+                    "context_filled": was_filled,
+                    **{**s, "notes": row_notes},
                 })
                 if args.sample and len(samples) >= args.sample:
                     break
@@ -298,7 +409,7 @@ async def run(args: argparse.Namespace) -> int:
                     equipment=s["equipment"],
                     to_failure=s["to_failure"],
                     rpe=s["rpe"],
-                    notes=s["notes"],
+                    notes=row_notes,
                     source=s["_source"],
                 )
 
@@ -316,8 +427,9 @@ async def run(args: argparse.Namespace) -> int:
     if samples:
         print("\n── Sample parses (first %d) ─────────────────────────────────" % len(samples))
         for s in samples:
+            fill_tag = " ⟵filled" if s.get("context_filled") else ""
             print(
-                f"  [{s['date']}] lift_id={s['lift_id']} {s['exercise']:25s} "
+                f"  [{s['date']}] lift_id={s['lift_id']} {s['exercise']:30s}{fill_tag} "
                 f"set {s['set_number']}: "
                 f"{s['weight_lb']}lb × {s['reps']} reps  "
                 f"[{s.get('equipment') or '-'}, fail={s['to_failure']}, "
