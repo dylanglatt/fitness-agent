@@ -1036,20 +1036,6 @@ def register_commands(bot):
         )
 
     @bot.hybrid_command(
-        name="swap",
-        description="[stub] Swap today's planned session for an alternative at equivalent stimulus.",
-    )
-    @is_owner_hybrid
-    async def swap_cmd(ctx: commands.Context, *, reason: str = ""):
-        # TODO: coach method that takes today's planned session + a reason
-        # (tired legs, no gym, etc.) and returns a same-stimulus alternative.
-        await ctx.send(
-            "_/swap isn't wired yet — the planner has to know the stimulus "
-            "space (aerobic/threshold/strength/power) to substitute safely. "
-            "Coming after /workout bakes for a bit._"
-        )
-
-    @bot.hybrid_command(
         name="warmup",
         description="[stub] A 5–10 minute warmup tuned to today's planned session.",
     )
