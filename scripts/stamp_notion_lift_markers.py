@@ -48,6 +48,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import Config
+from integrations.notion import NotionClient
 
 logging.basicConfig(
     level=logging.INFO,
@@ -191,13 +192,16 @@ async def run(args: argparse.Namespace) -> int:
         logger.error("NOTION_LIFTS_DATABASE_ID is not configured.")
         return 2
 
-    # 1) SQLite lifts, grouped by date, ordered by id.
+    # 1) SQLite lifts, grouped by date, ordered by id. We grab details
+    # and raw_message too because --create-missing reuses them as the new
+    # Notion row's Notes content.
     import aiosqlite
     sqlite_rows: list[dict] = []
     async with aiosqlite.connect(cfg.DB_PATH) as sdb:
         sdb.row_factory = aiosqlite.Row
         async with sdb.execute(
-            "SELECT id, date, exercise FROM lifts ORDER BY date ASC, id ASC"
+            "SELECT id, date, exercise, details, raw_message FROM lifts "
+            "ORDER BY date ASC, id ASC"
         ) as cur:
             sqlite_rows = [dict(r) for r in await cur.fetchall()]
 
@@ -230,17 +234,29 @@ async def run(args: argparse.Namespace) -> int:
         len(notion_by_date),
     )
 
-    # 3) Build the stamp plan.
+    # 3) Build the stamp / create plan.
+    #
+    # Two modes:
+    #   * --create-missing (recommended for Dylan's data): for every SQLite
+    #     lift without a [liftrow:N] marker in Notion, CREATE a fresh per-lift
+    #     Notion Lifts row. Don't try to pair with existing unmarked rows —
+    #     those are pre-bot summary-style entries that shouldn't be repurposed
+    #     as a parent for a single set.
+    #   * default: try to pair (i-th unmarked SQLite ↔ i-th unmarked Notion).
+    #     Useful when the Notion DB was supposed to be 1:1 with SQLite but
+    #     missing markers — rare in practice.
     stats = {
         "sqlite_total": len(sqlite_rows),
         "already_marked": 0,
-        "planned": 0,
+        "planned": 0,            # plans to STAMP an existing Notion row
+        "to_create": 0,          # plans to CREATE a new Notion row
         "skipped_no_notion_row": 0,
         "exercise_mismatch_warning": 0,
         "stamped": 0,
+        "created": 0,
         "failed": 0,
     }
-    plans: list[dict] = []
+    plans: list[dict] = []  # each plan has 'op': 'stamp' or 'create'
 
     for date, sqlite_lifts in sorted(sqlite_by_date.items()):
         notion_pages = notion_by_date.get(date, [])
@@ -251,22 +267,37 @@ async def run(args: argparse.Namespace) -> int:
             if m is not None:
                 existing_marker_ids.add(m)
 
-        # Pages without a marker yet — these are the targets.
+        # Pages without a marker yet — these are the targets for stamp mode.
         unmarked_pages = [p for p in notion_pages if _extract_marker(p) is None]
         # SQLite lifts that don't yet have a marker in Notion.
         unstamped_sqlite = [r for r in sqlite_lifts if r["id"] not in existing_marker_ids]
 
         stats["already_marked"] += len(sqlite_lifts) - len(unstamped_sqlite)
 
-        # Pair the i-th unstamped SQLite lift with the i-th unmarked Notion page.
-        # Order is chronological on both sides, so position-pairing should align.
+        if args.create_missing:
+            # Create a fresh Notion Lifts row for every unmarked SQLite lift.
+            # Existing unmarked Notion rows on this date stay untouched.
+            for sql_lift in unstamped_sqlite:
+                plans.append({
+                    "op": "create",
+                    "sqlite_id": sql_lift["id"],
+                    "sqlite_ex": sql_lift["exercise"] or "",
+                    "sqlite_details": sql_lift.get("details") or "",
+                    "sqlite_raw": sql_lift.get("raw_message") or "",
+                    "date": date,
+                })
+                stats["to_create"] += 1
+            continue
+
+        # Default (stamp) mode: position-pair the i-th unmarked SQLite lift
+        # with the i-th unmarked Notion page on this date.
         for i, sql_lift in enumerate(unstamped_sqlite):
             if i >= len(unmarked_pages):
-                # SQLite has more lifts than unmarked Notion pages on this date.
-                # The Notion side is exhausted; we can't stamp this lift.
                 logger.warning(
                     "Date %s: SQLite lift %d (%r) has no unmarked Notion row "
-                    "to pair with (notion=%d, sqlite=%d, already_marked=%d).",
+                    "to pair with (notion=%d, sqlite=%d, already_marked=%d). "
+                    "Re-run with --create-missing to create a fresh Notion "
+                    "row for this lift.",
                     date, sql_lift["id"], sql_lift["exercise"],
                     len(notion_pages), len(sqlite_lifts),
                     len(sqlite_lifts) - len(unstamped_sqlite),
@@ -275,7 +306,7 @@ async def run(args: argparse.Namespace) -> int:
                 continue
             n_page = unmarked_pages[i]
             n_ex = _extract_exercise(n_page)
-            sql_ex = sql_lift["exercise"]
+            sql_ex = sql_lift["exercise"] or ""
             current_notes = _extract_notes(n_page)
             if not _exercises_roughly_match(sql_ex, n_ex):
                 stats["exercise_mismatch_warning"] += 1
@@ -285,6 +316,7 @@ async def run(args: argparse.Namespace) -> int:
                     date, i, sql_lift["id"], sql_ex, n_ex,
                 )
             plans.append({
+                "op": "stamp",
                 "sqlite_id": sql_lift["id"],
                 "sqlite_ex": sql_ex,
                 "notion_page_id": n_page["id"],
@@ -296,33 +328,68 @@ async def run(args: argparse.Namespace) -> int:
 
     # 4) Execute or dry-run.
     if not plans:
-        print("\nNothing to stamp — all SQLite lifts already have markers in Notion.")
+        print("\nNothing to do — all SQLite lifts already have markers in Notion.")
         return 0
 
     if args.dry_run:
-        print(f"\n── DRY-RUN plan ({len(plans)} rows) ─────────────────────────────")
-        for p in plans[:50]:
-            same = "✓" if _exercises_roughly_match(p["sqlite_ex"], p["notion_ex"]) else "≈"
-            print(
-                f"  [{p['date']}] sqlite_id={p['sqlite_id']:3d}  "
-                f"{p['sqlite_ex']:30s} {same} {p['notion_ex']:30s}  "
-                f"page={p['notion_page_id'][:8]}…"
-            )
-        if len(plans) > 50:
-            print(f"  …and {len(plans) - 50} more")
+        print(f"\n── DRY-RUN plan ({len(plans)} ops) ───────────────────────────────")
+        for p in plans[:60]:
+            if p["op"] == "stamp":
+                same = "✓" if _exercises_roughly_match(p["sqlite_ex"], p["notion_ex"]) else "≈"
+                print(
+                    f"  STAMP  [{p['date']}] sqlite_id={p['sqlite_id']:3d}  "
+                    f"{p['sqlite_ex']:30s} {same} {p['notion_ex']:30s}  "
+                    f"page={p['notion_page_id'][:8]}…"
+                )
+            else:
+                print(
+                    f"  CREATE [{p['date']}] sqlite_id={p['sqlite_id']:3d}  "
+                    f"{p['sqlite_ex']:30s}  details={p['sqlite_details'][:40]!r}"
+                )
+        if len(plans) > 60:
+            print(f"  …and {len(plans) - 60} more")
     else:
+        # Live writes. STAMP ops use the raw httpx client; CREATE ops use
+        # the NotionClient so they go through the same code path as
+        # real-time bot writes (Schedule relation, dedup marker, etc.).
+        notion_client = NotionClient(cfg)
         async with httpx.AsyncClient(timeout=30.0) as client:
             headers = _headers(cfg.NOTION_API_KEY)
-            for i, p in enumerate(plans):
-                ok = await stamp_marker(
-                    client, headers, p["notion_page_id"],
-                    p["current_notes"], p["sqlite_id"],
-                )
-                if ok:
-                    stats["stamped"] += 1
+            done_count = 0
+            for p in plans:
+                if p["op"] == "stamp":
+                    ok = await stamp_marker(
+                        client, headers, p["notion_page_id"],
+                        p["current_notes"], p["sqlite_id"],
+                    )
+                    if ok:
+                        stats["stamped"] += 1
+                        done_count += 1
+                    else:
+                        stats["failed"] += 1
                 else:
-                    stats["failed"] += 1
-                if args.sample and stats["stamped"] >= args.sample:
+                    # CREATE: route through notion.log_lift so the new row
+                    # ends up shaped exactly like a live bot write — marker
+                    # in Notes, Schedule relation populated, etc.
+                    try:
+                        page_id = await notion_client.log_lift(
+                            date=p["date"],
+                            exercise=p["sqlite_ex"] or "lift",
+                            notes=p["sqlite_raw"] or p["sqlite_details"] or "",
+                            lift_id=p["sqlite_id"],
+                        )
+                        if page_id:
+                            stats["created"] += 1
+                            done_count += 1
+                        else:
+                            stats["failed"] += 1
+                    except Exception as e:
+                        logger.warning(
+                            "CREATE failed for sqlite_id=%d: %s",
+                            p["sqlite_id"], e,
+                        )
+                        stats["failed"] += 1
+                if args.sample and done_count >= args.sample:
                     break
                 await asyncio.sleep(NOTION_RATE_LIMIT_SLEEP_S)
 
@@ -340,9 +407,19 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dry-run", action="store_true", help="plan & print, no writes")
     p.add_argument("--sample", type=int, default=0,
-                   help="stop after stamping N markers (live only)")
+                   help="stop after N successful writes (live only)")
     p.add_argument("--since", type=str, default=None,
                    help="only process SQLite lifts on or after YYYY-MM-DD")
+    p.add_argument(
+        "--create-missing", action="store_true",
+        help=(
+            "For every SQLite lift without a [liftrow:N] marker in Notion, "
+            "CREATE a fresh per-lift Notion Lifts row (don't try to pair "
+            "with existing unmarked rows). Use this when the unmarked "
+            "Notion rows are summary-style entries that shouldn't be "
+            "repurposed as a single-set's parent."
+        ),
+    )
     args = p.parse_args()
     sys.exit(asyncio.run(run(args)))
 
