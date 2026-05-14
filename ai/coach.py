@@ -1861,9 +1861,12 @@ class Coach:
             # not sets, write a single row so the lift still gets a
             # structured representation.
             n_sets = lift.get("sets") or 1
+            # Collect per-set SQLite ids so we can mirror them to Notion's
+            # Lift Sets DB below with proper [liftsetrow:<id>] markers.
+            chat_set_records: list[dict] = []
             try:
                 for s in range(1, n_sets + 1):
-                    await self.db.log_lift_set(
+                    set_db_id = await self.db.log_lift_set(
                         lift_id=lift_id,
                         date=datetime.now().strftime("%Y-%m-%d"),
                         exercise=lift["exercise"],
@@ -1872,19 +1875,30 @@ class Coach:
                         weight_lb=lift.get("weight_lb"),
                         source="chat",
                     )
+                    chat_set_records.append({
+                        "set_db_id": set_db_id,
+                        "set_number": s,
+                        "reps": lift.get("reps"),
+                        "weight_lb": lift.get("weight_lb"),
+                    })
             except Exception as e:
                 logger.warning(
                     "lift_sets expansion failed for %s (sets=%s): %s — "
                     "lifts row still committed, backfill can retry later.",
                     lift.get("exercise"), n_sets, e,
                 )
+            parent_lift_notion_id: str | None = None
             try:
                 # Writes to the Lifts DB. The parser now returns optional
                 # structured `sets`, `reps`, `weight_lb`, `workout` fields
                 # when Haiku can extract them — when it can't, those cells
                 # stay blank and the raw message in Notes preserves the
                 # original phrasing so nothing is lost.
-                ok = await self.notion.log_lift(
+                #
+                # log_lift returns the page id on success (used below to wire
+                # up the Parent Lift relation on the per-set rows), None on
+                # failure. Falsy check still works because None is falsy.
+                parent_lift_notion_id = await self.notion.log_lift(
                     date=datetime.now().strftime("%Y-%m-%d"),
                     exercise=lift["exercise"],
                     workout=lift.get("workout"),
@@ -1894,9 +1908,9 @@ class Coach:
                     notes=message,
                     lift_id=lift_id,
                 )
-                if not ok:
+                if not parent_lift_notion_id:
                     logger.warning(
-                        "Notion lift write returned False for %r — the row is "
+                        "Notion lift write returned None for %r — the row is "
                         "in SQLite but did NOT land in Notion. The nightly "
                         "reconciliation pass will retry it.",
                         message[:80],
@@ -1909,6 +1923,32 @@ class Coach:
                     type(e).__name__,
                     e,
                 )
+
+            # Mirror each set to the Notion Lift Sets DB, linking it back to
+            # the parent Lift via the relation. Best-effort: if the Lift Sets
+            # DB isn't configured, log_lift_set no-ops. If the parent write
+            # failed, parent_lift_notion_id is None and the child rows skip
+            # the relation but still get written (backfill / reconciliation
+            # can re-link them later by [liftrow:N] / [liftsetrow:M] markers).
+            if self.notion.is_configured_lift_sets() and chat_set_records:
+                for rec in chat_set_records:
+                    try:
+                        await self.notion.log_lift_set(
+                            date=datetime.now().strftime("%Y-%m-%d"),
+                            exercise=lift["exercise"],
+                            set_number=rec["set_number"],
+                            reps=rec["reps"],
+                            weight_lb=rec["weight_lb"],
+                            source="chat",
+                            parent_lift_page_id=parent_lift_notion_id,
+                            lift_set_id=rec["set_db_id"],
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Notion lift_set write raised %s for set %d: %s — "
+                            "SQLite row committed, Notion backfill can retry.",
+                            type(e).__name__, rec["set_number"], e,
+                        )
 
         # Recovery session logging runs independently — a single message can
         # describe both a lift AND a post-lift sauna.
@@ -2453,8 +2493,9 @@ Rules:
         # one place we KNOW the set number deterministically (set_idx+1 of
         # total_sets), so source='liftstart' rows are the highest-quality
         # historical data we have.
+        liftstart_set_db_id: int | None = None
         try:
-            await self.db.log_lift_set(
+            liftstart_set_db_id = await self.db.log_lift_set(
                 lift_id=lift_id,
                 date=datetime.now().strftime("%Y-%m-%d"),
                 exercise=ex_name,
@@ -2472,8 +2513,9 @@ Rules:
         # Mirror to Notion if wired (best-effort; never blocks). Failure is
         # logged at WARNING so we hear about it — the reconciliation pass
         # picks up anything we miss here on its next run.
+        parent_lift_notion_id: str | None = None
         try:
-            ok = await self.notion.log_lift(
+            parent_lift_notion_id = await self.notion.log_lift(
                 date=datetime.now().strftime("%Y-%m-%d"),
                 exercise=ex_name,
                 workout=session.get("workout_label"),
@@ -2483,9 +2525,9 @@ Rules:
                 notes=f"[liftstart] set {set_idx + 1}/{total_sets} · target {ex.get('reps')}",
                 lift_id=lift_id,
             )
-            if not ok:
+            if not parent_lift_notion_id:
                 logger.warning(
-                    "Notion lift write returned False for %s set %d/%d — "
+                    "Notion lift write returned None for %s set %d/%d — "
                     "row in SQLite but not Notion; reconciliation will retry.",
                     ex_name, set_idx + 1, total_sets,
                 )
@@ -2495,6 +2537,30 @@ Rules:
                 "row in SQLite but not Notion; reconciliation will retry.",
                 type(e).__name__, ex_name, set_idx + 1, total_sets, e,
             )
+
+        # Mirror the per-set row to Notion's Lift Sets DB (best-effort).
+        # No-op if NOTION_LIFT_SETS_DATABASE_ID isn't configured. The
+        # parent_lift_page_id wires up the Parent Lift relation; if the
+        # parent write failed above, the child row still goes in without
+        # the relation and reconciliation can re-link later.
+        if self.notion.is_configured_lift_sets():
+            try:
+                await self.notion.log_lift_set(
+                    date=datetime.now().strftime("%Y-%m-%d"),
+                    exercise=ex_name,
+                    set_number=set_idx + 1,
+                    reps=reps,
+                    weight_lb=weight,
+                    source="liftstart",
+                    parent_lift_page_id=parent_lift_notion_id,
+                    lift_set_id=liftstart_set_db_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Notion lift_set write raised %s for %s set %d/%d: %s — "
+                    "SQLite row committed, Notion backfill can retry.",
+                    type(e).__name__, ex_name, set_idx + 1, total_sets, e,
+                )
 
         history.append({
             "exercise": ex_name,

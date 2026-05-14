@@ -238,6 +238,7 @@ class NotionClient:
         self.api_key = config.NOTION_API_KEY
         self.schedule_db_id = getattr(config, "NOTION_SCHEDULE_DATABASE_ID", "")
         self.lifts_db_id = getattr(config, "NOTION_LIFTS_DATABASE_ID", "")
+        self.lift_sets_db_id = getattr(config, "NOTION_LIFT_SETS_DATABASE_ID", "")
         self.runs_db_id = getattr(config, "NOTION_RUNS_DATABASE_ID", "")
         self.daily_db_id = getattr(config, "NOTION_DAILY_DATABASE_ID", "")
 
@@ -262,6 +263,9 @@ class NotionClient:
     def is_configured_lifts(self) -> bool:
         return self._has_api_key() and not _placeholder(self.lifts_db_id)
 
+    def is_configured_lift_sets(self) -> bool:
+        return self._has_api_key() and not _placeholder(self.lift_sets_db_id)
+
     def is_configured_runs(self) -> bool:
         return self._has_api_key() and not _placeholder(self.runs_db_id)
 
@@ -274,6 +278,7 @@ class NotionClient:
             [
                 self.is_configured_schedule(),
                 self.is_configured_lifts(),
+                self.is_configured_lift_sets(),
                 self.is_configured_runs(),
                 self.is_configured_daily(),
             ]
@@ -490,8 +495,15 @@ class NotionClient:
         rpe: float | None = None,
         notes: str | None = None,
         lift_id: int | None = None,
-    ) -> bool:
-        """Write one Lifts row. Returns True on success, False on failure.
+    ) -> str | None:
+        """Write one Lifts row. Returns the new Notion page id on success,
+        None on failure.
+
+        The return type changed from bool → Optional[str] when Lift Sets
+        were added — callers that wire up the Parent Lift relation on
+        child Lift Sets rows need the page id. Truthy-check sites
+        (`if not ok`, `if page:`) keep working unchanged because Python
+        falsy semantics treat `None` and `""` the same as `False`.
 
         All numeric fields are optional — when the chat-log parser can't
         extract structured sets/reps/weight, pass `notes=<raw message>` so
@@ -508,7 +520,7 @@ class NotionClient:
         """
         if not self.is_configured_lifts():
             logger.debug("Notion Lifts DB not configured — skipping.")
-            return False
+            return None
 
         # Auto-create / fetch the Schedule row for this date so we can wire
         # the Relation. If Schedule isn't configured, skip the relation and
@@ -540,8 +552,83 @@ class NotionClient:
         page = await self._create_page(self.lifts_db_id, props)
         if page:
             logger.info(f"Notion Lift row created: {exercise} ({date}).")
-            return True
-        return False
+            return page.get("id")
+        return None
+
+    # ── Lift Sets DB writes ─────────────────────────────────────────────────
+
+    async def log_lift_set(
+        self,
+        *,
+        date: str,
+        exercise: str,
+        set_number: int,
+        reps: int | None = None,
+        weight_lb: float | None = None,
+        equipment: str | None = None,
+        to_failure: bool = False,
+        rpe: float | None = None,
+        notes: str | None = None,
+        source: str = "chat",
+        parent_lift_page_id: str | None = None,
+        lift_set_id: int | None = None,
+    ) -> str | None:
+        """Write one Lift Sets row. Returns the new Notion page id on
+        success, None on failure (or when the DB isn't configured).
+
+        Each row represents ONE set of one exercise. The Parent Lift
+        relation links it back to the workout-summary row in the Lifts DB
+        — set this from the page_id returned by log_lift().
+
+        `lift_set_id` is the SQLite lift_sets.id of the corresponding row.
+        When provided, we embed `[liftsetrow:<id>]` in Notes for the same
+        dedup-marker pattern as log_lift — backfill / reconciliation can
+        scan for this to avoid double-writing.
+
+        Equipment is select-validated against a small whitelist; values
+        outside the list are silently dropped (better than crashing on a
+        new equipment type the user hasn't added to the Notion column).
+        """
+        if not self.is_configured_lift_sets():
+            logger.debug("Notion Lift Sets DB not configured — skipping.")
+            return None
+
+        if lift_set_id is not None:
+            marker = f"[liftsetrow:{lift_set_id}]"
+            notes = f"{marker} {notes}" if notes else marker
+
+        props: dict = {}
+        title = f"{exercise} · Set {set_number} · {date}"
+        _set_title(props, "Name", title)
+        _set_date(props, "Date", date)
+        _set_rich_text(props, "Exercise", exercise)
+        _set_number(props, "Set Number", set_number)
+        _set_number(props, "Reps", reps)
+        _set_number(props, "Weight (lb)", weight_lb)
+        _set_select(
+            props, "Equipment", equipment,
+            {"Barbell", "Dumbbell", "Machine", "Cable", "Bodyweight", "Trap bar"},
+            fallback=None,
+        )
+        # To Failure is a Checkbox in Notion — set directly, no helper needed.
+        props["To Failure"] = {"checkbox": bool(to_failure)}
+        _set_number(props, "RPE", rpe)
+        _set_rich_text(props, "Notes", notes)
+        _set_select(
+            props, "Source", source,
+            {"liftstart", "chat", "backfill"},
+            fallback="chat",
+        )
+        if parent_lift_page_id:
+            props["Parent Lift"] = {"relation": [{"id": parent_lift_page_id}]}
+
+        page = await self._create_page(self.lift_sets_db_id, props)
+        if page:
+            logger.info(
+                f"Notion Lift Set row created: {exercise} set {set_number} ({date})."
+            )
+            return page.get("id")
+        return None
 
     # ── Runs DB writes ──────────────────────────────────────────────────────
 
@@ -645,11 +732,13 @@ class NotionClient:
             lift_notes = "Auto-logged from Strava WeightTraining — set/rep detail not captured by Strava."
             if marker:
                 lift_notes = f"{marker} {lift_notes}"
-            return await self.log_lift(
+            # log_lift returns the page_id on success / None on failure;
+            # this function's declared return is bool, so coerce.
+            return bool(await self.log_lift(
                 date=(activity.get("start_date_local") or "")[:10],
                 exercise=activity.get("name") or "WeightTraining",
                 notes=lift_notes,
-            )
+            ))
 
         distance_mi = _meters_to_miles(activity.get("distance"))
         duration_min = _seconds_to_minutes(activity.get("moving_time"))

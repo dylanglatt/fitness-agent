@@ -44,11 +44,17 @@ class Config:
     CHAT_MODEL: str = os.getenv("CHAT_MODEL", "claude-haiku-4-5-20251001")
     COACH_CHEAP_MODE: bool = os.getenv("COACH_CHEAP_MODE", "1") not in ("0", "false", "False", "")
 
-    # Notion — four-database model (per user's spreadsheet mock):
+    # Notion — five-database model (per user's spreadsheet mock):
     #
     #   SCHEDULE   — day-level index (Training Group, Workout, date). One row
-    #                per day; relates to the other three DBs.
-    #   LIFTS      — one row per exercise per day (Sets, Reps, Weight lb, RPE).
+    #                per day; relates to the other DBs.
+    #   LIFTS      — one row per exercise per workout (workout-summary level).
+    #                Sets, Reps, Weight lb, RPE columns describe the
+    #                prescription / aggregate; granular set data lives in
+    #                LIFT_SETS (linked by a Parent Lift relation).
+    #   LIFT_SETS  — one row per SET performed. Linked back to the parent
+    #                Lifts row via the "Parent Lift" relation. Backs the
+    #                strength-progression views; mirrors SQLite lift_sets.
     #   RUNS       — one row per cardio activity (Distance mi, Pace, Zone %).
     #                Holds rides/hikes/swims/walks too, tagged by Type.
     #   DAILY LOG  — one row per day with WHOOP physiology + morning brief text.
@@ -58,6 +64,7 @@ class Config:
     NOTION_API_KEY: str = os.getenv("NOTION_API_KEY", "")
     NOTION_SCHEDULE_DATABASE_ID: str = os.getenv("NOTION_SCHEDULE_DATABASE_ID", "")
     NOTION_LIFTS_DATABASE_ID: str = os.getenv("NOTION_LIFTS_DATABASE_ID", "")
+    NOTION_LIFT_SETS_DATABASE_ID: str = os.getenv("NOTION_LIFT_SETS_DATABASE_ID", "")
     NOTION_RUNS_DATABASE_ID: str = os.getenv("NOTION_RUNS_DATABASE_ID", "")
     NOTION_DAILY_DATABASE_ID: str = os.getenv("NOTION_DAILY_DATABASE_ID", "")
 
