@@ -630,6 +630,7 @@ class Coach:
         plan: Optional[dict],
         acts: list[dict],
         lifts: list[dict],
+        overrides: Optional[dict[str, dict]] = None,
     ) -> list[str]:
         """Reconcile prescribed plan vs actual completed sessions.
 
@@ -640,12 +641,19 @@ class Coach:
 
         Callers should pass at least 14 days of activities + lifts so the
         last-week summary has data to work with.
+
+        `overrides` is an optional {date_str: override_dict} map for daily
+        plan overrides. When a date is present in overrides, it takes
+        precedence over the recurring weekly_template — that override IS
+        the prescription for adherence purposes. Skipping today after
+        /swap rest is a genuine REST day, not a missed lift.
         """
         if not plan:
             return []
         template = plan.get("weekly_template") or {}
         if not template:
             return []
+        overrides = overrides or {}
 
         today = datetime.now().date()
         # Monday-anchored week boundaries. weekday(): Mon=0 ... Sun=6.
@@ -731,6 +739,13 @@ class Coach:
                 return "OTHER", detail
             return "REST", detail
 
+        def _session_for(date_obj) -> Optional[dict]:
+            """Override wins over weekly template for any specific date."""
+            date_str = date_obj.isoformat()
+            if date_str in overrides:
+                return overrides[date_str]
+            return template.get(date_obj.strftime("%A").lower())
+
         def _counts_for_range(start_date, end_date) -> dict:
             """Tally LIFT/RUN/REST/OTHER actuals from start..end inclusive."""
             tally = {"LIFT": 0, "RUN": 0, "REST": 0, "OTHER": 0, "CROSS": 0}
@@ -753,9 +768,9 @@ class Coach:
 
         d = this_monday
         while d <= today:
-            day_name = d.strftime("%A").lower()
-            prescribed = _classify_prescribed(template.get(day_name))
+            prescribed = _classify_prescribed(_session_for(d))
             actual, detail = _classify_actual(by_date.get(d.isoformat()))
+            is_override_day = d.isoformat() in overrides
 
             if actual == "LIFT+RUN":
                 counts_this_week["LIFT"] += 1
@@ -780,14 +795,29 @@ class Coach:
             else:
                 marker = "DEVIATION"
             date_label = d.strftime("%a %b %d")
+            prescribed_label = (
+                f"{prescribed}*" if is_override_day else prescribed
+            )
             row = (
-                f"{date_label}: prescribed {prescribed:<5} | "
+                f"{date_label}: prescribed {prescribed_label:<6} | "
                 f"actual {actual:<8} | {marker}"
             )
             if detail:
                 row += f" ({detail})"
             rows.append(row)
             d += timedelta(days=1)
+
+        # `*` next to prescribed means "this came from a daily override,
+        # not the weekly template" — call it out so the model doesn't
+        # second-guess why prescribed differs from the recurring plan.
+        if any(d.isoformat() in overrides for d in [
+            this_monday + timedelta(days=i)
+            for i in range((today - this_monday).days + 1)
+        ]):
+            rows.append(
+                "(* = daily override applied — that's the prescription for "
+                "that date, not the weekly template default.)"
+            )
 
         # ── Weekly targets from the template ───────────────────────────────
         target_lifts = sum(
@@ -984,8 +1014,15 @@ class Coach:
             logger.debug(f"Tiered context: active plan lookup failed: {e}")
             plan = None
         if plan:
-            day_name = today.strftime("%A").lower()
-            session = (plan.get("weekly_template") or {}).get(day_name)
+            # Use the override-aware lookup so a /swap today on the morning
+            # of replaces the template-default session in chat context too.
+            try:
+                session = await self.db.get_effective_session_for_date(str(today))
+            except Exception as e:
+                logger.debug(f"Tiered context: effective-session lookup failed: {e}")
+                session = (plan.get("weekly_template") or {}).get(
+                    today.strftime("%A").lower()
+                )
             lines.append("")
             lines.append(f"ACTIVE PLAN: {plan.get('name')}")
             if plan.get("goal"):
@@ -995,8 +1032,11 @@ class Coach:
                 focus = session.get("focus", "")
                 presc = session.get("prescription", "")
                 notes = session.get("notes", "")
+                override_tag = (
+                    " (override)" if session.get("is_override") else ""
+                )
                 lines.append(
-                    f"  Today ({today.strftime('%A')}): {stype}"
+                    f"  Today ({today.strftime('%A')}): {stype}{override_tag}"
                     + (f" — {focus}" if focus else "")
                 )
                 if presc:
@@ -1033,8 +1073,16 @@ class Coach:
             except Exception as e:
                 logger.debug(f"Tiered context: 14-day Strava fetch failed: {e}")
                 acts_14d = []
+            # Pull any daily overrides for the same 14-day window. Overrides
+            # take precedence over the weekly template in adherence calc.
+            try:
+                override_rows = await self.db.get_overrides_in_range(d14, str(today))
+            except Exception as e:
+                logger.debug(f"Tiered context: overrides fetch failed: {e}")
+                override_rows = []
+            overrides_by_date = {r["date"]: r for r in override_rows}
             adherence_lines = self._compute_plan_adherence(
-                plan, acts_14d, recent_lifts
+                plan, acts_14d, recent_lifts, overrides=overrides_by_date,
             )
             if adherence_lines:
                 lines.append("")
@@ -1151,7 +1199,14 @@ class Coach:
             plan = None
         if plan:
             day_name = today.strftime("%A").lower()
-            session = (plan.get("weekly_template") or {}).get(day_name)
+            # Use the override-aware lookup so the morning brief shows the
+            # right prescription on a /swap day. is_override on the result
+            # tells us whether to label it as such for clarity.
+            try:
+                session = await self.db.get_effective_session_for_date(str(today))
+            except Exception as e:
+                logger.debug(f"Brief: effective-session lookup failed: {e}")
+                session = (plan.get("weekly_template") or {}).get(day_name)
             lines.append("")
             lines.append(f"ACTIVE PLAN: {plan.get('name')}")
             lines.append(f"  Goal: {plan.get('goal')}")
@@ -1160,9 +1215,19 @@ class Coach:
                 focus = session.get("focus", "")
                 presc = session.get("prescription", "")
                 notes = session.get("notes", "")
-                lines.append(
-                    f"  Today ({day_name}): {stype.upper()} — {focus}"
-                )
+                if session.get("is_override"):
+                    # Surface the override and the template default it
+                    # replaced so the brief reads honestly.
+                    base = (plan.get("weekly_template") or {}).get(day_name) or {}
+                    base_stype = (base.get("session_type") or "rest").upper()
+                    lines.append(
+                        f"  Today ({day_name}): {stype.upper()} (override; "
+                        f"weekly template says {base_stype}) — {focus}"
+                    )
+                else:
+                    lines.append(
+                        f"  Today ({day_name}): {stype.upper()} — {focus}"
+                    )
                 if presc:
                     lines.append(f"  Prescription: {presc}")
                 if notes:
@@ -1214,8 +1279,17 @@ class Coach:
         except Exception as e:
             logger.debug(f"14-day Strava fetch for adherence failed: {e}")
             acts_14d_for_adherence = []
+        try:
+            override_rows = await self.db.get_overrides_in_range(
+                str(d14), str(today),
+            )
+        except Exception as e:
+            logger.debug(f"Overrides fetch for adherence failed: {e}")
+            override_rows = []
+        overrides_by_date = {r["date"]: r for r in override_rows}
         adherence_lines = self._compute_plan_adherence(
-            plan, acts_14d_for_adherence, lifts_14d
+            plan, acts_14d_for_adherence, lifts_14d,
+            overrides=overrides_by_date,
         )
         if adherence_lines:
             lines.append("")
@@ -1773,15 +1847,18 @@ class Coach:
 
         # Active plan session for today, if any — lets the coach read the run
         # against what was prescribed instead of judging it in a vacuum.
+        # Uses the override-aware lookup so debrief honors /swap.
         try:
             plan = await self.db.get_active_plan()
             if plan:
-                day_name = datetime.now().strftime("%A").lower()
-                session = (plan.get("weekly_template") or {}).get(day_name)
+                today_iso2 = datetime.now().date().isoformat()
+                session = await self.db.get_effective_session_for_date(today_iso2)
                 if session:
+                    override_tag = " (override)" if session.get("is_override") else ""
                     data_lines.append("")
                     data_lines.append(
-                        f"Today's planned session: {session.get('session_type', '?').upper()} "
+                        f"Today's planned session: "
+                        f"{session.get('session_type', '?').upper()}{override_tag} "
                         f"— {session.get('focus', '')}"
                     )
                     if session.get("prescription"):
@@ -2322,7 +2399,10 @@ Rules:
         if not plan:
             return "No active training plan. Set one up before starting a session."
         today_name = datetime.now().strftime("%A").lower()
-        sess_def = (plan.get("weekly_template") or {}).get(today_name)
+        today_iso = datetime.now().date().isoformat()
+        # Override-aware lookup — `/swap pull` then `/liftstart` should
+        # start a Pull session even if today is a template-default run day.
+        sess_def = await self.db.get_effective_session_for_date(today_iso)
         if not sess_def:
             return f"No session defined for {today_name}. `/plan week` to see what's scheduled."
         stype = (sess_def.get("session_type") or "").lower()

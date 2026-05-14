@@ -155,6 +155,29 @@ class Database:
                     activated_at TEXT DEFAULT (datetime('now'))
                 )
             """)
+            # daily_plan_overrides: one-off exceptions to the recurring
+            # weekly_template. Keyed by date (one override per day, latest
+            # wins via UPSERT). When the bot resolves "what's today's plan",
+            # it checks this table first and falls back to the weekly
+            # template only if no override exists. The active plan stays
+            # unchanged — overrides don't bleed into next week.
+            #
+            # session_type uses the same vocabulary as the weekly template
+            # ('lift', 'run', 'rest', 'cross_train') but the slash command
+            # accepts the user-facing names too ('Push', 'Pull', 'Legs',
+            # 'Run', 'Rest'). The command-side normalization handles the
+            # translation before insert.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS daily_plan_overrides (
+                    date TEXT PRIMARY KEY,
+                    session_type TEXT NOT NULL,
+                    focus TEXT DEFAULT '',
+                    prescription TEXT DEFAULT '',
+                    notes TEXT DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
             # recovery_sessions: sauna, steam room, cold plunge, ice bath,
             # contrast, cryo. Duration in minutes, temp in Fahrenheit (Dylan's
             # unit preference). session_type is free-form enough to handle
@@ -1234,12 +1257,129 @@ class Database:
 
     async def get_session_for_day(self, day_of_week: str) -> Optional[dict]:
         """Return the session for a given weekday ('monday'..'sunday')
-        from the active plan, or None if no plan / no session."""
+        from the active plan, or None if no plan / no session.
+
+        This reads ONLY the recurring weekly_template — it does not honor
+        daily overrides. For day-specific decisions (what's today's plan,
+        plan-adherence reconciliation) use get_effective_session_for_date.
+        """
         plan = await self.get_active_plan()
         if not plan:
             return None
         tpl = plan.get("weekly_template") or {}
         return tpl.get(day_of_week.lower())
+
+    # ── Daily plan overrides ────────────────────────────────────────────────
+    #
+    # Override the recurring weekly_template for a specific date. UPSERT
+    # semantics — calling set_daily_override twice for the same date just
+    # replaces. get_effective_session_for_date is the single source of
+    # truth for "what's the plan for date X" across the bot.
+
+    async def set_daily_override(
+        self,
+        date: str,
+        session_type: str,
+        focus: str = "",
+        prescription: str = "",
+        notes: str = "",
+        source: str = "manual",
+    ) -> None:
+        """UPSERT a daily plan override. Returns nothing — caller should
+        call get_daily_override afterwards if it needs the resolved row."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO daily_plan_overrides "
+                "(date, session_type, focus, prescription, notes, source) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(date) DO UPDATE SET "
+                "  session_type = excluded.session_type, "
+                "  focus        = excluded.focus, "
+                "  prescription = excluded.prescription, "
+                "  notes        = excluded.notes, "
+                "  source       = excluded.source, "
+                "  created_at   = datetime('now')",
+                (date, session_type, focus, prescription, notes, source),
+            )
+            await db.commit()
+        logger.info(f"Daily override set: {date} → {session_type}")
+
+    async def clear_daily_override(self, date: str) -> bool:
+        """Remove the override for a date. Returns True if a row was
+        deleted, False if no override existed."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "DELETE FROM daily_plan_overrides WHERE date = ?",
+                (date,),
+            )
+            await db.commit()
+            removed = cursor.rowcount > 0
+        if removed:
+            logger.info(f"Daily override cleared: {date}")
+        return removed
+
+    async def get_daily_override(self, date: str) -> Optional[dict]:
+        """Return the override row for a date, or None."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT date, session_type, focus, prescription, notes, "
+                "       source, created_at "
+                "FROM daily_plan_overrides WHERE date = ?",
+                (date,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_overrides_in_range(
+        self, start_date: str, end_date: str,
+    ) -> list[dict]:
+        """Return all overrides whose date is within [start, end] inclusive.
+        Used by plan-adherence reconciliation to compare prescribed vs
+        actual over a window."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT date, session_type, focus, prescription, notes, "
+                "       source, created_at "
+                "FROM daily_plan_overrides "
+                "WHERE date BETWEEN ? AND ? ORDER BY date ASC",
+                (start_date, end_date),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_effective_session_for_date(
+        self, date: str,
+    ) -> Optional[dict]:
+        """The single source of truth for 'what's the plan on date X'.
+
+        Returns the daily override if one exists for `date`; otherwise
+        returns the recurring weekly_template entry for that date's
+        weekday. Adds an 'is_override' bool and the source label so
+        downstream callers (morning brief, plan adherence, etc.) can
+        surface the override to the user without re-fetching.
+
+        Returns None if no plan is active and no override exists.
+        """
+        override = await self.get_daily_override(date)
+        if override:
+            override["is_override"] = True
+            return override
+        # Fall back to the recurring weekly_template.
+        try:
+            dt = datetime.fromisoformat(date)
+        except ValueError:
+            logger.warning(f"get_effective_session_for_date: bad date {date!r}")
+            return None
+        weekday = dt.strftime("%A").lower()  # 'monday'..'sunday'
+        session = await self.get_session_for_day(weekday)
+        if session is None:
+            return None
+        # Return a shallow copy so callers can safely mutate.
+        out = dict(session)
+        out["is_override"] = False
+        return out
 
     async def _seed_default_plan_if_empty(self):
         """Insert a sensible starter plan if the table has no rows."""
