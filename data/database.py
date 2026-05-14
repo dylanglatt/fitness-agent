@@ -278,6 +278,53 @@ class Database:
                     history_json TEXT DEFAULT '[]'
                 )
             """)
+            # lift_sets: one row per SET performed. The lifts table stores a
+            # human-readable details string per entry; lift_sets stores the
+            # structured numbers so we can query "top set for bench press over
+            # the last 8 weeks" as real SQL instead of text-parsing details.
+            #
+            # weight_lb is the number that would be stamped on the implement
+            # (60 for a single 60-lb dumbbell, 135 for a barbell with one 45
+            # per side + the 45-lb bar). equipment + a future implement_count
+            # let us derive total system load when we care to.
+            #
+            # source: 'liftstart' (per-set row from the /liftstart state
+            # machine — deterministic), 'chat' (parsed at chat-path log time
+            # from a free-form message — Haiku), 'backfill' (one-off
+            # historical reparse). Useful for debugging weird rows.
+            #
+            # to_failure and rpe are nullable because most legacy data has
+            # neither; new entries during /liftstart can populate them.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS lift_sets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lift_id INTEGER NOT NULL,
+                    date TEXT NOT NULL,
+                    exercise TEXT NOT NULL,
+                    set_number INTEGER NOT NULL,
+                    reps INTEGER,
+                    weight_lb REAL,
+                    equipment TEXT,
+                    to_failure INTEGER DEFAULT 0,
+                    rpe REAL,
+                    notes TEXT DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'chat',
+                    created_at TEXT DEFAULT (datetime('now')),
+                    FOREIGN KEY (lift_id) REFERENCES lifts(id)
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lift_sets_exercise_date "
+                "ON lift_sets(exercise, date)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lift_sets_lift_id "
+                "ON lift_sets(lift_id)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_lift_sets_date "
+                "ON lift_sets(date)"
+            )
             await db.commit()
         # Seed a default balanced-concurrent plan if no plan exists yet.
         await self._seed_default_plan_if_empty()
@@ -322,6 +369,91 @@ class Database:
                 "SELECT date, exercise, details FROM lifts WHERE LOWER(exercise) LIKE ? "
                 "ORDER BY date DESC LIMIT ?",
                 (f"%{exercise.lower()}%", limit),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    # ── lift_sets (one row per set; populated alongside lifts) ──────────────
+
+    async def log_lift_set(
+        self,
+        lift_id: int,
+        date: str,
+        exercise: str,
+        set_number: int,
+        reps: Optional[int] = None,
+        weight_lb: Optional[float] = None,
+        equipment: Optional[str] = None,
+        to_failure: bool = False,
+        rpe: Optional[float] = None,
+        notes: str = "",
+        source: str = "chat",
+    ) -> int:
+        """Insert one lift_sets row. Mirrors a single set of a lift entry.
+
+        source: 'liftstart' for state-machine-driven entries, 'chat' for
+        free-form messages parsed at log time, 'backfill' for the one-off
+        historical reparse.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "INSERT INTO lift_sets "
+                "(lift_id, date, exercise, set_number, reps, weight_lb, "
+                " equipment, to_failure, rpe, notes, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    lift_id, date, exercise, set_number, reps, weight_lb,
+                    equipment, 1 if to_failure else 0, rpe, notes, source,
+                ),
+            )
+            new_id = cursor.lastrowid
+            await db.commit()
+        return int(new_id)
+
+    async def lift_sets_exist_for(self, lift_id: int) -> bool:
+        """Cheap existence check for backfill idempotency."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT 1 FROM lift_sets WHERE lift_id = ? LIMIT 1",
+                (lift_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return row is not None
+
+    async def get_lift_sets_for_exercise(
+        self,
+        exercise: str,
+        weeks: int = 12,
+    ) -> list[dict]:
+        """Return per-set rows for an exercise (LIKE match) over the past N
+        weeks, ordered chronologically. Backs query_lift_progression.
+        """
+        since = (datetime.now() - timedelta(weeks=weeks)).strftime("%Y-%m-%d")
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, lift_id, date, exercise, set_number, reps, "
+                "       weight_lb, equipment, to_failure, rpe, notes, source "
+                "FROM lift_sets "
+                "WHERE LOWER(exercise) LIKE ? AND date >= ? "
+                "ORDER BY date ASC, set_number ASC",
+                (f"%{exercise.lower()}%", since),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def iter_lifts_for_backfill(self) -> list[dict]:
+        """All lifts rows, oldest first, for the one-off backfill pass.
+
+        Returns id, date, exercise, details, raw_message. The backfill caller
+        checks lift_sets_exist_for(id) before reparsing so a re-run is a
+        no-op on rows already covered.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, date, exercise, details, raw_message "
+                "FROM lifts ORDER BY date ASC, id ASC"
             ) as cursor:
                 rows = await cursor.fetchall()
         return [dict(row) for row in rows]

@@ -15,7 +15,7 @@ Architecture notes (why this file is shaped the way it is):
    it asks for it via tools.
 
 3. Claude has tools for on-demand lookups.
-   query_daily_metrics / query_activities / query_lifts / get_whoop_aggregates /
+   query_daily_metrics / query_activities / query_lifts / query_lift_progression / get_whoop_aggregates /
    get_strava_aggregates are wired into chat(). A trend question like "how was
    my HRV in February?" turns into Claude calling get_whoop_aggregates for that
    window, getting back ~100 tokens of numbers, and answering from them.
@@ -267,6 +267,35 @@ TOOLS = [
         },
     },
     {
+        "name": "query_lift_progression",
+        "description": (
+            "PREFER THIS over query_lifts for any progression / overload "
+            "question on a specific lift ('am I getting stronger on bench', "
+            "'OHP trend', 'bench top set over the last 8 weeks'). Reads from "
+            "the structured lift_sets table — one row per set with reps, "
+            "weight, RPE, failure flag — and returns a per-session summary: "
+            "top set (heaviest set × reps), estimated 1RM (Epley), total "
+            "volume (sum of weight × reps), and a simple progression "
+            "direction. Use weeks=8 for short-term trend, weeks=26 for "
+            "half-year. If lift_sets is empty for the exercise (e.g. older "
+            "than the backfill date), fall back to query_lifts."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "exercise": {
+                    "type": "string",
+                    "description": "Exercise name — matched with LIKE, partial is fine.",
+                },
+                "weeks": {
+                    "type": "integer",
+                    "description": "Lookback window in weeks (default 12).",
+                },
+            },
+            "required": ["exercise"],
+        },
+    },
+    {
         "name": "query_correlated_runs",
         "description": (
             "PREFER THIS for any running-performance trend question (pace over "
@@ -358,6 +387,11 @@ class Coach:
                     args["exercise"], args.get("limit", 20)
                 )
                 return json.dumps(rows, default=str)
+            if name == "query_lift_progression":
+                summary = await self._summarize_lift_progression(
+                    args["exercise"], int(args.get("weeks", 12)),
+                )
+                return json.dumps(summary, default=str)
             if name == "query_correlated_runs":
                 rows = await self.db.get_correlated_runs_in_range(
                     args["start_date"],
@@ -1377,8 +1411,11 @@ class Coach:
         lines.append(
             "NOTE: Full history is in SQLite. Use tools "
             "(query_daily_metrics, get_whoop_aggregates, query_activities, "
-            "get_strava_aggregates, query_lifts) to answer questions about "
-            "specific past periods — don't guess from memory."
+            "get_strava_aggregates, query_lifts, query_lift_progression) to "
+            "answer questions about specific past periods — don't guess from "
+            "memory. For strength-progression questions on a specific lift, "
+            "prefer query_lift_progression — it returns structured per-session "
+            "top sets and an est-1RM trend instead of raw text rows."
         )
         return "\n".join(lines)
 
@@ -1817,6 +1854,30 @@ class Coach:
                 details=lift["details"],
                 raw=message,
             )
+            # Expand the parsed lift into per-set rows. Haiku gives us
+            # uniform sets (e.g. 4x6 @ 205 → 4 rows, all 6 reps at 205);
+            # the backfill script handles richer non-uniform shapes when
+            # they show up in raw_message. If we know reps OR weight but
+            # not sets, write a single row so the lift still gets a
+            # structured representation.
+            n_sets = lift.get("sets") or 1
+            try:
+                for s in range(1, n_sets + 1):
+                    await self.db.log_lift_set(
+                        lift_id=lift_id,
+                        date=datetime.now().strftime("%Y-%m-%d"),
+                        exercise=lift["exercise"],
+                        set_number=s,
+                        reps=lift.get("reps"),
+                        weight_lb=lift.get("weight_lb"),
+                        source="chat",
+                    )
+            except Exception as e:
+                logger.warning(
+                    "lift_sets expansion failed for %s (sets=%s): %s — "
+                    "lifts row still committed, backfill can retry later.",
+                    lift.get("exercise"), n_sets, e,
+                )
             try:
                 # Writes to the Lifts DB. The parser now returns optional
                 # structured `sets`, `reps`, `weight_lb`, `workout` fields
@@ -2388,6 +2449,26 @@ Rules:
             details=details,
             raw=f"[liftstart] {message}",
         )
+        # Also write the structured per-set row. The liftstart path is the
+        # one place we KNOW the set number deterministically (set_idx+1 of
+        # total_sets), so source='liftstart' rows are the highest-quality
+        # historical data we have.
+        try:
+            await self.db.log_lift_set(
+                lift_id=lift_id,
+                date=datetime.now().strftime("%Y-%m-%d"),
+                exercise=ex_name,
+                set_number=set_idx + 1,
+                reps=reps,
+                weight_lb=weight,
+                source="liftstart",
+            )
+        except Exception as e:
+            logger.warning(
+                "lift_sets write failed for %s set %d/%d: %s — lifts row "
+                "still committed, query_lift_progression may miss this set.",
+                ex_name, set_idx + 1, total_sets, e,
+            )
         # Mirror to Notion if wired (best-effort; never blocks). Failure is
         # logged at WARNING so we hear about it — the reconciliation pass
         # picks up anything we miss here on its next run.
@@ -2471,6 +2552,109 @@ Rules:
             skip_str = f" ({skipped} skipped)" if skipped else ""
             lines.append(f"  • {ex_name}: {sets_done} sets{skip_str}{tail}")
         return "\n".join(lines)
+
+    async def _summarize_lift_progression(
+        self, exercise: str, weeks: int = 12,
+    ) -> dict:
+        """Aggregate per-set rows for an exercise into a per-session summary.
+
+        For each day on which `exercise` was trained, returns:
+          date, top_weight (heaviest weight that day), top_set (weight × reps
+          for the heaviest set), est_1rm_epley (top weight × (1 + top_reps/30),
+          rounded), total_volume (sum of weight × reps across all sets that
+          day), n_sets, any_to_failure.
+
+        Returns {"sessions": [...], "trend": "up"/"down"/"flat", "note": "..."}
+        suitable for the AI tool-use channel.
+        """
+        rows = await self.db.get_lift_sets_for_exercise(exercise, weeks=weeks)
+        if not rows:
+            return {
+                "exercise": exercise,
+                "weeks": weeks,
+                "sessions": [],
+                "trend": "no_data",
+                "note": (
+                    "No lift_sets rows for this exercise in the window. "
+                    "Could be: exercise name mismatch, or older than the "
+                    "lift_sets backfill. Try query_lifts as a fallback."
+                ),
+            }
+
+        by_date: dict[str, list[dict]] = {}
+        for r in rows:
+            by_date.setdefault(r["date"], []).append(r)
+
+        sessions: list[dict] = []
+        for date in sorted(by_date.keys()):
+            day_rows = by_date[date]
+            # Heaviest set by weight (tie-break: more reps); ignore None weights.
+            weighted = [r for r in day_rows if r.get("weight_lb") is not None]
+            if not weighted:
+                top_weight = None
+                top_reps = None
+                est_1rm = None
+            else:
+                top = max(
+                    weighted,
+                    key=lambda r: (r.get("weight_lb") or 0, r.get("reps") or 0),
+                )
+                top_weight = top.get("weight_lb")
+                top_reps = top.get("reps")
+                if top_weight is not None and top_reps:
+                    # Epley est. 1RM, rounded to 1 lb. Bias: overestimates a
+                    # bit at high reps; fine as a trend signal.
+                    est_1rm = round(top_weight * (1 + top_reps / 30))
+                else:
+                    est_1rm = None
+            total_volume = round(sum(
+                (r.get("weight_lb") or 0) * (r.get("reps") or 0)
+                for r in day_rows
+            ))
+            sessions.append({
+                "date": date,
+                "n_sets": len(day_rows),
+                "top_weight_lb": top_weight,
+                "top_reps": top_reps,
+                "top_set": (
+                    f"{top_weight:g} × {top_reps}"
+                    if top_weight is not None and top_reps else None
+                ),
+                "est_1rm_lb": est_1rm,
+                "total_volume_lb": total_volume,
+                "any_to_failure": any(r.get("to_failure") for r in day_rows),
+            })
+
+        # Trend: compare first-half mean est_1rm to second-half mean est_1rm.
+        rms = [s["est_1rm_lb"] for s in sessions if s["est_1rm_lb"]]
+        trend = "flat"
+        note = ""
+        if len(rms) >= 4:
+            mid = len(rms) // 2
+            first = sum(rms[:mid]) / mid
+            second = sum(rms[mid:]) / (len(rms) - mid)
+            delta = second - first
+            if delta >= 5:
+                trend = "up"
+                note = f"est-1RM up ~{round(delta)} lb (first half avg {round(first)} → second half {round(second)})."
+            elif delta <= -5:
+                trend = "down"
+                note = f"est-1RM down ~{round(-delta)} lb (first half avg {round(first)} → second half {round(second)})."
+            else:
+                note = f"est-1RM essentially flat (delta {round(delta):+} lb)."
+        elif rms:
+            note = "Not enough sessions in window for a trend call; showing per-session detail."
+        else:
+            note = "Sessions found but no weighted sets — bodyweight-only?"
+
+        return {
+            "exercise": exercise,
+            "weeks": weeks,
+            "n_sessions": len(sessions),
+            "sessions": sessions,
+            "trend": trend,
+            "note": note,
+        }
 
     async def active_session_context_block(self) -> str:
         """Render a context block describing the in-flight session, for
