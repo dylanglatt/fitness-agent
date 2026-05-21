@@ -322,6 +322,46 @@ TOOLS = [
             "required": ["start_date", "end_date"],
         },
     },
+    {
+        "name": "query_whoop_workouts",
+        "description": (
+            "List WHOOP per-session workouts (the /v2/activity/workout feed) "
+            "in a date range, optionally filtered by sport_name (case-"
+            "insensitive substring match — 'sauna' matches 'Sauna', 'ice' "
+            "matches 'Ice Bath', 'walk' matches 'Walking'). Use this for any "
+            "question about activity types that DON'T live in Strava — "
+            "Sauna, Ice Bath, Stretching, Meditation, Yoga, Weightlifting "
+            "logged via WHOOP, etc. Returns sport_name, start_utc, average_hr, "
+            "max_hr, strain, and zone times per session.\n\n"
+            "CRITICAL CAVEAT: WHOOP returns NULL for average_hr / max_hr / "
+            "strain / zones on PASSIVE or NON-SCORED sports — specifically "
+            "Sauna, Ice Bath, Stretching, Meditation, Air Compression, "
+            "Percussive Massage, Massage Therapy. The session ROW still "
+            "exists (so you can count frequency, see dates, see duration "
+            "from start_utc/end_utc), but per-session HR is genuinely not "
+            "available from WHOOP's API for these sports. If asked about "
+            "HR trends for one of these sports, do NOT claim the sessions "
+            "aren't tracked — they ARE. Instead: confirm the session "
+            "frequency from this tool, then fall back to query_daily_metrics "
+            "to compare resting HR on sauna-days vs non-sauna-days as an "
+            "indirect adaptation signal."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "start_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "end_date": {"type": "string", "description": "YYYY-MM-DD"},
+                "sport_name": {
+                    "type": "string",
+                    "description": (
+                        "Optional case-insensitive substring filter on "
+                        "sport_name (e.g. 'sauna', 'ice', 'walk', 'weight')."
+                    ),
+                },
+            },
+            "required": ["start_date", "end_date"],
+        },
+    },
 ]
 
 
@@ -399,6 +439,39 @@ class Coach:
                     args.get("sport_type", "Run"),
                 )
                 return json.dumps(rows, default=str)
+            if name == "query_whoop_workouts":
+                rows = await self.db.get_whoop_workouts_by_sport_in_range(
+                    args["start_date"],
+                    args["end_date"],
+                    args.get("sport_name"),
+                )
+                # Compute a duration_min per row from start_utc/end_utc so the
+                # model doesn't have to parse ISO strings to talk about session
+                # length. Also annotate the response with a note about null
+                # HR fields when ALL rows came back with null HR (typical for
+                # Sauna / Ice Bath / etc.) — saves the model from having to
+                # infer the API limitation from scratch every time.
+                def _dur(r):
+                    try:
+                        s = datetime.fromisoformat(r["start_utc"].replace("Z", "+00:00"))
+                        e = datetime.fromisoformat(r["end_utc"].replace("Z", "+00:00"))
+                        return round((e - s).total_seconds() / 60, 1)
+                    except Exception:
+                        return None
+                for r in rows:
+                    r["duration_min"] = _dur(r)
+                payload: dict = {"rows": rows, "count": len(rows)}
+                if rows and all(r.get("average_hr") is None for r in rows):
+                    payload["note"] = (
+                        "All rows returned have null average_hr / max_hr / "
+                        "strain. This is expected for passive sports (Sauna, "
+                        "Ice Bath, Stretching, Meditation) — WHOOP does not "
+                        "score these. Sessions ARE tracked (count, date, "
+                        "duration are valid). For HR adaptation signal on "
+                        "these sports, query daily resting HR from "
+                        "query_daily_metrics over the same window."
+                    )
+                return json.dumps(payload, default=str)
         except Exception as e:
             logger.error(f"Tool {name} failed: {e}")
             return json.dumps({"error": str(e)})
@@ -1485,11 +1558,18 @@ class Coach:
         lines.append(
             "NOTE: Full history is in SQLite. Use tools "
             "(query_daily_metrics, get_whoop_aggregates, query_activities, "
-            "get_strava_aggregates, query_lifts, query_lift_progression) to "
-            "answer questions about specific past periods — don't guess from "
-            "memory. For strength-progression questions on a specific lift, "
-            "prefer query_lift_progression — it returns structured per-session "
-            "top sets and an est-1RM trend instead of raw text rows."
+            "get_strava_aggregates, query_lifts, query_lift_progression, "
+            "query_whoop_workouts) to answer questions about specific past "
+            "periods — don't guess from memory. For strength-progression "
+            "questions on a specific lift, prefer query_lift_progression — "
+            "it returns structured per-session top sets and an est-1RM trend "
+            "instead of raw text rows. For questions about activity types "
+            "that don't live in Strava (Sauna, Ice Bath, Stretching, "
+            "Meditation, Walking, WHOOP-logged Weightlifting) use "
+            "query_whoop_workouts — and remember WHOOP returns null HR/"
+            "strain for passive sports, so report session counts/dates and "
+            "pivot to daily RHR trends for any 'HR change over time' question "
+            "on those sports."
         )
         return "\n".join(lines)
 

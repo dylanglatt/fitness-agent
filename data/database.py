@@ -810,6 +810,40 @@ class Database:
                 rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def get_whoop_workouts_by_sport_in_range(
+        self,
+        start_date: str,
+        end_date: str,
+        sport_name: Optional[str] = None,
+    ) -> list[dict]:
+        """WHOOP per-session workouts in [start_date, end_date], optionally
+        filtered by sport_name (case-insensitive substring match — 'sauna'
+        matches 'Sauna', 'ice' matches 'Ice Bath', etc.).
+
+        Returns the same columns as the other whoop_workouts queries:
+        sport_name, start_utc, end_utc, average_hr, max_hr, strain, zone*_ms.
+        NOTE: WHOOP returns NULL for average_hr / max_hr / strain / zones on
+        passive / non-scored sports (Sauna, Ice Bath, Stretching, Meditation,
+        etc.). The rows still exist — caller should not interpret null HR as
+        "no session"; it means "WHOOP didn't score this session".
+        """
+        sql = (
+            "SELECT workout_id, start_date, start_utc, end_utc, "
+            "sport_id, sport_name, strain, average_hr, max_hr, "
+            "zone0_ms, zone1_ms, zone2_ms, zone3_ms, zone4_ms, zone5_ms "
+            "FROM whoop_workouts WHERE start_date BETWEEN ? AND ?"
+        )
+        params: list = [start_date, end_date]
+        if sport_name:
+            sql += " AND LOWER(sport_name) LIKE ?"
+            params.append(f"%{sport_name.lower()}%")
+        sql += " ORDER BY start_utc DESC"
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(sql, params) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
     async def find_whoop_workout_for_strava_activity(
         self,
         activity: dict,
