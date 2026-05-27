@@ -3,6 +3,9 @@
 .env.local
 .env.*.local
 
+# ─── Eval result files (timestamped, accumulate per run) ─────────────────────
+evals/results/
+
 # ─── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
@@ -31,6 +34,12 @@ htmlcov/
 .ruff_cache/
 
 # ─── Local data / databases ──────────────────────────────────────────────────
+data/fitness_agent.db
+data/fitness_agent.db-journal
+data/fitness_agent.db-wal
+data/fitness_agent.db-shm
+# Legacy DB name (the project was previously called fitness-bot). Kept so
+# pre-rename local data stays gitignored if anyone still has it on disk.
 data/fitness_bot.db
 data/fitness_bot.db-journal
 data/fitness_bot.db-wal
@@ -56,6 +65,7 @@ desktop.ini
 .claude/
 
 # ─── Legacy / scratch (kept gitignored to prevent accidental re-add) ─────────
+knowledge/fitness-agent-knowledge/
 knowledge/fitness-bot-knowledge/
 setup_coachrex.py
 

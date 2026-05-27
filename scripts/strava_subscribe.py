@@ -26,7 +26,7 @@ Usage:
   2. Make sure the bot is RUNNING and reachable — Strava tests the callback
      as part of the POST, so your GET /webhooks/strava route needs to be
      live when this script runs. Run `python main.py` in another terminal
-     (or systemctl start fitness-bot) first.
+     (or systemctl start fitness-agent) first.
   3. `python scripts/strava_subscribe.py`
 
 Output: the subscription id, which you may want to keep for the
@@ -53,7 +53,7 @@ def main():
     if not (cfg.STRAVA_CLIENT_ID and cfg.STRAVA_CLIENT_SECRET):
         sys.exit("STRAVA_CLIENT_ID / STRAVA_CLIENT_SECRET missing from .env")
     if not cfg.WEBHOOK_PUBLIC_URL:
-        sys.exit("WEBHOOK_PUBLIC_URL must be set (e.g. https://fitness-bot.example.com)")
+        sys.exit("WEBHOOK_PUBLIC_URL must be set (e.g. https://fitness-agent.example.com)")
     if not cfg.STRAVA_WEBHOOK_VERIFY_TOKEN:
         sys.exit(
             "STRAVA_WEBHOOK_VERIFY_TOKEN must be set. Generate one with:\n"

@@ -7,7 +7,7 @@ so command surface can grow without turning this file into a wall.
 """
 
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 import logging
 
 from config import Config

@@ -1,5 +1,5 @@
 """
-fitness-bot — entry point
+fitness-agent — entry point
 Run with: python main.py
 """
 
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 async def main():
     config = Config()
     bot = FitnessBot(config)
-    logger.info("Starting fitness-bot...")
+    logger.info("Starting fitness-agent...")
     await bot.start(config.DISCORD_TOKEN)
 
 

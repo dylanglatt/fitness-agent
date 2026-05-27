@@ -12,8 +12,6 @@ load_dotenv()
 class Config:
     # Discord
     DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
-    DISCORD_CHANNEL_DAILY: int = int(os.getenv("DISCORD_CHANNEL_DAILY", "0"))
-    DISCORD_CHANNEL_TRAINING: int = int(os.getenv("DISCORD_CHANNEL_TRAINING", "0"))
     # Optional: if set, slash commands sync to this single guild (instant).
     # If 0/unset, sync is global and can take up to an hour to propagate.
     DISCORD_GUILD_ID: int = int(os.getenv("DISCORD_GUILD_ID", "0"))
@@ -80,13 +78,11 @@ class Config:
     # clock time — see bot/scheduler.py. These bound the window.
     DAILY_BRIEF_POLL_START: str = os.getenv("DAILY_BRIEF_POLL_START", "05:30")  # earliest fire
     DAILY_BRIEF_BACKSTOP: str = os.getenv("DAILY_BRIEF_BACKSTOP", "10:00")      # fire no matter what
-    # Kept for backwards compatibility / display; no longer the trigger.
-    DAILY_BRIEF_TIME: str = os.getenv("DAILY_BRIEF_TIME", "07:30")
     TIMEZONE: str = os.getenv("TIMEZONE", "America/New_York")
     OWNER_USER_ID: int = int(os.getenv("OWNER_USER_ID", "0"))  # Your Discord user ID
 
     # Database
-    DB_PATH: str = os.getenv("DB_PATH", "data/fitness_bot.db")
+    DB_PATH: str = os.getenv("DB_PATH", "data/fitness_agent.db")
 
     # Home location (for weather forecast + air quality).
     # Set HOME_LAT, HOME_LNG, HOME_CITY in .env. If the lat/lng pair is

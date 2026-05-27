@@ -28,7 +28,7 @@ Useful issues include:
 4. Don't introduce new top-level modules without a reason. Prefer
    extending the existing `bot/`, `integrations/`, `ai/`, or `data/`
    packages.
-5. Don't commit `.env`, `bot.log`, `data/fitness_bot.db`, or anything from
+5. Don't commit `.env`, `bot.log`, `data/fitness_agent.db`, or anything from
    `data/chroma_db/`. The `.gitignore` already covers these — confirm with
    `git status` before pushing.
 

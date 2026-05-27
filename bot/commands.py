@@ -1,5 +1,5 @@
 """
-All slash commands for fitness-bot, registered via register_commands(bot).
+All slash commands for fitness-agent, registered via register_commands(bot).
 
 Design notes:
 
@@ -34,6 +34,8 @@ import discord
 import pytz
 from discord import app_commands
 from discord.ext import commands
+
+from ai.coach import _log_claude_call
 
 logger = logging.getLogger(__name__)
 
@@ -97,20 +99,6 @@ def _parse_window(window: str) -> int:
         return max(1, int(w))
     except ValueError:
         return 30
-
-
-def _fmt_delta(recent: Optional[float], baseline: Optional[float], unit: str = "", good_up: bool = True) -> str:
-    """Return a formatted recent vs. baseline line with direction arrow."""
-    if recent is None or baseline is None:
-        return f"  —{unit}"
-    diff = recent - baseline
-    arrow = "→"
-    if abs(diff) >= 0.5 if unit != "%" else abs(diff) >= 1:
-        if diff > 0:
-            arrow = "↑" if good_up else "↑(worse)"
-        else:
-            arrow = "↓" if not good_up else "↓(worse)"
-    return f"{recent:g}{unit} (baseline {baseline:g}{unit}) {arrow}"
 
 
 def _mi(meters: Optional[float]) -> float:
@@ -737,6 +725,14 @@ def register_commands(bot):
                 max_tokens=120,
                 messages=[{"role": "user", "content": summary_prompt}],
             )
+            # Observability — log the spend so /cost includes this caller.
+            try:
+                await _log_claude_call(
+                    db, caller="performance_oneliner",
+                    model=coach.cheap_model, response=resp,
+                )
+            except Exception as e:
+                logger.debug(f"_log_claude_call(performance_oneliner) failed: {e}")
             one_liner = resp.content[0].text.strip()
             lines.insert(1, "")
             lines.insert(2, f"_{one_liner}_")
@@ -749,6 +745,60 @@ def register_commands(bot):
             lines.append("_Note: 7d is recent signal, not a trend. Rolling "
                          "averages like HRV and weight need ~3 weeks to stabilize._")
 
+        await _send_chunked(ctx, "\n".join(lines))
+
+    # ── /cost — Anthropic API spend, broken down by code path ──────────────
+    #
+    # Reads from the llm_calls table populated by ai/coach._log_claude_call().
+    # cost_usd is computed at log time from a price table; if Anthropic changes
+    # prices, update _MODEL_PRICES_PER_MTOK in ai/coach.py — historical rows
+    # keep whatever cost they were logged with (we don't backfill).
+
+    @bot.hybrid_command(
+        name="cost",
+        description="Anthropic API spend over the last N days (default 7).",
+    )
+    @is_owner_hybrid
+    async def cost_cmd(ctx: commands.Context, days: int = 7):
+        await ctx.defer()
+        if days <= 0 or days > 365:
+            await ctx.send("`days` must be between 1 and 365.")
+            return
+        rows = await db.get_llm_cost_breakdown(days=days)
+        if not rows:
+            await ctx.send(
+                f"No LLM calls logged in the last {days} day(s). "
+                f"This is normal if observability was just deployed."
+            )
+            return
+
+        total_cost = sum(r.get("total_cost_usd") or 0 for r in rows)
+        total_calls = sum(r.get("calls") or 0 for r in rows)
+        total_in = sum(r.get("input_tokens") or 0 for r in rows)
+        total_out = sum(r.get("output_tokens") or 0 for r in rows)
+        unpriced = sum(r.get("unpriced_calls") or 0 for r in rows)
+
+        lines = [
+            f"**Anthropic spend — last {days} day(s)**",
+            f"_{total_calls} calls · {total_in:,} in · {total_out:,} out · "
+            f"**${total_cost:.4f}** total_",
+        ]
+        if unpriced:
+            lines.append(
+                f"_Note: {unpriced} call(s) had no price in the table — "
+                f"actual spend is higher. Update _MODEL_PRICES_PER_MTOK in "
+                f"ai/coach.py to fix._"
+            )
+        lines.append("")
+        # One row per (caller, model) pair, descending by cost.
+        for r in rows:
+            cost = r.get("total_cost_usd") or 0
+            share = (cost / total_cost * 100) if total_cost else 0
+            lines.append(
+                f"  `{r['caller']:<28s}` {r['calls']:>3d} calls · "
+                f"{r['model'].replace('claude-', '')[:18]:<18s} · "
+                f"${cost:.4f} ({share:.0f}%)"
+            )
         await _send_chunked(ctx, "\n".join(lines))
 
     # ── /ask — conversational with an explicit slash UX ────────────────────
@@ -996,58 +1046,12 @@ def register_commands(bot):
             lines.append("  No body measurement available from WHOOP.")
         lines.append("")
         lines.append(
-            "_BF%, lean mass, visceral fat, and body water are NOT exposed by the WHOOP v2 API. "
-            "To add them, wire FitDays → Apple Health → webhook (or manual CSV import). "
-            "See composition-source TODO in README._"
+            "_BF%, lean mass, visceral fat, and body water are not exposed by the "
+            "WHOOP v2 API. A separate composition data source would be needed to "
+            "surface them here._"
         )
         await ctx.send("\n".join(l for l in lines if l))
 
-    # ── Stubs for commands that need new data sources ─────────────────────
-    # Each replies with a clear "coming soon" + what's blocking.
-
-    @bot.hybrid_command(
-        name="uv",
-        description="[stub] Today's UV peak window. Needs a UV data source.",
-    )
-    @is_owner_hybrid
-    async def uv_cmd(ctx: commands.Context):
-        # TODO: integrate OpenUV (openuv.io — free tier), or Open-Meteo's UV
-        # index (no auth, free). Open-Meteo fits cleanest with the existing
-        # weather.py client. Then compute peak window + duration to hit a
-        # daily target dose.
-        await ctx.send(
-            "_/uv isn't wired yet — needs a UV index source. "
-            "Open-Meteo's free UV endpoint is the simplest drop-in; "
-            "can live next to integrations/weather.py._"
-        )
-
-    @bot.hybrid_command(
-        name="daylight",
-        description="[stub] Sunrise, solar noon, sunset for today.",
-    )
-    @is_owner_hybrid
-    async def daylight_cmd(ctx: commands.Context):
-        # TODO: Either compute locally (astral / suncalc) or hit
-        # api.sunrise-sunset.org (free, no auth). Use HOME_LAT/HOME_LNG.
-        await ctx.send(
-            "_/daylight isn't wired yet — will compute from HOME_LAT/LNG "
-            "once a small astronomy helper lands (astral lib or "
-            "api.sunrise-sunset.org)._"
-        )
-
-    @bot.hybrid_command(
-        name="warmup",
-        description="[stub] A 5–10 minute warmup tuned to today's planned session.",
-    )
-    @is_owner_hybrid
-    async def warmup_cmd(ctx: commands.Context):
-        # TODO: small coach method; warmup is highly deterministic once
-        # session_type is known (run → lunge matrix + strides; lift → joint
-        # prep + working-weight ramps). Can be template-based, no Claude needed.
-        await ctx.send(
-            "_/warmup isn't wired yet — will be template-driven once the "
-            "per-session templates land._"
-        )
 
     # ── /goal slash group (add / list / progress / retire) ────────────────
 

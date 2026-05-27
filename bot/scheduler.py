@@ -14,8 +14,13 @@ New behavior: inside a poll window (default 05:30–10:00 local), check every
 10 minutes whether WHOOP has posted a recovery record dated today. The first
 time we see one, fire the brief. If we hit the backstop time (10:00) without
 seeing a fresh record, fire anyway with whatever's available — better a
-slightly-stale brief than no brief. "Fired today" state is in-memory and
-resets at local midnight.
+slightly-stale brief than no brief.
+
+"Fired today" state is persisted via the sync_state table so a bot restart
+between firing time and local midnight does not refire the brief (or the
+weekly/Sunday DMs). Weekly summary, Sunday reflection, and nightly sync use
+a windowed `now >= target` check combined with a per-day guard — so a
+single dropped tick on the 1-minute loop never causes a missed day.
 """
 
 import logging
@@ -60,6 +65,14 @@ def _chunk_for_discord(text: str, limit: int = 1990) -> list[str]:
 
 
 class Scheduler:
+    # Keys in the sync_state table that record the local date on which each
+    # scheduled job last fired. Using sync_state (already there for WHOOP /
+    # Strava cursors) avoids a new table just to track four counters.
+    _STATE_DAILY_BRIEF = "scheduler:daily_brief_last_fired"
+    _STATE_WEEKLY = "scheduler:weekly_summary_last_fired"
+    _STATE_STOIC = "scheduler:stoic_reflection_last_fired"
+    _STATE_NIGHTLY = "scheduler:nightly_sync_last_fired"
+
     def __init__(self, bot, config, coach):
         self.bot = bot
         self.config = config
@@ -70,14 +83,12 @@ class Scheduler:
         self.poll_start_h, self.poll_start_m = _parse_hhmm(config.DAILY_BRIEF_POLL_START)
         self.backstop_h, self.backstop_m = _parse_hhmm(config.DAILY_BRIEF_BACKSTOP)
 
-        # In-memory "did the brief fire today?" state. Keyed by local date.
-        self._brief_fired_on: str | None = None  # ISO date string, or None
         # Throttle the WHOOP check to once every N minutes (we're called every
         # minute by the loop; no need to hit WHOOP that often).
         self._last_whoop_check: datetime | None = None
         # Cached owner discord.User, fetched lazily on first DM send. Scheduled
-        # briefs used to post to DISCORD_CHANNEL_DAILY; they now DM the owner
-        # directly (a channel is noise for a personal coach).
+        # briefs DM the owner directly; a shared channel is noise for a
+        # personal coach.
         self._owner_user = None
 
     def start(self):
@@ -88,30 +99,61 @@ class Scheduler:
             f"{self.config.TIMEZONE}"
         )
 
+    async def _already_fired_today(self, state_key: str, today_iso: str) -> bool:
+        """True if this scheduled job has already recorded `today_iso` as its
+        last-fired date. Persisted via the sync_state table, so a restart
+        between firing and midnight does NOT cause a refire."""
+        try:
+            state = await self.coach.db.get_sync_state(state_key)
+        except Exception as e:
+            # If state lookup fails, fall through to "not fired" — better to
+            # risk an occasional duplicate DM after a DB error than to silently
+            # skip a real day's brief.
+            logger.warning(f"sync_state read failed for {state_key}: {e}")
+            return False
+        if not state:
+            return False
+        return (state.get("last_record_date") or "") == today_iso
+
+    async def _mark_fired_today(self, state_key: str, today_iso: str) -> None:
+        """Record that this scheduled job fired on `today_iso`."""
+        try:
+            await self.coach.db.set_sync_state(
+                source=state_key,
+                last_synced_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                last_record_date=today_iso,
+            )
+        except Exception as e:
+            logger.warning(f"sync_state write failed for {state_key}: {e}")
+
     @tasks.loop(minutes=1)
     async def check_scheduled_tasks(self):
         now = datetime.now(self.tz)
         today_iso = now.date().isoformat()
 
-        # Reset the "fired today" flag on day rollover.
-        if self._brief_fired_on and self._brief_fired_on != today_iso:
-            self._brief_fired_on = None
-
         # ── Daily morning brief — data-driven window ───────────────────────
-        if self._brief_fired_on != today_iso:
+        if not await self._already_fired_today(self._STATE_DAILY_BRIEF, today_iso):
             await self._maybe_fire_daily_brief(now, today_iso)
 
-        # Weekly training summary — Sundays at 7:00pm
-        if now.weekday() == 6 and now.hour == 19 and now.minute == 0:
-            await self._send_weekly_summary()
+        # ── Weekly training summary — Sundays from 7:00 PM local ───────────
+        # Window-based ("any tick at or after target time, once per day") so a
+        # single skipped 1-min tick never silently drops a Sunday.
+        if now.weekday() == 6 and (now.hour, now.minute) >= (19, 0):
+            if not await self._already_fired_today(self._STATE_WEEKLY, today_iso):
+                await self._send_weekly_summary()
+                await self._mark_fired_today(self._STATE_WEEKLY, today_iso)
 
-        # Sunday Stoic reflection — Sundays at 8:30pm (after summary)
-        if now.weekday() == 6 and now.hour == 20 and now.minute == 30:
-            await self._send_stoic_reflection()
+        # ── Sunday Stoic reflection — Sundays from 8:30 PM (after summary) ─
+        if now.weekday() == 6 and (now.hour, now.minute) >= (20, 30):
+            if not await self._already_fired_today(self._STATE_STOIC, today_iso):
+                await self._send_stoic_reflection()
+                await self._mark_fired_today(self._STATE_STOIC, today_iso)
 
-        # Nightly incremental sync — 3:05 AM local
-        if now.hour == 3 and now.minute == 5:
-            await self._nightly_sync()
+        # ── Nightly incremental sync — from 3:05 AM local ──────────────────
+        if (now.hour, now.minute) >= (3, 5) and now.hour < 5:
+            if not await self._already_fired_today(self._STATE_NIGHTLY, today_iso):
+                await self._nightly_sync()
+                await self._mark_fired_today(self._STATE_NIGHTLY, today_iso)
 
     async def _maybe_fire_daily_brief(self, now: datetime, today_iso: str):
         """Decide whether to fire today's brief.
@@ -132,7 +174,7 @@ class Scheduler:
         if now_min >= back_min:
             logger.info("Backstop time reached without fresh WHOOP record — firing brief anyway.")
             await self._send_daily_brief(reason="backstop")
-            self._brief_fired_on = today_iso
+            await self._mark_fired_today(self._STATE_DAILY_BRIEF, today_iso)
             return
 
         # Inside the poll window. Throttle the WHOOP check.
@@ -151,7 +193,7 @@ class Scheduler:
         if fresh:
             logger.info("Fresh WHOOP recovery detected for today — firing brief.")
             await self._send_daily_brief(reason="fresh-whoop")
-            self._brief_fired_on = today_iso
+            await self._mark_fired_today(self._STATE_DAILY_BRIEF, today_iso)
 
     async def _whoop_has_today_recovery(self, now_local: datetime) -> bool:
         """Ask WHOOP whether a recovery record for today's local date exists yet.

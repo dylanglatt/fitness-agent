@@ -4,7 +4,7 @@ data from SQLite into the Notion databases.
 
 Prereqs (in this order):
   1. `python sync_history.py` must have populated SQLite (this script does
-     NOT call the WHOOP/Strava APIs directly — it reads from data/fitness_bot.db).
+     NOT call the WHOOP/Strava APIs directly — it reads from data/fitness_agent.db).
   2. `python scripts/notion_test.py` must return 4x OK (all DBs configured
      and accessible by the integration).
 

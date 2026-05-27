@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 class Database:
-    def __init__(self, db_path: str = "data/fitness_bot.db"):
+    def __init__(self, db_path: str = "data/fitness_agent.db"):
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -348,6 +348,29 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_lift_sets_date "
                 "ON lift_sets(date)"
             )
+            # llm_calls: observability for Anthropic API spend.
+            # One row per successful messages.create() response. `caller` is a
+            # free-text label set by the call site (daily_brief, chat, debrief,
+            # lift_classifier, etc.) so /cost can group spend by code path.
+            # cost_usd is computed at log time from a price table keyed by
+            # model id — null if the model isn't in the table (so we still
+            # log the call and can fix the table later).
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS llm_calls (
+                    timestamp TEXT NOT NULL,
+                    caller TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_creation_tokens INTEGER,
+                    cost_usd REAL
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_llm_calls_ts_caller "
+                "ON llm_calls(timestamp, caller)"
+            )
             await db.commit()
         # Seed a default balanced-concurrent plan if no plan exists yet.
         await self._seed_default_plan_if_empty()
@@ -461,6 +484,25 @@ class Database:
                 "WHERE LOWER(exercise) LIKE ? AND date >= ? "
                 "ORDER BY date ASC, set_number ASC",
                 (f"%{exercise.lower()}%", since),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_lift_sets_for_date(self, date: str) -> list[dict]:
+        """Return all per-set rows logged on `date` (YYYY-MM-DD), ordered
+        chronologically by id (so the caller's reversed() gives most-recent
+        first). Used by the lift parser to inherit the exercise name when
+        the user types follow-up messages like "2nd set same thing".
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT id, lift_id, date, exercise, set_number, reps, "
+                "       weight_lb, equipment, to_failure, rpe, notes, source "
+                "FROM lift_sets "
+                "WHERE date = ? "
+                "ORDER BY id ASC",
+                (date,),
             ) as cursor:
                 rows = await cursor.fetchall()
         return [dict(row) for row in rows]
@@ -1893,6 +1935,88 @@ class Database:
             async with db.execute(
                 "SELECT date, weight_kg, height_m, max_hr FROM whoop_body_measurements "
                 "WHERE date >= ? ORDER BY date DESC",
+                (since,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    # ── LLM observability ───────────────────────────────────────────────────
+    #
+    # Spend visibility into the Anthropic API. log_llm_call is called from the
+    # coach after every successful messages.create response; get_llm_cost_breakdown
+    # backs the /cost slash command. Best-effort — if logging itself fails, we
+    # don't want to bring down the chat path, so callers should try/except.
+
+    async def log_llm_call(
+        self,
+        *,
+        caller: str,
+        model: str,
+        input_tokens: Optional[int],
+        output_tokens: Optional[int],
+        cache_read_tokens: Optional[int] = None,
+        cache_creation_tokens: Optional[int] = None,
+        cost_usd: Optional[float] = None,
+    ) -> None:
+        """Record one Anthropic messages.create response.
+
+        Cost is computed by the caller from a price table that lives in
+        ai/coach.py (so prices stay close to where calls are made and can be
+        updated without a DB migration). cost_usd may be None when the model
+        isn't priced — the row still gets logged so we know the call happened.
+        """
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute(
+                    """
+                    INSERT INTO llm_calls
+                        (timestamp, caller, model, input_tokens, output_tokens,
+                         cache_read_tokens, cache_creation_tokens, cost_usd)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                        caller,
+                        model,
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                        cache_creation_tokens,
+                        cost_usd,
+                    ),
+                )
+                await db.commit()
+        except Exception as e:
+            # Don't let observability take down the bot.
+            logger.warning(f"log_llm_call failed: {e}")
+
+    async def get_llm_cost_breakdown(self, days: int = 7) -> list[dict]:
+        """Per-caller spend over the last N days, sorted by cost descending.
+
+        Each row: caller, model, calls, input_tokens, output_tokens,
+        cache_read_tokens, cache_creation_tokens, total_cost_usd. NULL costs
+        are summed as zero (SUM ignores NULL in SQLite), so the totals are a
+        lower bound when some models aren't priced — call those out in the UI.
+        """
+        since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00Z")
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                """
+                SELECT caller,
+                       model,
+                       COUNT(*)                       AS calls,
+                       COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                       COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                       COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                       COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+                       COALESCE(SUM(cost_usd), 0)     AS total_cost_usd,
+                       SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END) AS unpriced_calls
+                FROM llm_calls
+                WHERE timestamp >= ?
+                GROUP BY caller, model
+                ORDER BY total_cost_usd DESC, calls DESC
+                """,
                 (since,),
             ) as cursor:
                 rows = await cursor.fetchall()

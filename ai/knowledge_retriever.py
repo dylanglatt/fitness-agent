@@ -3,8 +3,6 @@ Knowledge Retriever
 ====================
 Provides semantic search over the ChromaDB fitness knowledge base.
 Used by ai/coach.py to inject relevant knowledge into Claude prompts.
-
-Copy this file to: ai/knowledge_retriever.py
 """
 
 import logging

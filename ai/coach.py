@@ -61,6 +61,78 @@ except ImportError:
     logger.info("Knowledge retriever not available — run ingest_knowledge.py to enable RAG.")
 
 
+# ── LLM pricing (USD per 1M tokens) ─────────────────────────────────────────
+#
+# Used by _log_claude_call() to estimate per-call cost for the `/cost` command.
+# Numbers are best-effort snapshots — Anthropic changes prices periodically.
+# UPDATE THIS TABLE when prices change (or when adding new models). Anything
+# not in the table logs with cost_usd=NULL and gets surfaced as "unpriced" in
+# the /cost output, so a stale table degrades to "missing data" not "wrong data".
+#
+# Source: https://www.anthropic.com/pricing  (input / output / cache write / cache read)
+_MODEL_PRICES_PER_MTOK = {
+    # Sonnet 4.6
+    "claude-sonnet-4-6":           {"in": 3.00, "out": 15.00, "cache_write": 3.75, "cache_read": 0.30},
+    # Opus 4.6
+    "claude-opus-4-6":             {"in": 15.00, "out": 75.00, "cache_write": 18.75, "cache_read": 1.50},
+    # Haiku 4.5
+    "claude-haiku-4-5-20251001":   {"in": 1.00, "out": 5.00, "cache_write": 1.25, "cache_read": 0.10},
+    "claude-haiku-4-5":            {"in": 1.00, "out": 5.00, "cache_write": 1.25, "cache_read": 0.10},
+}
+
+
+def _estimate_cost_usd(
+    model: str,
+    input_tokens: Optional[int],
+    output_tokens: Optional[int],
+    cache_read_tokens: Optional[int],
+    cache_creation_tokens: Optional[int],
+) -> Optional[float]:
+    """Return cost in USD for one messages.create response, or None if the
+    model isn't in _MODEL_PRICES_PER_MTOK. Cache-read and cache-creation
+    tokens are billed separately from regular input tokens — Anthropic's
+    SDK returns input_tokens as the NON-cached portion, so we sum all three
+    classes at their respective rates.
+    """
+    price = _MODEL_PRICES_PER_MTOK.get(model)
+    if not price:
+        return None
+    cost = 0.0
+    cost += ((input_tokens or 0) / 1_000_000) * price["in"]
+    cost += ((output_tokens or 0) / 1_000_000) * price["out"]
+    cost += ((cache_read_tokens or 0) / 1_000_000) * price["cache_read"]
+    cost += ((cache_creation_tokens or 0) / 1_000_000) * price["cache_write"]
+    return round(cost, 6)
+
+
+async def _log_claude_call(db, *, caller: str, model: str, response) -> None:
+    """Extract usage from an Anthropic response and persist a row to llm_calls.
+
+    Safe to call on any response object — if usage is missing, all token
+    fields go in as null. Wrapped in try/except by the DB layer so a logging
+    failure can never take down the chat path.
+    """
+    if db is None:
+        return
+    usage = getattr(response, "usage", None)
+    in_tok = getattr(usage, "input_tokens", None) if usage else None
+    out_tok = getattr(usage, "output_tokens", None) if usage else None
+    # Cache token fields are present on responses that used cache_control.
+    # They're optional in the SDK; getattr-with-default keeps us safe.
+    cache_read = getattr(usage, "cache_read_input_tokens", None) if usage else None
+    cache_create = getattr(usage, "cache_creation_input_tokens", None) if usage else None
+    cost = _estimate_cost_usd(model, in_tok, out_tok, cache_read, cache_create)
+    await db.log_llm_call(
+        caller=caller,
+        model=model,
+        input_tokens=in_tok,
+        output_tokens=out_tok,
+        cache_read_tokens=cache_read,
+        cache_creation_tokens=cache_create,
+        cost_usd=cost,
+    )
+
+
 # ── Unit helpers (user prefers miles/pounds) ────────────────────────────────
 def _m_to_mi(meters):
     return round((meters or 0) / 1609.344, 2) if meters else 0.0
@@ -489,6 +561,7 @@ class Coach:
         model: Optional[str] = None,
         system: Optional[str] = None,
         max_tool_iters: int = 3,
+        caller: str = "unspecified",
     ) -> str:
         """Send a message to Claude, handling any tool calls it makes.
 
@@ -532,6 +605,18 @@ class Coach:
         # on a question that only needed one.
         for _ in range(max_tool_iters):
             response = await self.claude.messages.create(**create_kwargs)
+            # Log the call for /cost. Each tool-use round-trip is its own
+            # response and its own billable event, so log per-iteration —
+            # not just on the final text response.
+            try:
+                await _log_claude_call(
+                    self.db,
+                    caller=caller,
+                    model=create_kwargs.get("model") or self.model,
+                    response=response,
+                )
+            except Exception as e:
+                logger.debug(f"_log_claude_call failed (non-fatal): {e}")
 
             if response.stop_reason != "tool_use":
                 # Plain text response — extract and return.
@@ -1584,7 +1669,7 @@ class Coach:
         context = await self._build_layered_context()
         stoic_quote = get_daily_stoic_quote()
         prompt = DAILY_BRIEF_PROMPT.format(data=context, stoic_quote=stoic_quote)
-        brief = await self._ask_claude(prompt, allow_tools=False)
+        brief = await self._ask_claude(prompt, allow_tools=False, caller="daily_brief")
 
         # Best-effort Notion log. Two writes now — one daily-summary row, plus
         # one row per Strava activity that came in since yesterday. Each write
@@ -1641,12 +1726,12 @@ class Coach:
     async def weekly_summary(self) -> str:
         context = await self._build_layered_context()
         prompt = WEEKLY_SUMMARY_PROMPT.format(data=context)
-        return await self._ask_claude(prompt, allow_tools=True, max_tokens=1500)
+        return await self._ask_claude(prompt, allow_tools=True, max_tokens=1500, caller="weekly_summary")
 
     async def stoic_reflection(self) -> str:
         context = await self._build_layered_context()
         prompt = SUNDAY_REFLECTION_PROMPT.format(data=context)
-        return await self._ask_claude(prompt, allow_tools=True, max_tokens=1200)
+        return await self._ask_claude(prompt, allow_tools=True, max_tokens=1200, caller="sunday_reflection")
 
     async def recommend_workout(self) -> str:
         """Prescribe today's session, modulated by recovery + training load.
@@ -1678,7 +1763,7 @@ class Coach:
             "philosophy-poster phrases, no 'keep pushing' filler.\n\n"
             f"=== CONTEXT ===\n{context}"
         )
-        return await self._ask_claude(prompt, allow_tools=False, max_tokens=700)
+        return await self._ask_claude(prompt, allow_tools=False, max_tokens=700, caller="recommend_workout")
 
     # ── Debrief (live WHOOP workout + Strava parallel fetch) ────────────────
 
@@ -1967,7 +2052,7 @@ class Coach:
             "Keep under ~180 words. No philosophy quotes. No 'keep pushing' filler.\n\n"
             f"=== DATA ===\n{data_block}"
         )
-        return await self._ask_claude(prompt, allow_tools=False, max_tokens=600)
+        return await self._ask_claude(prompt, allow_tools=False, max_tokens=600, caller="debrief")
 
     async def chat(self, message: str) -> str:
         """
@@ -1993,7 +2078,22 @@ class Coach:
             logger.info("chat(): routed to debrief_run via intent regex.")
             return await self.debrief_run()
 
-        lift = await self._try_parse_lift(message)
+        # Build recent-lifts-today context for the lift parser so messages
+        # like "2nd set same thing" or "3rd set: 105 for 8 reps" can inherit
+        # the exercise name from the prior log. Without this, Haiku saw only
+        # the bare message and wrote blank-Exercise rows + reset Set Number
+        # to 1 — see the May 2026 blank-row batch and the `inherited_exercise`
+        # branch in _try_parse_lift for the full rationale.
+        recent_lift_context: list[dict] = []
+        try:
+            today_iso = datetime.now().strftime("%Y-%m-%d")
+            today_sets = await self.db.get_lift_sets_for_date(today_iso)
+            # Most-recent first; the parser uses the top 1–2 only.
+            recent_lift_context = list(reversed(today_sets))[:4]
+        except Exception as e:
+            logger.debug(f"recent_lift_context lookup failed (non-fatal): {e}")
+
+        lift = await self._try_parse_lift(message, recent_context=recent_lift_context)
         # Guard: only log when Haiku found at least one structured number.
         # Without this, conversational mentions like "what's my leg lift
         # today, main lift being trap bar deadlift" produce phantom rows
@@ -2011,38 +2111,62 @@ class Coach:
                 details=lift["details"],
                 raw=message,
             )
-            # Expand the parsed lift into per-set rows. Haiku gives us
-            # uniform sets (e.g. 4x6 @ 205 → 4 rows, all 6 reps at 205);
-            # the backfill script handles richer non-uniform shapes when
-            # they show up in raw_message. If we know reps OR weight but
-            # not sets, write a single row so the lift still gets a
-            # structured representation.
-            n_sets = lift.get("sets") or 1
-            # Collect per-set SQLite ids so we can mirror them to Notion's
-            # Lift Sets DB below with proper [liftsetrow:<id>] markers.
+            # Two write modes:
+            #
+            #   1. Explicit single-set ("2nd set: 105 for 8 reps", "set 3 same
+            #      thing"). The parser tagged this with set_number=N and the
+            #      message is about exactly that one set. Write ONE row at
+            #      set_number=N — don't loop, that's what produced the
+            #      duplicate-Set-1 rows on Notion.
+            #
+            #   2. Block log ("bench 3x10 at 145"). The parser left set_number
+            #      None and gave us sets/reps. Expand into N uniform rows
+            #      starting at set 1. Same as before.
+            #
+            # The backfill script handles richer non-uniform shapes when they
+            # show up in raw_message.
+            explicit_set = lift.get("set_number")
             chat_set_records: list[dict] = []
             try:
-                for s in range(1, n_sets + 1):
+                if explicit_set is not None and explicit_set > 0:
                     set_db_id = await self.db.log_lift_set(
                         lift_id=lift_id,
                         date=datetime.now().strftime("%Y-%m-%d"),
                         exercise=lift["exercise"],
-                        set_number=s,
+                        set_number=explicit_set,
                         reps=lift.get("reps"),
                         weight_lb=lift.get("weight_lb"),
                         source="chat",
                     )
                     chat_set_records.append({
                         "set_db_id": set_db_id,
-                        "set_number": s,
+                        "set_number": explicit_set,
                         "reps": lift.get("reps"),
                         "weight_lb": lift.get("weight_lb"),
                     })
+                else:
+                    n_sets = lift.get("sets") or 1
+                    for s in range(1, n_sets + 1):
+                        set_db_id = await self.db.log_lift_set(
+                            lift_id=lift_id,
+                            date=datetime.now().strftime("%Y-%m-%d"),
+                            exercise=lift["exercise"],
+                            set_number=s,
+                            reps=lift.get("reps"),
+                            weight_lb=lift.get("weight_lb"),
+                            source="chat",
+                        )
+                        chat_set_records.append({
+                            "set_db_id": set_db_id,
+                            "set_number": s,
+                            "reps": lift.get("reps"),
+                            "weight_lb": lift.get("weight_lb"),
+                        })
             except Exception as e:
                 logger.warning(
-                    "lift_sets expansion failed for %s (sets=%s): %s — "
+                    "lift_sets expansion failed for %s (sets=%s, explicit_set=%s): %s — "
                     "lifts row still committed, backfill can retry later.",
-                    lift.get("exercise"), n_sets, e,
+                    lift.get("exercise"), lift.get("sets"), explicit_set, e,
                 )
             parent_lift_notion_id: str | None = None
             try:
@@ -2152,25 +2276,62 @@ class Coach:
             model=self.chat_model,
             system=CHAT_SYSTEM_PROMPT,
             max_tool_iters=3,
+            caller="chat",
         )
 
     # ── Lift parsing (regex pre-filter + cheap model) ───────────────────────
 
-    async def _try_parse_lift(self, message: str) -> dict | None:
+    async def _try_parse_lift(
+        self,
+        message: str,
+        recent_context: Optional[list[dict]] = None,
+    ) -> dict | None:
         """Fast pre-filter: if the message has no numbers or lift keywords, skip
         the model call entirely. Saves roughly one Claude round-trip per chat.
 
         Returns a dict with:
-          exercise (str, required), details (str, free-form backup),
+          exercise (str, required, non-empty), details (str, free-form backup),
           sets, reps, weight_lb (numbers, optional — missing if ambiguous),
+          set_number (int or None — set with a parent if user typed "Nth set"
+                      / "2nd set same thing"; None for a fresh top-level lift),
+          inherited_from (str or None — exercise name we inferred from
+                          recent_context if the message itself didn't name it),
           workout (Push/Pull/Legs/Other, optional — model's best guess).
 
         The structured fields feed the Notion Lifts DB columns directly. The
         details string is kept as a fallback so partial parses (e.g. Haiku
         extracts exercise but can't pin sets/reps) still record the raw lift.
+
+        recent_context is a short list of {exercise, set_number, weight_lb,
+        reps} dicts ordered most-recent-first — used to resolve "same thing",
+        "another set", and "Nth set: ..." messages where the exercise name
+        isn't in the current message. Without this context Haiku used to write
+        blank-Exercise rows and reset Set Number to 1 every time. See the
+        git history for the May 2026 batch of blank rows that prompted this.
         """
         if not _LIFT_HINT.search(message):
             return None
+
+        # Render the last 1–2 lifts as plain JSON the model can read. We keep
+        # this small (max 2 rows) — more would tempt Haiku to confabulate
+        # exercises that aren't relevant to the current message.
+        ctx_block = ""
+        if recent_context:
+            trimmed = [
+                {
+                    "exercise": r.get("exercise") or "",
+                    "set_number": r.get("set_number"),
+                    "reps": r.get("reps"),
+                    "weight_lb": r.get("weight_lb"),
+                }
+                for r in recent_context[:2]
+                if (r.get("exercise") or "").strip()
+            ]
+            if trimmed:
+                ctx_block = (
+                    "\nRecent lifts logged in this session (most recent first):\n"
+                    f"{json.dumps(trimmed, indent=2)}\n"
+                )
 
         # Prompt tightened so Haiku returns numbers we can put straight into
         # number columns. Unit note is critical — "135" in a bench context
@@ -2180,7 +2341,7 @@ class Coach:
 Does this message describe a weightlifting exercise? If yes, extract the structured fields.
 
 Message: "{message}"
-
+{ctx_block}
 Respond with JSON ONLY. Schema:
 {{
   "is_lift": true | false,
@@ -2189,6 +2350,8 @@ Respond with JSON ONLY. Schema:
   "sets": <int or null>,
   "reps": <int or null — if sets are a scheme like 5x5, this is reps per set>,
   "weight_lb": <number or null — assume pounds unless message says 'kg'>,
+  "set_number": <int or null — the explicit set index the user named, e.g. "2nd set" → 2, "set 3" → 3. null if the message doesn't name a specific set>,
+  "inherited_exercise": <true if `exercise` was inferred from Recent lifts (e.g. user typed "same thing" or "3rd set: 105 for 8 reps" with no exercise name), false otherwise>,
   "workout": "Push" | "Pull" | "Legs" | "Other" | null
 }}
 
@@ -2198,6 +2361,12 @@ Rules:
     references to past sessions ("I do have trap bar deadlift logged once"),
     future plans, or any mention without a quantified set/rep/weight number
     is NOT a lift log. In those cases return {{"is_lift": false}}.
+  • CONTEXT INHERITANCE: if the message names a set number ("2nd set",
+    "set 3", "another set", "same thing", "same weight") but does NOT name
+    the exercise, inherit the exercise from the most recent entry in Recent
+    lifts. Set "inherited_exercise": true. If Recent lifts is empty AND the
+    message doesn't name the exercise, return {{"is_lift": false}} —
+    DO NOT guess. A blank-exercise log is worse than no log.
   • If the message describes a lift but you can't confidently pin a field, set it to null.
   • For push/pull/legs: Bench/OHP/Dips/Push-ups = Push. Rows/Pull-ups/Chin-ups/Curls = Pull.
     Squat/Deadlift/Lunge/Leg press = Legs. Core/accessory/mixed = Other.
@@ -2208,9 +2377,16 @@ Rules:
         try:
             resp = await self.claude.messages.create(
                 model=self.cheap_model,  # Haiku — ~10x cheaper than Sonnet
-                max_tokens=300,
+                max_tokens=400,
                 messages=[{"role": "user", "content": parse_prompt}],
             )
+            try:
+                await _log_claude_call(
+                    self.db, caller="lift_classifier",
+                    model=self.cheap_model, response=resp,
+                )
+            except Exception as e:
+                logger.debug(f"_log_claude_call(lift_classifier) failed: {e}")
             raw = resp.content[0].text
             start = raw.find("{")
             end = raw.rfind("}") + 1
@@ -2234,12 +2410,29 @@ Rules:
                 except (TypeError, ValueError):
                     return None
 
+            exercise = (data.get("exercise") or "").strip()
+            # Belt-and-braces: if Haiku ignored the rule about not guessing,
+            # refuse to write a blank-Exercise row. A row with no exercise
+            # name is dead data — better to fail closed and let the user
+            # re-log with the name spelled out than to silently corrupt the
+            # Lift Sets DB (the bug this whole fix addresses).
+            if not exercise:
+                logger.info(
+                    "lift_classifier returned blank exercise for %r — "
+                    "refusing to log. Recent context had %d row(s).",
+                    message[:80], len(recent_context or []),
+                )
+                return None
+
+            inherited = bool(data.get("inherited_exercise"))
             return {
-                "exercise": data.get("exercise") or "",
+                "exercise": exercise,
                 "details": data.get("details") or "",
                 "sets": _coerce_int(data.get("sets")),
                 "reps": _coerce_int(data.get("reps")),
                 "weight_lb": _coerce_float(data.get("weight_lb")),
+                "set_number": _coerce_int(data.get("set_number")),
+                "inherited_exercise": inherited,
                 "workout": data.get("workout") if data.get("workout") in ("Push", "Pull", "Legs", "Other") else None,
             }
         except Exception as e:
@@ -2279,6 +2472,13 @@ If not (e.g. "headed to the sauna later" — no completion, no data): {{"is_sess
                 max_tokens=250,
                 messages=[{"role": "user", "content": parse_prompt}],
             )
+            try:
+                await _log_claude_call(
+                    self.db, caller="recovery_session_classifier",
+                    model=self.cheap_model, response=resp,
+                )
+            except Exception as e:
+                logger.debug(f"_log_claude_call(recovery_session_classifier) failed: {e}")
             raw = resp.content[0].text
             start = raw.find("{")
             end = raw.rfind("}") + 1
@@ -2356,6 +2556,13 @@ Rules:
                 max_tokens=800,
                 messages=[{"role": "user", "content": parse_prompt}],
             )
+            try:
+                await _log_claude_call(
+                    self.db, caller="lift_session_planner",
+                    model=self.cheap_model, response=resp,
+                )
+            except Exception as e:
+                logger.debug(f"_log_claude_call(lift_session_planner) failed: {e}")
             raw = resp.content[0].text
             start = raw.find("{")
             end = raw.rfind("}") + 1

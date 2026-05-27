@@ -13,7 +13,7 @@ into .env. For each configured database it answers:
      your database's actual columns.)
 
 Usage:
-    cd ~/Desktop/Projects/fitness-bot
+    cd ~/Desktop/Projects/fitness-agent
     python scripts/notion_test.py          # read-only ping of all 4 DBs
     python scripts/notion_test.py --write  # also create one test row per DB
 """

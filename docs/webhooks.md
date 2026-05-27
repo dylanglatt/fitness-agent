@@ -1,6 +1,6 @@
 # Webhooks on DigitalOcean + Caddy
 
-This is the end-to-end setup for running the fitness-bot webhook receiver
+This is the end-to-end setup for running the fitness-agent webhook receiver
 on a DigitalOcean droplet with Caddy handling TLS. The goal: Strava and
 WHOOP push events as they happen, so `/debrief` (and the brief) never waits
 on a 3 AM polling job to see this morning's run.
@@ -14,7 +14,7 @@ on a 3 AM polling job to see this morning's run.
   Caddy (:443)     ← Let's Encrypt, auto-renews
      │  HTTP (loopback)
      ▼
-  fitness-bot (127.0.0.1:8765)
+  fitness-agent (127.0.0.1:8765)
      ├─ GET  /webhooks/strava   ← Strava verify handshake
      ├─ POST /webhooks/strava   ← Strava activity events
      ├─ POST /webhooks/whoop    ← WHOOP signed events
@@ -47,9 +47,9 @@ ufw allow 80,443/tcp
 ufw --force enable
 
 # App user + directory
-useradd -m -s /bin/bash fitness-bot
-su - fitness-bot
-git clone https://github.com/dylanglatt/fitness-bot.git && cd fitness-bot
+useradd -m -s /bin/bash fitness-agent
+su - fitness-agent
+git clone https://github.com/dylanglatt/fitness-agent.git && cd fitness-agent
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -64,12 +64,12 @@ cp .env.example .env
 Edit `/etc/caddy/Caddyfile`:
 
 ```caddy
-fitness-bot.example.com {
+fitness-agent.example.com {
     # Let's Encrypt kicks in automatically; you need an A record pointing
     # to the droplet's IP before this will renew.
     encode zstd gzip
     log {
-        output file /var/log/caddy/fitness-bot.log
+        output file /var/log/caddy/fitness-agent.log
         format console
     }
 
@@ -91,24 +91,24 @@ Then:
 ```bash
 systemctl reload caddy
 # …Caddy will fetch a cert on first access. Trigger it once:
-curl -I https://fitness-bot.example.com/healthz
+curl -I https://fitness-agent.example.com/healthz
 ```
 
 ## systemd service for the bot
 
-`/etc/systemd/system/fitness-bot.service`:
+`/etc/systemd/system/fitness-agent.service`:
 
 ```ini
 [Unit]
-Description=fitness-bot (Discord + webhook receiver)
+Description=fitness-agent (Discord + webhook receiver)
 After=network.target
 
 [Service]
 Type=simple
-User=fitness-bot
-WorkingDirectory=/home/fitness-bot/fitness-bot
-EnvironmentFile=/home/fitness-bot/fitness-bot/.env
-ExecStart=/home/fitness-bot/fitness-bot/venv/bin/python main.py
+User=fitness-agent
+WorkingDirectory=/home/fitness-agent/fitness-agent
+EnvironmentFile=/home/fitness-agent/fitness-agent/.env
+ExecStart=/home/fitness-agent/fitness-agent/venv/bin/python main.py
 Restart=on-failure
 RestartSec=5
 
@@ -120,8 +120,8 @@ Then:
 
 ```bash
 systemctl daemon-reload
-systemctl enable --now fitness-bot
-journalctl -u fitness-bot -f
+systemctl enable --now fitness-agent
+journalctl -u fitness-agent -f
 ```
 
 You should see `Webhook server listening on 127.0.0.1:8765` and the bot's
@@ -134,8 +134,8 @@ Both services require a one-time registration step after the bot is running.
 **Strava:**
 
 ```bash
-su - fitness-bot
-cd fitness-bot
+su - fitness-agent
+cd fitness-agent
 source venv/bin/activate
 python scripts/strava_subscribe.py
 ```
@@ -149,14 +149,14 @@ dashboard steps.
 
 ```bash
 # From the droplet — should be "ok"
-curl -s https://fitness-bot.example.com/healthz
+curl -s https://fitness-agent.example.com/healthz
 
 # Tail the logs and do a workout. You should see:
 #   Strava event: create activity id=<id> owner=<id>
 #   Strava activity <id> upserted from webhook.
 #   WHOOP event: workout.updated id=<uuid> user=<id>
 #   WHOOP workout <uuid> upserted from webhook.
-journalctl -u fitness-bot -f
+journalctl -u fitness-agent -f
 ```
 
 Then in Discord, run `/debrief` — it should grade the run using fresh HR,
@@ -168,6 +168,6 @@ zones, and pace within a minute of you ending the activity.
 |---------|--------------|-----|
 | Strava events silent, `/debrief` says "not synced" | `WEBHOOK_PUBLIC_URL` mismatch, subscription stale | `scripts/strava_unsubscribe.py` then `strava_subscribe.py` |
 | WHOOP events rejected 403 | `WHOOP_CLIENT_SECRET` was rotated | Re-save webhook URL in WHOOP dashboard |
-| `signature verification failed` in logs | `WHOOP_CLIENT_SECRET` in `.env` doesn't match dashboard | Copy the latest secret into `.env`, `systemctl restart fitness-bot` |
-| Caddy returns 502 | Bot not running or wrong port | `systemctl status fitness-bot`; check `WEBHOOK_PORT` in `.env` |
+| `signature verification failed` in logs | `WHOOP_CLIENT_SECRET` in `.env` doesn't match dashboard | Copy the latest secret into `.env`, `systemctl restart fitness-agent` |
+| Caddy returns 502 | Bot not running or wrong port | `systemctl status fitness-agent`; check `WEBHOOK_PORT` in `.env` |
 | 3 AM nightly sync still catching tons of events | Webhooks aren't delivering | Check Strava subscription list and WHOOP dashboard; verify `/healthz` reachable from outside |

@@ -1,4 +1,4 @@
-# fitness-bot
+# fitness-agent
 
 > A personal AI fitness coach that lives in Discord. Pulls WHOOP recovery data
 > and Strava activities, lets you log lifts via chat, writes a Notion training
@@ -20,16 +20,18 @@
   HR ceiling, lift template — based on recovery, sleep, weather, and your
   training plan.
 - **Conversational coach.** Ask anything: *"should I run hard today?"*,
-  *"how has my bench progressed?"*, *"why do I feel tired despite a green
-  recovery?"*. Routed to Claude with your live data + a small RAG knowledge
-  base of training, recovery, and Stoic-philosophy notes.
+  *"how has my bench progressed?"*, *"how much protein on a hard lift day?"*,
+  *"why do I feel tired despite a green recovery?"*. Routed to Claude with
+  your live data + a RAG knowledge base of running, strength, recovery,
+  nutrition, sleep, periodization, and Stoic mindset notes.
 - **Lift logging by chat.** Type *"bench 3x10 at 145"* in Discord. It parses
   the set, logs it to SQLite + Notion, tracks progression, flags PRs.
 - **Slash-command tree.** `/recovery`, `/sleep`, `/strain`, `/load`,
-  `/performance`, `/goal`, `/workout`, `/plan`, `/debrief` — quick views
-  without typing free-form prompts.
-- **Notion training journal** with four databases — `Schedule`, `Lifts`,
-  `Runs`, `Daily Log` — auto-written in the background.
+  `/performance`, `/goal`, `/workout`, `/plan`, `/debrief`, `/swap`,
+  `/liftstart`/`/liftend`, `/cost` — quick views and controls without
+  typing free-form prompts.
+- **Notion training journal** with five linked databases — `Schedule`,
+  `Lifts`, `Lift Sets`, `Runs`, `Daily Log` — auto-written in the background.
 - **Webhook-driven** Strava + WHOOP ingestion (no nightly polling) when you
   expose a public HTTPS endpoint via Caddy.
 - **Post-workout debrief** — fuses Strava pace + WHOOP HR/zones into a
@@ -73,7 +75,7 @@ flowchart LR
 
     subgraph Outputs
         DISCORD[Discord<br/>brief + chat + slash]
-        NOTION[Notion<br/>4-DB journal]
+        NOTION[Notion<br/>5-DB journal]
         SQLITE[(SQLite<br/>lifts + notes)]
     end
 
@@ -116,8 +118,8 @@ flowchart LR
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/dylanglatt/fitness-bot.git
-cd fitness-bot
+git clone https://github.com/dylanglatt/fitness-agent.git
+cd fitness-agent
 python3.11 -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
@@ -179,15 +181,19 @@ python main.py
 
 ### Notion
 1. [notion.so/profile/integrations](https://www.notion.so/profile/integrations) → New integration (Internal) → copy the secret
-2. Create four databases under a parent "Fitness" page:
+2. Create five databases under a parent "Fitness" page:
    - **Schedule** — day-level index (Training Group, Workout, date)
-   - **Lifts** — one row per exercise per day (Sets, Reps, Weight lb, RPE)
+   - **Lifts** — one row per exercise per workout (Sets, Reps, Weight lb, RPE)
+   - **Lift Sets** — one row per *set* performed, related back to the parent
+     Lifts row. Backs strength-progression views. Optional — leave blank to
+     log workout-summary rows only.
    - **Runs** — one row per cardio activity (Distance mi, Pace, Zone %)
    - **Daily Log** — one row per day with WHOOP physiology + morning brief text
 3. For each database, click ••• → Connections → add your integration. *Without
    this step, the API returns 404 even with a valid key.*
 4. Copy each database ID from its URL (the 32-char chunk before `?`) into the
-   matching `NOTION_*_DATABASE_ID` in `.env`
+   matching `NOTION_*_DATABASE_ID` in `.env`. Any ID can be left blank — the
+   bot skips writes to that DB rather than crashing.
 
 ### Webhooks (optional)
 If you want push-based ingestion instead of polling — see
@@ -199,7 +205,7 @@ walkthrough. Leave `WEBHOOK_PORT=0` to disable.
 ## Project structure
 
 ```
-fitness-bot/
+fitness-agent/
 ├── main.py                    # Entry point
 ├── config.py                  # All config / env vars
 ├── requirements.txt
@@ -211,7 +217,7 @@ fitness-bot/
 ├── integrations/
 │   ├── strava.py              # Strava API client
 │   ├── whoop.py               # WHOOP API client
-│   ├── notion.py              # Notion write client (4-DB)
+│   ├── notion.py              # Notion write client (5-DB)
 │   ├── weather.py             # Open-Meteo weather + AQI
 │   └── webhook_server.py      # aiohttp webhook receiver
 ├── ai/
@@ -251,16 +257,16 @@ zero-downtime redeploy on push to `main`; configure `DEPLOY_HOST`,
 Run as a systemd service:
 
 ```ini
-# /etc/systemd/system/fitness-bot.service
+# /etc/systemd/system/fitness-agent.service
 [Unit]
-Description=fitness-bot
+Description=fitness-agent
 After=network.target
 
 [Service]
 User=ubuntu
-WorkingDirectory=/home/ubuntu/fitness-bot
-EnvironmentFile=/home/ubuntu/fitness-bot/.env
-ExecStart=/home/ubuntu/fitness-bot/venv/bin/python main.py
+WorkingDirectory=/home/ubuntu/fitness-agent
+EnvironmentFile=/home/ubuntu/fitness-agent/.env
+ExecStart=/home/ubuntu/fitness-agent/venv/bin/python main.py
 Restart=always
 RestartSec=5
 
@@ -269,8 +275,8 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-sudo systemctl enable --now fitness-bot
-sudo journalctl -u fitness-bot -f      # tail logs
+sudo systemctl enable --now fitness-agent
+sudo journalctl -u fitness-agent -f      # tail logs
 ```
 
 For webhook-driven ingestion (Strava + WHOOP push), put Caddy in front to

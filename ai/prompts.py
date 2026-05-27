@@ -1,8 +1,6 @@
 """
 System prompts and fitness knowledge base for the AI coach.
 Edit this file to tune the coach's personality and expertise.
-
-Replace the contents of ai/prompts.py with this file.
 """
 
 import random
