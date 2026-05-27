@@ -438,7 +438,7 @@ def register_commands(bot):
         row = rows[0] if rows else None
         if not row:
             try:
-                snap = await coach.whoop.get_today_snapshot()
+                snap = await coach.whoop.get_today_snapshot(local_tz=getattr(coach.config, "TIMEZONE", None))
                 rec = (snap or {}).get("recovery") or {}
                 score = (rec.get("score") or {}).get("recovery_score")
                 hrv = round((rec.get("score") or {}).get("hrv_rmssd_milli") or 0, 1)

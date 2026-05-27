@@ -200,16 +200,69 @@ class WhoopClient:
             data = resp.json()
         return data or None
 
-    async def get_today_snapshot(self) -> dict:
-        """Get today's recovery, sleep, and strain as a single dict."""
-        recovery = await self.get_recovery(days=1)
-        sleep = await self.get_sleep(days=1)
+    async def get_today_snapshot(self, local_tz: Optional[str] = None) -> dict:
+        """Get today's recovery, sleep, and strain as a single dict.
+
+        Pre-fix behavior was to return the most recent record from the last
+        day regardless of date. That meant when WHOOP hadn't finished
+        computing the morning's recovery yet, the brief silently used
+        YESTERDAY'S recovery as if it were today's — the "inaccurate
+        HRV/RHR in morning briefs" failure mode. Now we filter to records
+        whose timestamp (converted to the caller's local tz) falls on
+        today's local date. If nothing matches, the field is None and the
+        brief honestly says "no recovery yet" instead of confabulating.
+
+        local_tz is an Olson tz string (e.g. "America/New_York"). When
+        omitted we fall back to UTC, which is the previous buggy behavior
+        but explicit about it.
+        """
+        recovery = await self.get_recovery(days=2)  # widen to catch late syncs
+        sleep = await self.get_sleep(days=2)
         strain = await self.get_strain(days=1)
 
+        # Compute "today" in the caller's local tz. Falls back to UTC if
+        # pytz can't load the zone (defensive — bad config shouldn't crash
+        # the brief; we just lose date-correctness like before).
+        try:
+            import pytz
+            tz = pytz.timezone(local_tz) if local_tz else pytz.UTC
+        except Exception:
+            import pytz
+            tz = pytz.UTC
+        today_local = datetime.now(tz).date()
+
+        def _on_today(rec: dict, ts_keys: tuple[str, ...]) -> bool:
+            for k in ts_keys:
+                ts = rec.get(k)
+                if not ts:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if dt.astimezone(tz).date() == today_local:
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        # Recoveries are tied to the sleep they came from; their created_at
+        # is when WHOOP computed the score (post-wake). Sleep records use
+        # `end` (when the sleep period ended). Strain is per-cycle.
+        today_recovery = next(
+            (r for r in recovery if _on_today(r, ("created_at", "updated_at"))),
+            None,
+        )
+        today_sleep = next(
+            (s for s in sleep if _on_today(s, ("end", "start"))),
+            None,
+        )
+        # Strain stays "most recent" since same-day strain accumulates as
+        # the day progresses and the brief fires before strain is "done".
+        today_strain = strain[0] if strain else None
+
         return {
-            "recovery": recovery[0] if recovery else None,
-            "sleep": sleep[0] if sleep else None,
-            "strain": strain[0] if strain else None,
+            "recovery": today_recovery,
+            "sleep": today_sleep,
+            "strain": today_strain,
         }
 
     # ── Paginated history iterators ─────────────────────────────────────────
@@ -484,14 +537,22 @@ class WhoopClient:
         return " | ".join(parts)
 
     def summarize_recovery(self, record: dict) -> str:
-        """Readable summary of a recovery record."""
+        """Readable summary of a recovery record.
+
+        Each field is rendered as "N/A" when the value is missing rather
+        than defaulting to 0 — a literal "HRV: 0.0ms" in the morning brief
+        is worse than admitting WHOOP hasn't finished computing the score.
+        """
         if not record:
             return "No recovery data."
-        score = record.get("score", {})
-        recovery_score = score.get("recovery_score", "N/A")
-        hrv = round(score.get("hrv_rmssd_milli", 0), 1)
-        rhr = score.get("resting_heart_rate", "N/A")
-        return f"Recovery: {recovery_score}% | HRV: {hrv}ms | RHR: {rhr} bpm"
+        score = record.get("score") or {}
+        recovery_score = score.get("recovery_score")
+        hrv_raw = score.get("hrv_rmssd_milli")
+        rhr = score.get("resting_heart_rate")
+        rec_s = f"{recovery_score}%" if recovery_score is not None else "N/A"
+        hrv_s = f"{round(hrv_raw, 1)}ms" if hrv_raw is not None else "N/A"
+        rhr_s = f"{rhr} bpm" if rhr is not None else "N/A"
+        return f"Recovery: {rec_s} | HRV: {hrv_s} | RHR: {rhr_s}"
 
     def summarize_sleep(self, record: dict) -> str:
         """Readable summary of a sleep record."""

@@ -48,8 +48,7 @@ implementation that another developer with similar accounts (WHOOP +
 Strava + Discord + Anthropic + Notion) could fork and run with modest
 config changes — but it's not a polished product, there's no
 multi-tenancy, and the system prompt is opinionated toward my own
-training style. PRs that improve generality are welcome; see
-[CONTRIBUTING.md](CONTRIBUTING.md).
+training style.
 
 ---
 

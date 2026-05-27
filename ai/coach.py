@@ -1105,7 +1105,7 @@ class Coach:
 
         # Live WHOOP snapshot — same call the layered builder makes first.
         try:
-            snap = await self.whoop.get_today_snapshot()
+            snap = await self.whoop.get_today_snapshot(local_tz=getattr(self.config, "TIMEZONE", None))
             rec_line = self.whoop.summarize_recovery(snap.get("recovery"))
             slp_line = self.whoop.summarize_sleep(snap.get("sleep"))
             if rec_line:
@@ -1328,7 +1328,7 @@ class Coach:
 
         # ── Today snapshot (live, since nightly sync may not have today yet)
         try:
-            snap = await self.whoop.get_today_snapshot()
+            snap = await self.whoop.get_today_snapshot(local_tz=getattr(self.config, "TIMEZONE", None))
             rec_line = self.whoop.summarize_recovery(snap.get("recovery"))
             slp_line = self.whoop.summarize_sleep(snap.get("sleep"))
             lines.append(f"  {rec_line}")
@@ -1676,50 +1676,80 @@ class Coach:
         # is independently try/except'd so a failure on one doesn't skip the
         # others; we care more about "something got logged" than "everything
         # was perfect" on the morning-brief path.
+        # Step 1: get the WHOOP snapshot for today, but don't let a failure
+        # here skip the entire Notion log — the brief text itself is still
+        # worth recording. Pre-fix, a single transient WHOOP API error meant
+        # the whole daily row was dropped including the prose. Now we record
+        # whatever we have; missing fields stay null in Notion.
+        snapshot: dict = {}
         try:
-            snapshot = await self.whoop.get_today_snapshot()
-            rec = snapshot.get("recovery", {}) or {}
-            slp = snapshot.get("sleep", {}) or {}
-            activities = await self.strava.get_recent_activities(days=1)
+            snapshot = await self.whoop.get_today_snapshot(
+                local_tz=getattr(self.config, "TIMEZONE", None)
+            ) or {}
+        except Exception as e:
+            logger.warning(
+                "WHOOP snapshot fetch failed during brief log — "
+                "logging brief text only (HRV/RHR/recovery will be null). %s",
+                e,
+            )
 
-            score = rec.get("score", {}) if rec else {}
-            sleep_score = slp.get("score", {}) if slp else {}
-            stage_summary = sleep_score.get("stage_summary", {}) if sleep_score else {}
+        rec = snapshot.get("recovery") or {}
+        slp = snapshot.get("sleep") or {}
+        score = rec.get("score") or {}
+        sleep_score = slp.get("score") or {}
+        stage_summary = sleep_score.get("stage_summary") or {}
 
-            # 1) Daily row (WHOOP + brief text). No activities list here —
-            # Strava activities become their own rows in the Workouts DB below.
+        # Sleep hours: convert only when the raw field is populated. Don't
+        # default to 0 — a missing field becoming "0 hours slept" misleads
+        # both the Notion log and any downstream trend calculation.
+        sleep_milli = stage_summary.get("total_in_bed_time_milli")
+        sleep_hours = round(sleep_milli / 3_600_000, 1) if sleep_milli else None
+
+        # HRV: same defensiveness. WHOOP omits the field when the score
+        # hasn't been computed yet (mid-morning, before sleep is finalized).
+        hrv_raw = score.get("hrv_rmssd_milli")
+        hrv = round(hrv_raw, 1) if hrv_raw is not None else None
+
+        try:
             await self.notion.log_daily_entry(
                 date=datetime.now().strftime("%Y-%m-%d"),
                 summary={
                     "recovery_score": score.get("recovery_score"),
-                    "hrv": round(score.get("hrv_rmssd_milli", 0), 1),
+                    "hrv": hrv,
                     "rhr": score.get("resting_heart_rate"),
-                    "sleep_hours": round(stage_summary.get("total_in_bed_time_milli", 0) / 3_600_000, 1),
+                    "sleep_hours": sleep_hours,
                     "sleep_efficiency": sleep_score.get("sleep_efficiency_percentage"),
                     "daily_brief": brief,
                 },
             )
-
-            # 2) One Runs row per Strava activity. Each activity also flows
-            # into the Schedule DB (via find_or_create_schedule inside
-            # log_run) so that day's Schedule entry exists and relates back.
-            # Non-run cardio (rides/hikes/swims/walks) lands here too, tagged
-            # by Type. Dedupe-by-date isn't enforced — if the same activity
-            # lands twice, user can delete the dupe row manually.
-            #
-            # For each activity we look up the matching WHOOP workout by
-            # (date + ±30min) and pass it to log_strava_activity, which
-            # prefers WHOOP's continuous-wrist HR + zone math over Strava's
-            # numbers. Without this, new Runs rows would land with HR but
-            # no zones — same gap the offline backfill closed.
-            for a in activities:
-                try:
-                    whoop_match = await self.db.find_whoop_workout_for_strava_activity(a)
-                    await self.notion.log_strava_activity(a, whoop_workout=whoop_match)
-                except Exception as e:
-                    logger.debug(f"Notion run log skipped for activity {a.get('id')}: {e}")
         except Exception as e:
-            logger.warning(f"Notion log failed silently: {e}")
+            logger.warning(f"Notion daily-log write failed (non-fatal): {e}")
+
+        # Step 2: Strava activities — independent of the WHOOP path so a
+        # WHOOP outage doesn't block these from landing in Notion.
+        try:
+            activities = await self.strava.get_recent_activities(days=1)
+        except Exception as e:
+            logger.warning(f"Strava activities fetch failed during brief log: {e}")
+            activities = []
+        # One Runs row per Strava activity. Each activity also flows into the
+        # Schedule DB (via find_or_create_schedule inside log_run) so that
+        # day's Schedule entry exists and relates back. Non-run cardio
+        # (rides/hikes/swims/walks) lands here too, tagged by Type. Dedupe-by
+        # -date isn't enforced — if the same activity lands twice, the user
+        # can delete the dupe row manually.
+        #
+        # For each activity we look up the matching WHOOP workout by
+        # (date + ±30min) and pass it to log_strava_activity, which prefers
+        # WHOOP's continuous-wrist HR + zone math over Strava's numbers.
+        # Without this, new Runs rows would land with HR but no zones —
+        # same gap the offline backfill closed.
+        for a in activities:
+            try:
+                whoop_match = await self.db.find_whoop_workout_for_strava_activity(a)
+                await self.notion.log_strava_activity(a, whoop_workout=whoop_match)
+            except Exception as e:
+                logger.debug(f"Notion run log skipped for activity {a.get('id')}: {e}")
 
         return brief
 
