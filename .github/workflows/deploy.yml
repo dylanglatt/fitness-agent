@@ -33,7 +33,7 @@ jobs:
           script: |
             set -euo pipefail
 
-            cd ~/fitness-agent
+            cd ~/fitness-bot
 
             # Defensive backup of .env in case anything ever touches it.
             # `git reset --hard` won't touch gitignored files, but belt + braces.
@@ -57,12 +57,12 @@ jobs:
             ./venv/bin/pip install --quiet -r requirements.txt
 
             # Restart the bot via systemd
-            systemctl restart fitness-agent
+            systemctl restart fitness-bot
             sleep 2
-            if systemctl is-active --quiet fitness-agent; then
-              echo "Deploy successful — fitness-agent is running"
+            if systemctl is-active --quiet fitness-bot; then
+              echo "Deploy successful — fitness-bot is running"
             else
-              echo "fitness-agent failed to start — recent logs:"
-              journalctl -u fitness-agent -n 30 --no-pager
+              echo "fitness-bot failed to start — recent logs:"
+              journalctl -u fitness-bot -n 30 --no-pager
               exit 1
             fi
