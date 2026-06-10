@@ -10,6 +10,7 @@ from ai.training_state import (
     classify_exercise, classify_run, build_training_state,
     classify_planned_session, assess_readiness,
     recovery_intensity_band, assess_deload,
+    whoop_recovery_sessions, merge_recovery_sessions, render_recovery_block,
     PUSH, PULL, LEGS, CORE, RUN_EASY, RUN_QUALITY, RUN_LONG,
 )
 
@@ -122,6 +123,35 @@ def test_no_deload_when_recovered():
     series = [70, 72, 68, 71, 69, 74, 70, 73, 71]
     d = assess_deload(series, baseline_recovery=70)
     assert d["suggested"] is False, d
+
+
+def test_whoop_recovery_extraction():
+    wos = [
+        {"sport_id": 233, "sport_name": "Sauna", "start_date": "2026-06-09",
+         "start_utc": "2026-06-09T19:00:00.000Z", "end_utc": "2026-06-09T19:20:00.000Z"},
+        {"sport_id": 0, "sport_name": "Running", "start_date": "2026-06-09"},  # not recovery
+        {"sport_id": 88, "sport_name": "Ice Bath", "start_date": "2026-06-08",
+         "start_utc": "2026-06-08T18:00:00.000Z", "end_utc": "2026-06-08T18:05:00.000Z"},
+    ]
+    out = whoop_recovery_sessions(wos)
+    assert len(out) == 2, out
+    sauna = [o for o in out if o["session_type"] == "sauna"][0]
+    assert sauna["duration_min"] == 20 and sauna["source"] == "whoop"
+
+
+def test_recovery_merge_dedupes():
+    chat = [{"date": "2026-06-09", "session_type": "sauna", "duration_min": 20, "notes": "post-lift"}]
+    whoop = [
+        {"date": "2026-06-09", "session_type": "sauna", "duration_min": 20, "source": "whoop"},
+        {"date": "2026-06-07", "session_type": "ice_bath", "duration_min": 5, "source": "whoop"},
+    ]
+    merged = merge_recovery_sessions(chat, whoop)
+    # Sauna on 06-09 logged in both -> one row, source 'both', keeps the note.
+    assert len(merged) == 2, merged
+    sauna = [m for m in merged if m["session_type"] == "sauna"][0]
+    assert sauna["source"] == "both" and sauna.get("notes") == "post-lift"
+    # Non-empty render proves the brief would show recovery (not "zero").
+    assert "RECENT RECOVERY SESSIONS" in render_recovery_block(merged)
 
 
 if __name__ == "__main__":

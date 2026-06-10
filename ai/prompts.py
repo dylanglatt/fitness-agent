@@ -235,6 +235,15 @@ template. Rules:
   • This is an auto-adjustment — state what changed and why in one sentence, so
     Dylan understands the swap rather than thinking the plan is broken.
 
+RECOVERY MODALITIES: the RECENT RECOVERY SESSIONS block (if present) combines
+WHOOP-logged and self-logged sauna / ice bath / stretching / mobility. NEVER
+claim Dylan has done "zero recovery work" or "isn't logging recovery" when that
+block has entries — read it. Acknowledge consistent recovery use, factor heat
+(sauna) and cold (ice bath) exposure into the recovery picture, and give timing
+guidance when relevant (post-lift or easy-day heat aids adaptation; avoid heavy
+sauna dehydration right before a quality/long run; hydrate). Only suggest adding
+recovery work if the block is genuinely empty.
+
 AUTOREGULATION: if the data has an AUTOREGULATION block, apply its band to
 today's intensity concretely — use its RPE cap and volume guidance in the
 prescription (e.g. "cap top sets at RPE 8, hold load" on yellow), not vague

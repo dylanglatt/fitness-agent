@@ -413,6 +413,94 @@ def render_autoregulation_block(band: dict, deload: dict) -> str:
     return "\n".join(lines)
 
 
+# ── Recovery modalities (sauna / ice bath / stretching / etc.) ───────────────
+# WHOOP sport_id -> normalized recovery session_type. These are the passive
+# recovery activities WHOOP logs that the brief previously used only to annotate
+# runs — so they were invisible as recovery work. (Yoga/Pilates are excluded
+# on purpose: they're training, not recovery.)
+RECOVERY_SPORT_IDS = {
+    70: "meditation", 88: "ice_bath", 128: "stretching",
+    233: "sauna", 236: "compression", 237: "massage",
+}
+
+
+def whoop_recovery_sessions(whoop_workouts: list[dict]) -> list[dict]:
+    """Extract recovery-modality sessions from WHOOP workout rows.
+
+    Returns [{date, session_type, duration_min, source: 'whoop'}]. Duration is
+    derived from start/end when present.
+    """
+    out: list[dict] = []
+    for w in whoop_workouts or []:
+        sid = w.get("sport_id")
+        if sid not in RECOVERY_SPORT_IDS:
+            continue
+        dur = None
+        s, e = w.get("start_utc"), w.get("end_utc")
+        try:
+            if s and e:
+                ds = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+                de = datetime.fromisoformat(str(e).replace("Z", "+00:00"))
+                dur = round((de - ds).total_seconds() / 60.0)
+        except Exception:
+            dur = None
+        out.append({
+            "date": (w.get("start_date") or str(s or "")[:10]),
+            "session_type": RECOVERY_SPORT_IDS[sid],
+            "duration_min": dur,
+            "source": "whoop",
+        })
+    return out
+
+
+def merge_recovery_sessions(
+    chat_sessions: list[dict], whoop_sessions: list[dict]
+) -> list[dict]:
+    """Merge bot-logged and WHOOP-logged recovery, deduped by (date, type).
+
+    A session present in both places counts once (marked source 'both'); the
+    chat row wins because it carries notes/temp. Newest first.
+    """
+    def norm(t: object) -> str:
+        return str(t or "").strip().lower().replace(" ", "_")
+
+    by_key: dict[tuple, dict] = {}
+    for s in chat_sessions or []:
+        k = (str(s.get("date"))[:10], norm(s.get("session_type")))
+        row = dict(s)
+        row["source"] = "logged"
+        by_key[k] = row
+    for s in whoop_sessions or []:
+        k = (str(s.get("date"))[:10], norm(s.get("session_type")))
+        if k in by_key:
+            by_key[k]["source"] = "both"
+            if by_key[k].get("duration_min") is None:
+                by_key[k]["duration_min"] = s.get("duration_min")
+        else:
+            by_key[k] = dict(s)
+    return sorted(by_key.values(), key=lambda r: str(r.get("date")), reverse=True)
+
+
+def render_recovery_block(sessions: list[dict]) -> str:
+    """Render merged recovery sessions for the brief. '' if none."""
+    if not sessions:
+        return ""
+    lines = ["RECENT RECOVERY SESSIONS (last 14 days — WHOOP + self-logged):"]
+    for r in sessions[:20]:
+        parts = [str(r.get("date")), str(r.get("session_type"))]
+        if r.get("duration_min") is not None:
+            parts.append(f"{r['duration_min']:g} min")
+        if r.get("temp_f") is not None:
+            parts.append(f"{r['temp_f']:g}°F")
+        src = r.get("source")
+        if src and src != "logged":
+            parts.append(f"[{src}]")
+        if r.get("notes"):
+            parts.append(str(r["notes"]))
+        lines.append("  - " + " | ".join(parts))
+    return "\n".join(lines)
+
+
 def render_readiness_block(state: dict, readiness: dict) -> str:
     """Render the deterministic readiness assessment as a context block for the
     morning-brief prompt. Returns '' if there's nothing useful to say."""

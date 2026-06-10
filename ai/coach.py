@@ -1667,24 +1667,26 @@ class Coach:
             for l in earlier_lifts[:15]:
                 lines.append(f"  - {l['date']} | {l['exercise']} | {l['details']}")
 
-        # ── Recovery sessions (sauna / plunge / etc.) — last 14 days
+        # ── Recovery sessions (sauna / ice bath / stretching / etc.) — 14 days.
+        # Merge BOTH sources: bot-logged (recovery_sessions table) AND WHOOP-
+        # logged passive activities (sauna=233, ice bath=88, stretching=128, …)
+        # pulled from whoop_wos_14d, which the brief previously used only to
+        # annotate runs. Without this merge the coach wrongly reported "zero
+        # recovery work" even when WHOOP had sauna sessions on file.
         try:
-            recovery_sessions = await self.db.get_recent_recovery_sessions(days=14)
+            chat_recovery = await self.db.get_recent_recovery_sessions(days=14)
         except Exception as e:
             logger.debug(f"Could not load recovery sessions: {e}")
-            recovery_sessions = []
-        if recovery_sessions:
-            lines.append("")
-            lines.append("RECENT RECOVERY SESSIONS (self-reported, last 14 days):")
-            for r in recovery_sessions[:20]:
-                parts = [r["date"], r["session_type"]]
-                if r.get("duration_min") is not None:
-                    parts.append(f"{r['duration_min']:g} min")
-                if r.get("temp_f") is not None:
-                    parts.append(f"{r['temp_f']:g}°F")
-                if r.get("notes"):
-                    parts.append(r["notes"])
-                lines.append("  - " + " | ".join(str(p) for p in parts))
+            chat_recovery = []
+        try:
+            whoop_recovery = ts.whoop_recovery_sessions(whoop_wos_14d)
+            merged_recovery = ts.merge_recovery_sessions(chat_recovery, whoop_recovery)
+            rec_block = ts.render_recovery_block(merged_recovery)
+            if rec_block:
+                lines.append("")
+                lines.append(rec_block)
+        except Exception as e:
+            logger.warning(f"Recovery-sessions block failed (non-fatal): {e}")
 
         if notes:
             lines.append("")
