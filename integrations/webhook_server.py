@@ -209,6 +209,22 @@ async def _whoop_event(request: web.Request) -> web.Response:
                     if date:
                         await db.upsert_whoop_recovery(date, row, r)
                 logger.info("WHOOP recoveries refreshed (%d) from webhook.", len(recs))
+
+                # Recovery is computed from the main sleep — so this event is
+                # the "sleep processed" signal that the morning brief waits on.
+                # Hand off to the scheduler, which decides (window + freshness +
+                # once-per-day guard) whether to fire now. Its guards make this
+                # safe to call on every recovery event, including re-scores.
+                scheduler = request.app.get("scheduler")
+                if scheduler is not None:
+                    try:
+                        await scheduler.on_recovery_webhook()
+                    except Exception as e:
+                        logger.error(
+                            "Recovery-webhook brief trigger failed: %s",
+                            e,
+                            exc_info=True,
+                        )
             elif event_type.startswith("sleep."):
                 recs = await coach.whoop.get_sleep(days=2)
                 for r in recs:
@@ -239,12 +255,18 @@ async def _healthz(request: web.Request) -> web.Response:
 
 # ── App factory + lifecycle ──────────────────────────────────────────────────
 
-def build_app(config, db, coach) -> web.Application:
-    """Build the aiohttp Application that hosts both services' webhook routes."""
+def build_app(config, db, coach, scheduler=None) -> web.Application:
+    """Build the aiohttp Application that hosts both services' webhook routes.
+
+    `scheduler` is optional so the app can be built in tests without one; when
+    provided, the WHOOP recovery handler uses it to fire the morning brief the
+    moment recovery is scored.
+    """
     app = web.Application()
     app["config"] = config
     app["db"] = db
     app["coach"] = coach
+    app["scheduler"] = scheduler
     app["strava_verify_token"] = getattr(config, "STRAVA_WEBHOOK_VERIFY_TOKEN", "") or ""
     app["whoop_client_secret"] = getattr(config, "WHOOP_CLIENT_SECRET", "") or ""
 
@@ -257,12 +279,13 @@ def build_app(config, db, coach) -> web.Application:
 
 
 async def start_webhook_server(
-    config, db, coach
+    config, db, coach, scheduler=None
 ) -> Optional[tuple[web.AppRunner, web.TCPSite]]:
     """Start the webhook server on config.WEBHOOK_HOST:WEBHOOK_PORT.
 
     Returns (runner, site) so the caller can clean up on shutdown, or None
-    if webhooks are disabled (port 0 / unset).
+    if webhooks are disabled (port 0 / unset). `scheduler`, when passed, lets
+    the WHOOP recovery handler fire the morning brief on recovery arrival.
     """
     port = int(getattr(config, "WEBHOOK_PORT", 0) or 0)
     if port <= 0:
@@ -270,7 +293,7 @@ async def start_webhook_server(
         return None
 
     host = getattr(config, "WEBHOOK_HOST", "127.0.0.1") or "127.0.0.1"
-    app = build_app(config, db, coach)
+    app = build_app(config, db, coach, scheduler=scheduler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host=host, port=port)

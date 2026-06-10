@@ -53,7 +53,11 @@ class FitnessBot(commands.Bot):
         # refresh-token rotation is particularly unforgiving there).
         try:
             from integrations.webhook_server import start_webhook_server
-            result = await start_webhook_server(self.config, self.db, self.coach)
+            # Pass the scheduler so the WHOOP recovery webhook can fire the
+            # morning brief on sleep-processed, with the timed poll as fallback.
+            result = await start_webhook_server(
+                self.config, self.db, self.coach, self.scheduler
+            )
             if result is not None:
                 self._webhook_runner, self._webhook_site = result
         except Exception as e:

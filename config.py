@@ -77,7 +77,7 @@ class Config:
     # Daily brief is triggered by WHOOP-data-arrival inside a window, not a fixed
     # clock time — see bot/scheduler.py. These bound the window.
     DAILY_BRIEF_POLL_START: str = os.getenv("DAILY_BRIEF_POLL_START", "05:30")  # earliest fire
-    DAILY_BRIEF_BACKSTOP: str = os.getenv("DAILY_BRIEF_BACKSTOP", "10:00")      # fire no matter what
+    DAILY_BRIEF_BACKSTOP: str = os.getenv("DAILY_BRIEF_BACKSTOP", "11:30")      # fire no matter what
     TIMEZONE: str = os.getenv("TIMEZONE", "America/New_York")
     OWNER_USER_ID: int = int(os.getenv("OWNER_USER_ID", "0"))  # Your Discord user ID
 

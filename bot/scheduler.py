@@ -23,6 +23,7 @@ a windowed `now >= target` check combined with a per-day guard — so a
 single dropped tick on the 1-minute loop never causes a missed day.
 """
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 import pytz
@@ -90,6 +91,11 @@ class Scheduler:
         # briefs DM the owner directly; a shared channel is noise for a
         # personal coach.
         self._owner_user = None
+        # Serializes the "fire today's brief" decision across its two triggers
+        # — the 1-minute poll loop and the WHOOP recovery webhook. Without it,
+        # both can pass the initial already-fired check before either marks the
+        # day done, and the owner gets two identical briefs.
+        self._brief_lock = asyncio.Lock()
 
     def start(self):
         self.check_scheduled_tasks.start()
@@ -155,6 +161,24 @@ class Scheduler:
                 await self._nightly_sync()
                 await self._mark_fired_today(self._STATE_NIGHTLY, today_iso)
 
+    async def _fire_daily_brief_once(
+        self, today_iso: str, reason: str
+    ) -> bool:
+        """Fire today's brief exactly once, no matter which trigger calls.
+
+        The poll loop and the recovery webhook both race to send the morning
+        brief. This serializes them: take the lock, re-check the persisted
+        already-fired flag (the check that matters is the one INSIDE the lock),
+        send, then mark. Returns True if this call actually sent the brief,
+        False if it was already sent today.
+        """
+        async with self._brief_lock:
+            if await self._already_fired_today(self._STATE_DAILY_BRIEF, today_iso):
+                return False
+            await self._send_daily_brief(reason=reason)
+            await self._mark_fired_today(self._STATE_DAILY_BRIEF, today_iso)
+            return True
+
     async def _maybe_fire_daily_brief(self, now: datetime, today_iso: str):
         """Decide whether to fire today's brief.
 
@@ -163,6 +187,12 @@ class Scheduler:
           2. Inside window: every ~10 min, check WHOOP for a record dated
              today. If present → fire. If absent → wait.
           3. At/past backstop → fire regardless of WHOOP state.
+
+        Note: with the recovery webhook wired up (on_recovery_webhook), this
+        poll loop is the FALLBACK path — it covers the cases where the webhook
+        never arrives (bot was down at score time, WHOOP didn't push, the
+        public URL was unreachable). On a normal morning the webhook fires the
+        brief first and this loop then no-ops via the shared already-fired flag.
         """
         start_min = self.poll_start_h * 60 + self.poll_start_m
         back_min = self.backstop_h * 60 + self.backstop_m
@@ -172,9 +202,12 @@ class Scheduler:
             return  # too early
 
         if now_min >= back_min:
-            logger.info("Backstop time reached without fresh WHOOP record — firing brief anyway.")
-            await self._send_daily_brief(reason="backstop")
-            await self._mark_fired_today(self._STATE_DAILY_BRIEF, today_iso)
+            fired = await self._fire_daily_brief_once(today_iso, reason="backstop")
+            if fired:
+                logger.info(
+                    "Backstop time reached without a recovery webhook/record — "
+                    "fired brief anyway."
+                )
             return
 
         # Inside the poll window. Throttle the WHOOP check.
@@ -191,9 +224,54 @@ class Scheduler:
             fresh = False
 
         if fresh:
-            logger.info("Fresh WHOOP recovery detected for today — firing brief.")
-            await self._send_daily_brief(reason="fresh-whoop")
-            await self._mark_fired_today(self._STATE_DAILY_BRIEF, today_iso)
+            fired = await self._fire_daily_brief_once(today_iso, reason="fresh-whoop-poll")
+            if fired:
+                logger.info("Fresh WHOOP recovery detected by poll — fired brief.")
+
+    async def on_recovery_webhook(self):
+        """Fire the brief the moment WHOOP finishes scoring today's recovery.
+
+        Called by the webhook server's recovery handler. Recovery is computed
+        from your main sleep, so a recovery.* event is the real "sleep detected
+        and processed" signal — this is what lets the brief track your actual
+        wake/sync time instead of a fixed clock.
+
+        Guards (any failing → no-op, leaving the poll loop as backstop):
+          • Outside the morning window (before poll-start) — don't let a
+            midnight re-score or a late nap's recovery fire a 3 AM brief.
+          • Already fired today.
+          • The event isn't actually for today's local date (WHOOP re-scoring
+            an older recovery still sends recovery.updated).
+        """
+        now = datetime.now(self.tz)
+        today_iso = now.date().isoformat()
+
+        start_min = self.poll_start_h * 60 + self.poll_start_m
+        if now.hour * 60 + now.minute < start_min:
+            logger.info(
+                "Recovery webhook arrived before poll-start window — "
+                "leaving it to the poll loop."
+            )
+            return
+
+        if await self._already_fired_today(self._STATE_DAILY_BRIEF, today_iso):
+            return
+
+        try:
+            fresh = await self._whoop_has_today_recovery(now)
+        except Exception as e:
+            logger.warning(f"Recovery-webhook freshness check failed: {e}")
+            return
+        if not fresh:
+            logger.info(
+                "Recovery webhook fired but no recovery dated today — "
+                "likely a re-score of an older record. Ignoring."
+            )
+            return
+
+        fired = await self._fire_daily_brief_once(today_iso, reason="recovery-webhook")
+        if fired:
+            logger.info("Daily brief fired from WHOOP recovery webhook.")
 
     async def _whoop_has_today_recovery(self, now_local: datetime) -> bool:
         """Ask WHOOP whether a recovery record for today's local date exists yet.
