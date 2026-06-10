@@ -48,6 +48,7 @@ from integrations.strava import StravaClient
 from integrations.whoop import WhoopClient
 from integrations.notion import NotionClient
 from integrations.weather import WeatherClient
+from ai import training_state as ts
 
 logger = logging.getLogger(__name__)
 
@@ -1453,6 +1454,25 @@ class Coach:
             lines.append("")
             for a in adherence_lines:
                 lines.append(a)
+
+        # ── TRAINING READINESS — deterministic recency + spacing assessment.
+        # Reuses the 14-day lifts/activities already fetched above (no extra
+        # query). Classifies each lift into push/pull/legs and each run into
+        # easy/quality/long, computes days-since-last per pattern, and checks
+        # today's planned session against 48h spacing + leg/run interference.
+        # This is the engine that prevents "push two days in a row": the
+        # decision is computed here in code, and the prompt rule below forces
+        # the brief to honor it. See docs/recommendation_engine_plan.md.
+        try:
+            state = ts.build_training_state(lifts_14d, acts_14d_for_adherence, today)
+            planned = ts.classify_planned_session(locals().get("session"))
+            readiness = ts.assess_readiness(state, planned)
+            readiness_block = ts.render_readiness_block(state, readiness)
+            if readiness_block:
+                lines.append("")
+                lines.append(readiness_block)
+        except Exception as e:
+            logger.warning(f"Training-readiness block failed (non-fatal): {e}")
 
         # ── Last 7 days detail
         if daily:
