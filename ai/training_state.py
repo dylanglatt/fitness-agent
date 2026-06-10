@@ -304,6 +304,115 @@ def assess_readiness(
     return result
 
 
+# ── Autoregulation: recovery → intensity band ────────────────────────────────
+# Defaults from docs/recommendation_engine_plan.md §7 — tunable.
+GREEN_MIN = 67   # recovery score ≥ this → progress
+YELLOW_MIN = 34  # ≥ this and < GREEN_MIN → maintain; < this → easy/recovery
+HRV_SUPPRESSED_FRAC = 0.90  # HRV below 90% of baseline → suppress even if score is green
+
+
+def recovery_intensity_band(
+    recovery_score: Optional[float],
+    hrv: Optional[float] = None,
+    hrv_baseline: Optional[float] = None,
+) -> dict:
+    """Map recovery (and HRV vs baseline) to a concrete intensity prescription.
+
+    Returns {band, rpe_cap, volume, guidance}. Pure logic, unit-testable.
+    'band' ∈ green | yellow | red | unknown. When recovery hasn't synced yet
+    (common mid-morning before WHOOP finalizes), band is 'unknown' and we tell
+    the athlete to train to plan and autoregulate by feel rather than guess.
+    """
+    if recovery_score is None:
+        return {
+            "band": "unknown", "rpe_cap": None, "volume": "as planned",
+            "guidance": ("Recovery not synced yet — train to the plan and "
+                         "autoregulate by feel (leave 1–2 reps in reserve if flat)."),
+        }
+
+    if recovery_score >= GREEN_MIN:
+        band, rpe_cap, volume = "green", 9, "full"
+        guidance = "Green — progress. Add load/reps when you hit all targets with clean form."
+    elif recovery_score >= YELLOW_MIN:
+        band, rpe_cap, volume = "yellow", 8, "hold"
+        guidance = "Yellow — maintain. Cap top sets at RPE 8, hold volume, don't chase a PR."
+    else:
+        band, rpe_cap, volume = "red", 6, "reduce ~1/3"
+        guidance = ("Red — recovery priority. Keep effort easy (RPE ≤6), cut volume ~a third, "
+                    "or swap to easy aerobic / mobility.")
+
+    # HRV suppression nudge: even a green score with HRV well below baseline
+    # warrants caution (autonomic load the score may lag).
+    if (band == "green" and hrv is not None and hrv_baseline
+            and hrv < HRV_SUPPRESSED_FRAC * hrv_baseline):
+        pct = round((1 - hrv / hrv_baseline) * 100)
+        band, rpe_cap, volume = "yellow", 8, "hold"
+        guidance = (f"Score is green but HRV is ~{pct}% below baseline — treat as yellow: "
+                    "cap top sets at RPE 8, hold load. Don't override a suppressed HRV.")
+
+    return {"band": band, "rpe_cap": rpe_cap, "volume": volume, "guidance": guidance}
+
+
+# ── Deload signal ────────────────────────────────────────────────────────────
+DELOAD_GAP_POINTS = 12   # recent 7d recovery this far below baseline → fatigue
+DELOAD_LOW_SCORE = 40    # recovery at/below this counts as a "low" day
+DELOAD_LOW_DAYS = 4      # this many low days in the last 7 → deload
+
+
+def assess_deload(
+    recovery_series: list[Optional[float]],
+    baseline_recovery: Optional[float] = None,
+) -> dict:
+    """Suggest a deload from a recovery-score series (most-recent first or last —
+    order-independent; we only use the last 7 vs the prior window).
+
+    Triggers: recent 7-day average sits ≥DELOAD_GAP_POINTS below the 12-month
+    baseline AND below the prior window (accumulated fatigue), OR ≥DELOAD_LOW_DAYS
+    of the last 7 days are at/below DELOAD_LOW_SCORE. Heuristic + tunable.
+    """
+    scores = [s for s in (recovery_series or []) if s is not None]
+    if len(scores) < 5:
+        return {"suggested": False, "reason": "Not enough recovery data to assess deload."}
+
+    recent7 = scores[-7:]
+    prior = scores[:-7] if len(scores) > 7 else []
+    recent_avg = sum(recent7) / len(recent7)
+    prior_avg = (sum(prior) / len(prior)) if prior else None
+    low_days = sum(1 for s in recent7 if s <= DELOAD_LOW_SCORE)
+
+    suggested = False
+    reasons = []
+    if baseline_recovery and (baseline_recovery - recent_avg) >= DELOAD_GAP_POINTS and (
+            prior_avg is None or recent_avg <= prior_avg):
+        suggested = True
+        reasons.append(
+            f"7-day recovery avg {round(recent_avg)}% is {round(baseline_recovery - recent_avg)} "
+            f"pts below baseline ({round(baseline_recovery)}%) and not improving")
+    if low_days >= DELOAD_LOW_DAYS:
+        suggested = True
+        reasons.append(f"{low_days} of the last 7 days at/below {DELOAD_LOW_SCORE}% recovery")
+
+    return {
+        "suggested": suggested,
+        "reason": ("; ".join(reasons) if suggested
+                   else f"Recovery holding (7-day avg {round(recent_avg)}%) — no deload needed."),
+        "recent_avg": round(recent_avg, 1),
+        "prior_avg": round(prior_avg, 1) if prior_avg is not None else None,
+    }
+
+
+def render_autoregulation_block(band: dict, deload: dict) -> str:
+    """Render the autoregulation band + deload signal for the brief prompt."""
+    lines = ["AUTOREGULATION (computed — apply to today's intensity):"]
+    cap = f", cap RPE {band['rpe_cap']}" if band.get("rpe_cap") else ""
+    lines.append(f"  Recovery band: {band['band'].upper()} (volume {band['volume']}{cap})")
+    lines.append(f"    {band['guidance']}")
+    if deload.get("suggested"):
+        lines.append(f"  DELOAD SUGGESTED: {deload['reason']}.")
+        lines.append("    Cut volume ~40–50% this week or insert easy days; keep movement, drop fatigue.")
+    return "\n".join(lines)
+
+
 def render_readiness_block(state: dict, readiness: dict) -> str:
     """Render the deterministic readiness assessment as a context block for the
     morning-brief prompt. Returns '' if there's nothing useful to say."""

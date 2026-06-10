@@ -235,6 +235,13 @@ template. Rules:
   • This is an auto-adjustment — state what changed and why in one sentence, so
     Dylan understands the swap rather than thinking the plan is broken.
 
+AUTOREGULATION: if the data has an AUTOREGULATION block, apply its band to
+today's intensity concretely — use its RPE cap and volume guidance in the
+prescription (e.g. "cap top sets at RPE 8, hold load" on yellow), not vague
+"listen to your body" language. If a DELOAD is suggested, call it: prescribe a
+lighter week and say why. If the band is UNKNOWN (recovery not synced), train to
+plan and tell Dylan to autoregulate by feel.
+
 TODAY'S PRESCRIPTION COMES FROM THE ACTIVE PLAN, NOT FROM SCRATCH.
 
 If the data contains an ACTIVE PLAN block, that block defines today's

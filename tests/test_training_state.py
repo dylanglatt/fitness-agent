@@ -9,6 +9,7 @@ from datetime import date
 from ai.training_state import (
     classify_exercise, classify_run, build_training_state,
     classify_planned_session, assess_readiness,
+    recovery_intensity_band, assess_deload,
     PUSH, PULL, LEGS, CORE, RUN_EASY, RUN_QUALITY, RUN_LONG,
 )
 
@@ -94,6 +95,33 @@ def test_recency_picks_latest_date():
     state = build_training_state(lifts, [], TODAY)
     assert state["patterns"][PUSH]["days_ago"] == 1
     assert state["patterns"][PUSH]["count_7d"] == 2
+
+
+def test_recovery_bands():
+    assert recovery_intensity_band(80)["band"] == "green"
+    assert recovery_intensity_band(50)["band"] == "yellow"
+    assert recovery_intensity_band(50)["rpe_cap"] == 8
+    assert recovery_intensity_band(20)["band"] == "red"
+    assert recovery_intensity_band(None)["band"] == "unknown"
+
+
+def test_hrv_suppression_downgrades_green():
+    # Green score but HRV 20% below baseline -> treated as yellow.
+    b = recovery_intensity_band(75, hrv=60.0, hrv_baseline=75.0)
+    assert b["band"] == "yellow", b
+
+
+def test_deload_triggers_on_low_recovery_run():
+    # Many low days in the last week -> deload.
+    series = [70, 68, 65, 38, 35, 39, 33, 40, 36]  # last 7 mostly ≤40
+    d = assess_deload(series, baseline_recovery=68)
+    assert d["suggested"] is True, d
+
+
+def test_no_deload_when_recovered():
+    series = [70, 72, 68, 71, 69, 74, 70, 73, 71]
+    d = assess_deload(series, baseline_recovery=70)
+    assert d["suggested"] is False, d
 
 
 if __name__ == "__main__":

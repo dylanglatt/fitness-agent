@@ -1474,6 +1474,39 @@ class Coach:
         except Exception as e:
             logger.warning(f"Training-readiness block failed (non-fatal): {e}")
 
+        # ── AUTOREGULATION — recovery→intensity band + deload signal (Phase 3).
+        # Today's recovery often hasn't synced at brief time, so fall back to
+        # the most recent logged score; the band reports UNKNOWN if neither
+        # exists. Deload reads the 28-day recovery series vs the 12-mo baseline.
+        try:
+            today_rec_score = None
+            today_hrv = None
+            try:
+                _snap_rec = (snap.get("recovery") or {}).get("score") or {}
+                today_rec_score = _snap_rec.get("recovery_score")
+                today_hrv = _snap_rec.get("hrv_rmssd_milli")
+            except Exception:
+                pass
+            if today_rec_score is None:
+                for r in (daily or []):  # most recent available
+                    if r.get("recovery_score") is not None:
+                        today_rec_score = r.get("recovery_score")
+                        today_hrv = today_hrv or r.get("hrv_rmssd_ms")
+                        break
+            hrv_baseline = (agg365 or {}).get("avg_hrv")
+            baseline_rec = (agg365 or {}).get("avg_recovery")
+            band = ts.recovery_intensity_band(today_rec_score, today_hrv, hrv_baseline)
+            deload = ts.assess_deload(
+                [r.get("recovery_score") for r in (daily_28 or [])],
+                baseline_rec,
+            )
+            autoreg_block = ts.render_autoregulation_block(band, deload)
+            if autoreg_block:
+                lines.append("")
+                lines.append(autoreg_block)
+        except Exception as e:
+            logger.warning(f"Autoregulation block failed (non-fatal): {e}")
+
         # ── Last 7 days detail
         if daily:
             lines.append("")
@@ -1687,6 +1720,25 @@ class Coach:
 
     async def daily_brief(self) -> str:
         context = await self._build_layered_context()
+
+        # Phase 4 — ground the recommendation in the fitness-literature base.
+        # The brief decision space is hybrid programming, so retrieve principles
+        # on concurrent-training interference, recovery spacing, autoregulation,
+        # progression and deloads. No-op (empty string) if the knowledge base
+        # isn't ingested. Appended to context so no prompt-template change is
+        # needed. Add more sources via knowledge/*.md + ingest_knowledge.py.
+        try:
+            knowledge = self._retrieve_knowledge(
+                "Programming a balanced hybrid training week: concurrent-training "
+                "interference between strength and endurance, spacing muscle groups "
+                "~48h for recovery, autoregulating intensity by HRV and recovery "
+                "score, progressive overload, and when to deload."
+            )
+            if knowledge:
+                context = f"{context}\n\n{knowledge}"
+        except Exception as e:
+            logger.warning(f"Brief knowledge retrieval failed (non-fatal): {e}")
+
         stoic_quote = get_daily_stoic_quote()
         prompt = DAILY_BRIEF_PROMPT.format(data=context, stoic_quote=stoic_quote)
         brief = await self._ask_claude(prompt, allow_tools=False, caller="daily_brief")
