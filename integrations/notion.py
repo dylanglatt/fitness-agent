@@ -884,13 +884,33 @@ class NotionClient:
         result = {"lifts": 0, "activities": 0}
         since = (datetime.now().date() - timedelta(days=days)).isoformat()
 
+        # Fetch the recent Lifts pages ONCE. We read TWO marker types out of
+        # them:
+        #   [liftrow:<id>] → lift dedup (below)
+        #   [strava:<id>]  → Strava 'WeightTraining' activities are routed to
+        #                    the LIFTS DB by log_strava_activity (not Runs), so
+        #                    their dedup markers live here. The Strava dedup
+        #                    further down MUST see them, or every nightly run
+        #                    re-creates a fresh WeightTraining row — the
+        #                    compounding-duplicate bug found in the June 2026
+        #                    audit ("Lunch Weight Training" copied once per
+        #                    night across the 7-day window).
+        lift_pages: list[dict] = []
+        if self.is_configured_lifts():
+            lift_pages = await self._query_pages_since(
+                self.lifts_db_id, "Date", since
+            )
+
+        existing_strava_in_lifts: set[str] = set()
+        for page in lift_pages:
+            for m in _STRAVA_MARKER.finditer(self._notes_text(page)):
+                existing_strava_in_lifts.add(m.group(1))
+
         # ── Lifts ───────────────────────────────────────────────────────────
         if self.is_configured_lifts():
             # 1. What's already in Notion (by [liftrow:<id>] marker)?
             existing_lift_ids: set[int] = set()
-            for page in await self._query_pages_since(
-                self.lifts_db_id, "Date", since
-            ):
+            for page in lift_pages:
                 text = self._notes_text(page)
                 for m in _LIFTROW_MARKER.finditer(text):
                     try:
@@ -927,7 +947,9 @@ class NotionClient:
 
         # ── Strava activities ───────────────────────────────────────────────
         if self.is_configured_runs():
-            existing_strava_ids: set[str] = set()
+            # Seed with the [strava:<id>] markers already found in the Lifts DB
+            # (WeightTraining lands there) so we don't re-create those rows.
+            existing_strava_ids: set[str] = set(existing_strava_in_lifts)
             for page in await self._query_pages_since(
                 self.runs_db_id, "Date", since
             ):

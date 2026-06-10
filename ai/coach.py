@@ -2115,15 +2115,43 @@ class Coach:
         # to 1 — see the May 2026 blank-row batch and the `inherited_exercise`
         # branch in _try_parse_lift for the full rationale.
         recent_lift_context: list[dict] = []
+        today_sets_by_exercise: dict[str, dict] = {}
+        today_iso = datetime.now().strftime("%Y-%m-%d")
         try:
-            today_iso = datetime.now().strftime("%Y-%m-%d")
             today_sets = await self.db.get_lift_sets_for_date(today_iso)
-            # Most-recent first; the parser uses the top 1–2 only.
+            # Most-recent first; the parser uses the top rows to resolve
+            # "same thing" / "another set".
             recent_lift_context = list(reversed(today_sets))[:4]
+            # Per-exercise rollup of EVERYTHING done today (one compact entry
+            # per exercise). Unlike the 4-row window above, this never rolls
+            # off — so the parser can still inherit an exercise done earlier in
+            # the session, and we compute the next set number deterministically
+            # below instead of letting the model guess (the cause of the
+            # duplicate "Set 1" rows in the June 2026 audit).
+            for s in today_sets:  # chronological (ORDER BY id ASC)
+                name = (s.get("exercise") or "").strip()
+                if not name:
+                    continue
+                e = today_sets_by_exercise.setdefault(
+                    name.lower(),
+                    {"exercise": name, "sets_done": 0, "max_set": 0,
+                     "last_weight_lb": None, "last_reps": None},
+                )
+                e["sets_done"] += 1
+                e["max_set"] = max(e["max_set"], s.get("set_number") or 0)
+                e["last_weight_lb"] = s.get("weight_lb")
+                e["last_reps"] = s.get("reps")
         except Exception as e:
-            logger.debug(f"recent_lift_context lookup failed (non-fatal): {e}")
+            logger.warning(
+                f"recent_lift_context lookup failed (degrades set inheritance "
+                f"and numbering): {e}"
+            )
 
-        lift = await self._try_parse_lift(message, recent_context=recent_lift_context)
+        lift = await self._try_parse_lift(
+            message,
+            recent_context=recent_lift_context,
+            today_summary=list(today_sets_by_exercise.values()),
+        )
         # Guard: only log when Haiku found at least one structured number.
         # Without this, conversational mentions like "what's my leg lift
         # today, main lift being trap bar deadlift" produce phantom rows
@@ -2156,42 +2184,39 @@ class Coach:
             # The backfill script handles richer non-uniform shapes when they
             # show up in raw_message.
             explicit_set = lift.get("set_number")
+            # How many sets of THIS exercise are already logged today? Set
+            # numbers continue from here instead of resetting to 1 — a bare
+            # "weight x reps" mid-exercise becomes the next set, not a duplicate
+            # Set 1, and a block log ("bench 3x10") expands to the next N
+            # consecutive sets. Match case-insensitively against the rollup.
+            already_done = today_sets_by_exercise.get(
+                (lift["exercise"] or "").strip().lower(), {}
+            ).get("max_set", 0)
+            if explicit_set is not None and explicit_set > 0:
+                # User named a specific set ("2nd set ...") — honor it verbatim
+                # so they can correct/overwrite a mis-logged set.
+                set_numbers = [explicit_set]
+            else:
+                n_sets = lift.get("sets") or 1
+                set_numbers = [already_done + i for i in range(1, n_sets + 1)]
             chat_set_records: list[dict] = []
             try:
-                if explicit_set is not None and explicit_set > 0:
+                for sn in set_numbers:
                     set_db_id = await self.db.log_lift_set(
                         lift_id=lift_id,
-                        date=datetime.now().strftime("%Y-%m-%d"),
+                        date=today_iso,
                         exercise=lift["exercise"],
-                        set_number=explicit_set,
+                        set_number=sn,
                         reps=lift.get("reps"),
                         weight_lb=lift.get("weight_lb"),
                         source="chat",
                     )
                     chat_set_records.append({
                         "set_db_id": set_db_id,
-                        "set_number": explicit_set,
+                        "set_number": sn,
                         "reps": lift.get("reps"),
                         "weight_lb": lift.get("weight_lb"),
                     })
-                else:
-                    n_sets = lift.get("sets") or 1
-                    for s in range(1, n_sets + 1):
-                        set_db_id = await self.db.log_lift_set(
-                            lift_id=lift_id,
-                            date=datetime.now().strftime("%Y-%m-%d"),
-                            exercise=lift["exercise"],
-                            set_number=s,
-                            reps=lift.get("reps"),
-                            weight_lb=lift.get("weight_lb"),
-                            source="chat",
-                        )
-                        chat_set_records.append({
-                            "set_db_id": set_db_id,
-                            "set_number": s,
-                            "reps": lift.get("reps"),
-                            "weight_lb": lift.get("weight_lb"),
-                        })
             except Exception as e:
                 logger.warning(
                     "lift_sets expansion failed for %s (sets=%s, explicit_set=%s): %s — "
@@ -2261,6 +2286,16 @@ class Coach:
                             type(e).__name__, rec["set_number"], e,
                         )
 
+        elif _LIFT_HINT.search(message or ""):
+            # The message tripped the lift pre-filter (numbers / lift keywords)
+            # but nothing was logged — parser returned None, is_lift=false, or a
+            # parse with no usable number. Surface it so silent drops are
+            # debuggable and a future alerts channel has signal to send.
+            logger.info(
+                "Lift-like message NOT logged: %r (parsed=%s)",
+                message[:100], bool(lift),
+            )
+
         # Recovery session logging runs independently — a single message can
         # describe both a lift AND a post-lift sauna.
         recovery = await self._try_parse_recovery_session(message)
@@ -2315,6 +2350,7 @@ class Coach:
         self,
         message: str,
         recent_context: Optional[list[dict]] = None,
+        today_summary: Optional[list[dict]] = None,
     ) -> dict | None:
         """Fast pre-filter: if the message has no numbers or lift keywords, skip
         the model call entirely. Saves roughly one Claude round-trip per chat.
@@ -2363,6 +2399,25 @@ class Coach:
                     f"{json.dumps(trimmed, indent=2)}\n"
                 )
 
+        # Full per-exercise rollup of everything done earlier today. This does
+        # NOT roll off like the 2-row window above, so the model can inherit an
+        # exercise the user names again ("back to overhead press") even after
+        # several other exercises. Keep it to one compact line each.
+        summary_block = ""
+        if today_summary:
+            compact = [
+                f'{e.get("exercise")} — {e.get("sets_done")} set(s) done, '
+                f'last {e.get("last_weight_lb")}lb x {e.get("last_reps")}'
+                for e in today_summary
+                if (e.get("exercise") or "").strip()
+            ]
+            if compact:
+                summary_block = (
+                    "\nExercises already done earlier today:\n  - "
+                    + "\n  - ".join(compact)
+                    + "\n"
+                )
+
         # Prompt tightened so Haiku returns numbers we can put straight into
         # number columns. Unit note is critical — "135" in a bench context
         # is pounds in the US; the model defaults to whatever the message
@@ -2371,7 +2426,7 @@ class Coach:
 Does this message describe a weightlifting exercise? If yes, extract the structured fields.
 
 Message: "{message}"
-{ctx_block}
+{ctx_block}{summary_block}
 Respond with JSON ONLY. Schema:
 {{
   "is_lift": true | false,
@@ -2394,9 +2449,16 @@ Rules:
   • CONTEXT INHERITANCE: if the message names a set number ("2nd set",
     "set 3", "another set", "same thing", "same weight") but does NOT name
     the exercise, inherit the exercise from the most recent entry in Recent
-    lifts. Set "inherited_exercise": true. If Recent lifts is empty AND the
-    message doesn't name the exercise, return {{"is_lift": false}} —
-    DO NOT guess. A blank-exercise log is worse than no log.
+    lifts. Set "inherited_exercise": true. If the user names an exercise they
+    already did earlier (e.g. "back to overhead press", "more bench") match it
+    against "Exercises already done earlier today" and use that exact name.
+    If Recent lifts is empty AND the message doesn't name the exercise, return
+    {{"is_lift": false}} — DO NOT guess. A blank-exercise log is worse than no
+    log.
+  • DO NOT infer a set number. Leave "set_number" null unless the user
+    EXPLICITLY names one ("2nd set", "set 3"). The app assigns the running set
+    number from what's already logged today; a guessed "1" creates a duplicate
+    Set 1.
   • If the message describes a lift but you can't confidently pin a field, set it to null.
   • For push/pull/legs: Bench/OHP/Dips/Push-ups = Push. Rows/Pull-ups/Chin-ups/Curls = Pull.
     Squat/Deadlift/Lunge/Leg press = Legs. Core/accessory/mixed = Other.
@@ -2466,7 +2528,10 @@ Rules:
                 "workout": data.get("workout") if data.get("workout") in ("Push", "Pull", "Legs", "Other") else None,
             }
         except Exception as e:
-            logger.debug(f"Lift parse failed: {e}")
+            logger.warning(
+                "Lift parse failed for %r: %s — message not logged.",
+                message[:100], e,
+            )
         return None
 
     # ── Recovery-session parsing (sauna / cold plunge / etc.) ───────────────
@@ -3147,6 +3212,19 @@ Rules:
             lines.append(
                 f"  Currently on: {ex['name']} (set {set_idx + 1}/{ex['sets']})"
             )
+        # Completed sets so far this session — so 'what have I done?' mid-workout
+        # is answered from the actual log, not guessed. The session history is
+        # otherwise invisible to the chat context.
+        done = [h for h in (session.get("history") or []) if not h.get("skipped")]
+        if done:
+            lines.append("  Done so far this session:")
+            for h in done:
+                w = h.get("weight_lb")
+                r = h.get("reps")
+                lines.append(
+                    f"    - {h.get('exercise')} set {h.get('set')}: "
+                    f"{w if w is not None else '?'}lb x {r if r is not None else '?'}"
+                )
         remaining = exercises[ex_idx:]
         if remaining:
             lines.append("  Remaining: " + ", ".join(

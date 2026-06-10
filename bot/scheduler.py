@@ -472,20 +472,18 @@ class Scheduler:
                 f"{count_c} cycles, {count_w} workouts."
             )
 
-            # Strava: walk back 2 days to catch edits/delayed uploads.
-            # Webhooks handle everything fresh; this is the safety net only.
-            # We enrich each activity with /activities/{id} + zones so HR
-            # data lands even when this safety-net path is what wrote the row.
-            #
-            # Before today, this loop wrote to SQLite only — so if the Strava
-            # webhook ever missed a delivery, the activity would land in
-            # SQLite at 3:05am but never reach Notion. The nightly sync is
-            # the safety net for everything downstream, including Notion,
-            # so we now push to Notion here too (best-effort: a Notion
-            # failure must never break the SQLite-side sync).
+            # Strava: walk back 2 days to catch edits/delayed uploads and
+            # upsert into SQLite. We deliberately do NOT push to Notion from
+            # this loop. log_strava_activity always CREATES a new page (no
+            # by-marker idempotency), so an unconditional write here produced a
+            # duplicate row every night — and reconcile_recent only SKIPS rows
+            # already present, it never removes the dupes this loop created
+            # (the compounding "Lunch Weight Training" duplicates in the June
+            # 2026 audit). Notion writes now flow through reconcile_recent
+            # below, the single dedup-aware writer. Webhooks still mirror fresh
+            # activities to Notion in real time.
             after_ts = int((now - timedelta(days=2)).timestamp())
             count_a = 0
-            count_notion = 0
             async for act in self.coach.strava.iter_all_activities(after=after_ts):
                 try:
                     act = await self.coach.strava.enrich_activity(act)
@@ -495,22 +493,6 @@ class Scheduler:
                     )
                 await db.upsert_strava_activity(act)
                 count_a += 1
-                # Mirror to Notion. log_strava_activity embeds [strava:<id>]
-                # in the Notes field, so writing twice produces two visible
-                # rows — that's why we ALSO run the reconciliation pass,
-                # which dedupes by that marker. Here we just take the
-                # cheapest swing: if Notion is up, write it.
-                try:
-                    whoop_match = await db.find_whoop_workout_for_strava_activity(act)
-                    notion_ok = await self.coach.notion.log_strava_activity(
-                        act, whoop_workout=whoop_match
-                    )
-                    if notion_ok:
-                        count_notion += 1
-                except Exception as e:
-                    logger.warning(
-                        f"Nightly Notion push failed for activity {act.get('id')}: {e}"
-                    )
             await db.set_sync_state(
                 "strava",
                 datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -518,8 +500,8 @@ class Scheduler:
                 note="nightly",
             )
             logger.info(
-                f"Strava nightly sync: {count_a} activities touched, "
-                f"{count_notion} mirrored to Notion."
+                f"Strava nightly sync: {count_a} activities upserted to SQLite "
+                f"(Notion writes handled by reconciliation below)."
             )
 
             # ── Notion reconciliation — fills any gaps the real-time

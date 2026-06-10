@@ -215,6 +215,11 @@ questions over a date range, query_correlated_runs is the right call.
 DAILY_BRIEF_PROMPT = """
 Generate Dylan's morning brief based on the data below.
 
+DATE: Use the exact date from the "TODAY:" line in the data verbatim —
+weekday, month, day, and year. Do not infer, compute, or adjust the weekday
+or day number; copy what TODAY: says. (Past briefs occasionally stated the
+wrong day, e.g. "Monday, June 9" when June 9 was a Tuesday.)
+
 TODAY'S PRESCRIPTION COMES FROM THE ACTIVE PLAN, NOT FROM SCRATCH.
 
 If the data contains an ACTIVE PLAN block, that block defines today's
