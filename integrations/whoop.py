@@ -7,23 +7,23 @@ import httpx
 import logging
 import os
 import re
+import tempfile
 from datetime import datetime, timedelta
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# v2 keeps the version in the path — base is /developer, endpoints live under /v2/...
 WHOOP_BASE = "https://api.prod.whoop.com/developer"
 TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
 
 
+class WhoopAuthError(Exception):
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def _persist_refresh_token_to_env(new_token: str) -> None:
-    """
-    WHOOP rotates refresh tokens — every successful refresh invalidates the old
-    one and returns a new one. If we don't persist it, the bot will fail on the
-    NEXT restart with a 400 Bad Request because .env still holds the consumed
-    token. This rewrites WHOOP_REFRESH_TOKEN in .env in place.
-    """
     env_path = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"
     )
@@ -36,10 +36,19 @@ def _persist_refresh_token_to_env(new_token: str) -> None:
             content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
         else:
             content += f"\n{replacement}\n"
-        with open(env_path, "w") as f:
-            f.write(content)
+
+        dir_name = os.path.dirname(env_path)
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".env.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, env_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
     except Exception as e:
-        # Don't crash the bot if we can't write the file — just warn loudly.
         logger.error(
             f"Could not persist rotated WHOOP refresh token to .env: {e}. "
             f"Bot will work this session but will 400 on next restart."
@@ -71,9 +80,14 @@ class WhoopClient:
                 "client_secret": self.client_secret,
                 "refresh_token": self.refresh_token,
                 "grant_type": "refresh_token",
-                # v2 requires the same scopes we originally authorized with;
-                # omitting 'scope' here lets WHOOP return the token's existing scopes.
             })
+            if resp.status_code == 400:
+                raise WhoopAuthError(
+                    "WHOOP refresh token rejected (400). The stored token is "
+                    "consumed or expired and cannot self-heal. Re-authorize with "
+                    "`python whoop_auth.py`, then restart the bot.",
+                    status_code=400,
+                )
             resp.raise_for_status()
             data = resp.json()
             self._access_token = data["access_token"]

@@ -45,7 +45,7 @@ from ai.prompts import (
     get_daily_stoic_quote,
 )
 from integrations.strava import StravaClient
-from integrations.whoop import WhoopClient
+from integrations.whoop import WhoopClient, WhoopAuthError
 from integrations.notion import NotionClient
 from integrations.weather import WeatherClient
 from ai import training_state as ts
@@ -1113,6 +1113,12 @@ class Coach:
                 lines.append(f"  {rec_line}")
             if slp_line:
                 lines.append(f"  {slp_line}")
+        except WhoopAuthError as e:
+            logger.error(f"WHOOP auth failed: {e}")
+            lines.append(
+                "  ⚠️ WHOOP not connected — refresh token rejected. "
+                "Run `python whoop_auth.py` and restart to restore recovery data."
+            )
         except Exception as e:
             logger.debug(f"Tiered context: live WHOOP snapshot unavailable: {e}")
 
@@ -1334,6 +1340,12 @@ class Coach:
             slp_line = self.whoop.summarize_sleep(snap.get("sleep"))
             lines.append(f"  {rec_line}")
             lines.append(f"  {slp_line}")
+        except WhoopAuthError as e:
+            logger.error(f"WHOOP auth failed: {e}")
+            lines.append(
+                "  ⚠️ WHOOP not connected — refresh token rejected. "
+                "Run `python whoop_auth.py` and restart to restore recovery data."
+            )
         except Exception as e:
             logger.warning(f"Live WHOOP snapshot unavailable, falling back to DB: {e}")
             # Fall back to whatever is in SQLite for today
