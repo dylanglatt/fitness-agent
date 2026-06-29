@@ -7,3 +7,6 @@ pytz>=2024.1
 # aiohttp hosts the Strava + WHOOP webhook receiver (co-located in the same
 # event loop as the Discord bot; see integrations/webhook_server.py).
 aiohttp>=3.9.0
+# FastAPI service (api_server.py) — backend for the Coach Aurelius iOS app.
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0

@@ -114,6 +114,48 @@ def update_env(key, value):
     print(f"  ✅ Updated {key} in .env")
 
 
+def update_db_token(refresh_token):
+    """Persist the fresh refresh token into the bot's durable oauth_tokens
+    store. The running bot reads its WHOOP token from the DB (the DB copy wins
+    over .env), so a re-auth that only updated .env would be silently ignored
+    — the stale DB token would keep getting used and keep 400-ing. Writing here
+    too keeps the two in sync. Uses stdlib sqlite3 so this script stays
+    dependency-light and synchronous.
+    """
+    import sqlite3
+    db_path = os.getenv("DB_PATH", "data/fitness_agent.db")
+    db_path = os.path.join(os.path.dirname(__file__), db_path)
+    if not os.path.exists(db_path):
+        print(f"  ⚠️  DB not found at {db_path} — skipping DB token write. "
+              f"It will migrate from .env on next bot start.")
+        return
+    try:
+        con = sqlite3.connect(db_path)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS oauth_tokens (
+                provider TEXT PRIMARY KEY,
+                refresh_token TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        con.execute(
+            """
+            INSERT INTO oauth_tokens (provider, refresh_token, updated_at)
+            VALUES ('whoop', ?, datetime('now'))
+            ON CONFLICT(provider) DO UPDATE SET
+                refresh_token=excluded.refresh_token,
+                updated_at=excluded.updated_at
+            """,
+            (refresh_token,),
+        )
+        con.commit()
+        con.close()
+        print("  ✅ Updated WHOOP token in DB store (oauth_tokens)")
+    except Exception as e:
+        print(f"  ⚠️  Could not write token to DB ({e}). "
+              f".env is updated; restart the bot to migrate it.")
+
+
 def main():
     if not CLIENT_ID or not CLIENT_SECRET:
         print("ERROR: WHOOP_CLIENT_ID and WHOOP_CLIENT_SECRET must be set in your .env")
@@ -190,9 +232,10 @@ def main():
         print(f"⚠️  Refresh token test: {result.get('error_description', result)}")
         print("   (The bot will still work — it'll use the access token until it can refresh)")
 
-    # Save to .env
-    print("\nSaving to .env...")
+    # Save to .env AND the durable DB store (the bot prefers the DB copy).
+    print("\nSaving token...")
     update_env("WHOOP_REFRESH_TOKEN", refresh_token)
+    update_db_token(refresh_token)
 
     print("\n✅ Done! Restart the bot with: python main.py")
 

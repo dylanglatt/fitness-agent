@@ -27,6 +27,10 @@ class Database:
     async def initialize(self):
         """Create tables if they don't exist."""
         async with aiosqlite.connect(self.db_path) as db:
+            # WAL mode: lets the bot and the API server (api_server.py) read and
+            # write the same SQLite file concurrently without "database is
+            # locked" errors. Persists at the DB level once set.
+            await db.execute("PRAGMA journal_mode=WAL")
             # ── Original tables (unchanged) ─────────────────────────────────
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS lifts (
@@ -371,6 +375,22 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_llm_calls_ts_caller "
                 "ON llm_calls(timestamp, caller)"
             )
+            # oauth_tokens: durable, single-source store for rotating refresh
+            # tokens (currently WHOOP, which mints a NEW refresh token on every
+            # exchange and invalidates the old one). Previously the WHOOP token
+            # lived only in .env and was rewritten on each rotation — fragile:
+            # a failed write, or two processes (laptop checkout + VPS) sharing
+            # one token, would consume it and 400 the loser permanently, which
+            # is exactly how sync silently died for ~2 months. The DB is the
+            # authoritative copy now; .env is only a one-time seed for the
+            # first migration. provider is the PK ('whoop').
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS oauth_tokens (
+                    provider TEXT PRIMARY KEY,
+                    refresh_token TEXT NOT NULL,
+                    updated_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
             await db.commit()
         # Seed a default balanced-concurrent plan if no plan exists yet.
         await self._seed_default_plan_if_empty()
@@ -1004,6 +1024,38 @@ class Database:
             ) as cursor:
                 row = await cursor.fetchone()
         return dict(row) if row else None
+
+    # ── OAuth token store (durable, single-source) ──────────────────────────
+
+    async def get_oauth_token(self, provider: str) -> Optional[str]:
+        """Return the stored refresh token for `provider`, or None if unset.
+
+        None means "fall back to the .env seed" on first run — see
+        WhoopClient._load_token_from_store.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT refresh_token FROM oauth_tokens WHERE provider = ?",
+                (provider,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return row[0] if row and row[0] else None
+
+    async def set_oauth_token(self, provider: str, refresh_token: str) -> None:
+        """Upsert the refresh token for `provider`. Called on every WHOOP
+        rotation so the freshest token survives a restart."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO oauth_tokens (provider, refresh_token, updated_at)
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(provider) DO UPDATE SET
+                    refresh_token=excluded.refresh_token,
+                    updated_at=excluded.updated_at
+                """,
+                (provider, refresh_token),
+            )
+            await db.commit()
 
     # ── Read queries for layered context + Claude tool use ──────────────────
 

@@ -56,21 +56,66 @@ def _persist_refresh_token_to_env(new_token: str) -> None:
 
 
 class WhoopClient:
-    def __init__(self, config):
+    def __init__(self, config, db=None):
         self.client_id = config.WHOOP_CLIENT_ID
         self.client_secret = config.WHOOP_CLIENT_SECRET
+        # Seed from .env. If a db is provided, the DB copy (when present) wins
+        # on first use — see _load_token_from_store. Standalone scripts that
+        # construct WhoopClient(config) with no db keep the old .env behavior.
         self.refresh_token = config.WHOOP_REFRESH_TOKEN
+        self.db = db
+        self._token_loaded = False
         self._access_token: Optional[str] = None
         self._token_expires_at: int = 0
+
+    async def _load_token_from_store(self):
+        """Load the refresh token from the durable DB store, once per process.
+
+        WHOOP rotates the refresh token on every exchange, so the authoritative
+        copy is whatever was last persisted — which lives in the DB, not .env.
+        On the very first run after this change the DB is empty, so we migrate
+        the .env seed into it. Without a db (scripts), this is a no-op and the
+        .env value stands.
+        """
+        if self._token_loaded or self.db is None:
+            self._token_loaded = True
+            return
+        try:
+            stored = await self.db.get_oauth_token("whoop")
+            if stored:
+                self.refresh_token = stored
+            elif self.refresh_token:
+                # First-run migration: persist the .env seed so all future
+                # rotations are DB-backed.
+                await self.db.set_oauth_token("whoop", self.refresh_token)
+                logger.info("Migrated WHOOP refresh token from .env into the DB store.")
+        except Exception as e:
+            logger.warning(f"Could not load WHOOP token from DB store: {e}")
+        self._token_loaded = True
+
+    async def _persist_refresh_token(self, token: str) -> None:
+        """Persist a rotated refresh token to the durable store (DB if we have
+        one, else .env as a fallback for db-less scripts)."""
+        if self.db is not None:
+            try:
+                await self.db.set_oauth_token("whoop", token)
+                return
+            except Exception as e:
+                logger.error(
+                    f"Could not persist rotated WHOOP token to DB: {e}. "
+                    f"Falling back to .env."
+                )
+        _persist_refresh_token_to_env(token)
 
     async def _ensure_token(self):
         """Refresh access token if expired.
 
         WHOOP rotates refresh tokens on every exchange, so we must capture the
         new refresh_token from the response, update our in-memory copy, AND
-        persist it to .env so the next process start doesn't use a consumed
-        token and hit 400 Bad Request.
+        persist it to the durable store so the next process start doesn't use a
+        consumed token and hit 400 Bad Request.
         """
+        await self._load_token_from_store()
         if self._access_token and datetime.utcnow().timestamp() < self._token_expires_at - 60:
             return
 
@@ -98,7 +143,7 @@ class WhoopClient:
             new_refresh = data.get("refresh_token")
             if new_refresh and new_refresh != self.refresh_token:
                 self.refresh_token = new_refresh
-                _persist_refresh_token_to_env(new_refresh)
+                await self._persist_refresh_token(new_refresh)
                 logger.info("WHOOP token refreshed (refresh token rotated and persisted).")
             else:
                 logger.info("WHOOP token refreshed.")

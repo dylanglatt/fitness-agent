@@ -34,6 +34,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import anthropic
+import pytz
 
 from ai.prompts import (
     SYSTEM_PROMPT,
@@ -132,6 +133,21 @@ async def _log_claude_call(db, *, caller: str, model: str, response) -> None:
         cache_creation_tokens=cache_create,
         cost_usd=cost,
     )
+
+
+# ── Time formatting ─────────────────────────────────────────────────────────
+def _fmt_time(dt: datetime) -> str:
+    """Human-friendly local time, e.g. '2:05 PM EDT'.
+
+    Strips the leading zero from the hour (strftime gives '02:05') and
+    includes the tz abbreviation so the model knows the clock is local to
+    Dylan, not UTC.
+    """
+    s = dt.strftime("%I:%M %p")
+    if s.startswith("0"):
+        s = s[1:]
+    tz = dt.strftime("%Z")
+    return f"{s} {tz}".strip()
 
 
 # ── Unit helpers (user prefers miles/pounds) ────────────────────────────────
@@ -443,7 +459,9 @@ class Coach:
         self.config = config
         self.db = db
         self.strava = StravaClient(config)
-        self.whoop = WhoopClient(config)
+        # Pass db so the rotating WHOOP refresh token persists to the durable
+        # oauth_tokens store instead of racing on .env across processes.
+        self.whoop = WhoopClient(config, db)
         self.notion = NotionClient(config)
         self.weather = WeatherClient(config)
         self.claude = anthropic.AsyncAnthropic(api_key=config.ANTHROPIC_API_KEY)
@@ -466,6 +484,35 @@ class Coach:
         # turn (no caching saves you on the messages list).
         self._conversation: list[dict] = []
         self._conversation_max = 12  # 6 user/assistant pairs
+
+        # Resolve the configured timezone once. Everything user-facing (the
+        # TODAY/NOW lines, the date a lift is logged under, "did Dylan lift
+        # today") must key off Dylan's LOCAL wall clock, not the server's.
+        # On a UTC VPS a naive datetime.now() rolls into tomorrow at ~8 PM
+        # Eastern — which both logged late-evening lifts under the wrong date
+        # and told the morning brief the wrong weekday. The scheduler already
+        # uses datetime.now(pytz.timezone(...)); the coach now matches it.
+        tzname = getattr(config, "TIMEZONE", None) or "America/New_York"
+        try:
+            self._tz = pytz.timezone(tzname)
+        except Exception:
+            logger.warning(
+                "Unknown TIMEZONE %r — falling back to America/New_York.", tzname
+            )
+            self._tz = pytz.timezone("America/New_York")
+
+    def _now(self) -> datetime:
+        """Current wall-clock time in Dylan's configured timezone.
+
+        Use this instead of datetime.now() anywhere a date or time is shown
+        to Dylan or used to decide what day it is. datetime.now() returns the
+        server's naive local time, which on a UTC host is hours ahead of
+        Eastern and silently corrupts date logic after dark.
+        """
+        try:
+            return datetime.now(self._tz)
+        except Exception:
+            return datetime.now()
 
     # ── Tool execution — called when Claude asks for data ───────────────────
 
@@ -814,7 +861,7 @@ class Coach:
             return []
         overrides = overrides or {}
 
-        today = datetime.now().date()
+        today = self._now().date()
         # Monday-anchored week boundaries. weekday(): Mon=0 ... Sun=6.
         this_monday = today - timedelta(days=today.weekday())
         last_monday = this_monday - timedelta(days=7)
@@ -1088,9 +1135,13 @@ class Coach:
         if _TREND_INTENT.search(message or ""):
             return await self._build_layered_context()
 
-        today = datetime.now().date()
+        now_local = self._now()
+        today = now_local.date()
         d3 = today - timedelta(days=3)
-        lines: list[str] = [f"TODAY: {today.strftime('%A, %B %d, %Y')}"]
+        lines: list[str] = [
+            f"TODAY: {today.strftime('%A, %B %d, %Y')}",
+            f"CURRENT TIME: {_fmt_time(now_local)}",
+        ]
 
         # Active lift session block — stays at the top so the model can
         # never miss it. When present, it overrides any plan-day default
@@ -1260,7 +1311,7 @@ class Coach:
         # row dated today with "he lifted today" even when the row was a
         # phantom or a placeholder. Blank-detail rows never qualify as
         # "today's work."
-        today_iso = datetime.now().strftime("%Y-%m-%d")
+        today_iso = self._now().strftime("%Y-%m-%d")
         todays_lifts = [
             l for l in (recent_lifts or [])
             if l.get("date") == today_iso and (l.get("details") or "").strip()
@@ -1312,7 +1363,8 @@ class Coach:
         implicitly — often poorly. Now the model gets pre-computed slopes
         and can spend its tokens on the coaching decision.
         """
-        today = datetime.now().date()
+        now_local = self._now()
+        today = now_local.date()
         d7 = today - timedelta(days=7)
         d28 = today - timedelta(days=28)
         d30 = today - timedelta(days=30)
@@ -1321,6 +1373,7 @@ class Coach:
 
         lines: list[str] = []
         lines.append(f"TODAY: {today.strftime('%A, %B %d, %Y')}")
+        lines.append(f"CURRENT TIME: {_fmt_time(now_local)}")
 
         # Active lift session block — same as in the tiered builder, kept
         # at the top so the model can never miss it.
@@ -1656,7 +1709,7 @@ class Coach:
         # Same split-by-today logic as the tiered builder. LIFTS LOGGED
         # TODAY is the only block that answers "did Dylan lift today?" —
         # everything else is historical and must not be conflated with it.
-        today_iso = datetime.now().strftime("%Y-%m-%d")
+        today_iso = self._now().strftime("%Y-%m-%d")
         todays_lifts = [
             l for l in (lifts or [])
             if l.get("date") == today_iso and (l.get("details") or "").strip()
@@ -1798,7 +1851,7 @@ class Coach:
 
         try:
             await self.notion.log_daily_entry(
-                date=datetime.now().strftime("%Y-%m-%d"),
+                date=self._now().strftime("%Y-%m-%d"),
                 summary={
                     "recovery_score": score.get("recovery_score"),
                     "hrv": hrv,
@@ -2107,11 +2160,11 @@ class Coach:
         # Pull today's recovery for context — a hard intervals-day interpretation
         # changes completely if recovery was 32 vs 78.
         try:
-            today_iso = datetime.now().date().isoformat()
+            today_iso = self._now().date().isoformat()
             rows = await self.db.get_whoop_daily(today_iso, today_iso)
             if not rows:
                 # Fall back to yesterday if today hasn't been synced yet.
-                y = (datetime.now().date() - timedelta(days=1)).isoformat()
+                y = (self._now().date() - timedelta(days=1)).isoformat()
                 rows = await self.db.get_whoop_daily(y, y)
             if rows:
                 r = rows[0]
@@ -2132,7 +2185,7 @@ class Coach:
         try:
             plan = await self.db.get_active_plan()
             if plan:
-                today_iso2 = datetime.now().date().isoformat()
+                today_iso2 = self._now().date().isoformat()
                 session = await self.db.get_effective_session_for_date(today_iso2)
                 if session:
                     override_tag = " (override)" if session.get("is_override") else ""
@@ -2202,7 +2255,7 @@ class Coach:
         # branch in _try_parse_lift for the full rationale.
         recent_lift_context: list[dict] = []
         today_sets_by_exercise: dict[str, dict] = {}
-        today_iso = datetime.now().strftime("%Y-%m-%d")
+        today_iso = self._now().strftime("%Y-%m-%d")
         try:
             today_sets = await self.db.get_lift_sets_for_date(today_iso)
             # Most-recent first; the parser uses the top rows to resolve
@@ -2250,7 +2303,7 @@ class Coach:
             or lift.get("sets") is not None
         ):
             lift_id = await self.db.log_lift(
-                date=datetime.now().strftime("%Y-%m-%d"),
+                date=self._now().strftime("%Y-%m-%d"),
                 exercise=lift["exercise"],
                 details=lift["details"],
                 raw=message,
@@ -2321,7 +2374,7 @@ class Coach:
                 # up the Parent Lift relation on the per-set rows), None on
                 # failure. Falsy check still works because None is falsy.
                 parent_lift_notion_id = await self.notion.log_lift(
-                    date=datetime.now().strftime("%Y-%m-%d"),
+                    date=self._now().strftime("%Y-%m-%d"),
                     exercise=lift["exercise"],
                     workout=lift.get("workout"),
                     sets=lift.get("sets"),
@@ -2356,7 +2409,7 @@ class Coach:
                 for rec in chat_set_records:
                     try:
                         await self.notion.log_lift_set(
-                            date=datetime.now().strftime("%Y-%m-%d"),
+                            date=self._now().strftime("%Y-%m-%d"),
                             exercise=lift["exercise"],
                             set_number=rec["set_number"],
                             reps=rec["reps"],
@@ -2387,7 +2440,7 @@ class Coach:
         recovery = await self._try_parse_recovery_session(message)
         if recovery:
             await self.db.log_recovery_session(
-                date=datetime.now().strftime("%Y-%m-%d"),
+                date=self._now().strftime("%Y-%m-%d"),
                 session_type=recovery["session_type"],
                 duration_min=recovery.get("duration_min"),
                 temp_f=recovery.get("temp_f"),
@@ -2822,12 +2875,22 @@ Rules:
         )
 
     def _session_expired(self, session: dict) -> bool:
-        """True if the session has been idle past the timeout."""
+        """True if the session has been idle past the timeout.
+
+        This measures ELAPSED idle time, so it must compare against the same
+        clock that wrote last_activity_at. The DB layer writes that field with
+        a naive server-local timestamp, so we compare with naive datetime.now()
+        here — NOT self._now() (tz-aware local), which would both risk a
+        naive/aware subtraction error and skew the elapsed-time math by the
+        UTC offset. The guard below keeps us safe if a tz-aware value is ever
+        stored.
+        """
         try:
             last = datetime.fromisoformat(session["last_activity_at"])
         except Exception:
             return False
-        return datetime.now() - last > timedelta(hours=self.LIFT_SESSION_TIMEOUT_HOURS)
+        now = datetime.now() if last.tzinfo is None else datetime.now(last.tzinfo)
+        return now - last > timedelta(hours=self.LIFT_SESSION_TIMEOUT_HOURS)
 
     async def _format_next_set_prompt(self, session: dict) -> str:
         """Render the 'Bench, set 2 — recommended X x Y' prompt for the
@@ -2866,8 +2929,8 @@ Rules:
         plan = await self.db.get_active_plan()
         if not plan:
             return "No active training plan. Set one up before starting a session."
-        today_name = datetime.now().strftime("%A").lower()
-        today_iso = datetime.now().date().isoformat()
+        today_name = self._now().strftime("%A").lower()
+        today_iso = self._now().date().isoformat()
         # Override-aware lookup — `/swap pull` then `/liftstart` should
         # start a Pull session even if today is a template-default run day.
         sess_def = await self.db.get_effective_session_for_date(today_iso)
@@ -2963,7 +3026,7 @@ Rules:
                 "exercise": ex_name,
                 "set": set_idx + 1,
                 "skipped": True,
-                "ts": datetime.now().isoformat(timespec="seconds"),
+                "ts": self._now().isoformat(timespec="seconds"),
             })
             new_set_idx = set_idx + 1
             new_ex_idx = ex_idx
@@ -3032,7 +3095,7 @@ Rules:
         details = f"set {set_idx + 1}/{total_sets} · {weight_str} lb × {reps_str}"
         # Persist into the same lifts table the rest of the bot reads.
         lift_id = await self.db.log_lift(
-            date=datetime.now().strftime("%Y-%m-%d"),
+            date=self._now().strftime("%Y-%m-%d"),
             exercise=ex_name,
             details=details,
             raw=f"[liftstart] {message}",
@@ -3045,7 +3108,7 @@ Rules:
         try:
             liftstart_set_db_id = await self.db.log_lift_set(
                 lift_id=lift_id,
-                date=datetime.now().strftime("%Y-%m-%d"),
+                date=self._now().strftime("%Y-%m-%d"),
                 exercise=ex_name,
                 set_number=set_idx + 1,
                 reps=reps,
@@ -3064,7 +3127,7 @@ Rules:
         parent_lift_notion_id: str | None = None
         try:
             parent_lift_notion_id = await self.notion.log_lift(
-                date=datetime.now().strftime("%Y-%m-%d"),
+                date=self._now().strftime("%Y-%m-%d"),
                 exercise=ex_name,
                 workout=session.get("workout_label"),
                 sets=1,
@@ -3094,7 +3157,7 @@ Rules:
         if self.notion.is_configured_lift_sets():
             try:
                 await self.notion.log_lift_set(
-                    date=datetime.now().strftime("%Y-%m-%d"),
+                    date=self._now().strftime("%Y-%m-%d"),
                     exercise=ex_name,
                     set_number=set_idx + 1,
                     reps=reps,
@@ -3115,7 +3178,7 @@ Rules:
             "set": set_idx + 1,
             "weight_lb": weight,
             "reps": reps,
-            "ts": datetime.now().isoformat(timespec="seconds"),
+            "ts": self._now().isoformat(timespec="seconds"),
         })
         new_set_idx = set_idx + 1
         new_ex_idx = ex_idx

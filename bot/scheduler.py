@@ -29,6 +29,8 @@ from datetime import datetime, timedelta, timezone
 import pytz
 from discord.ext import tasks
 
+from integrations.whoop import WhoopAuthError
+
 logger = logging.getLogger(__name__)
 
 
@@ -73,6 +75,14 @@ class Scheduler:
     _STATE_WEEKLY = "scheduler:weekly_summary_last_fired"
     _STATE_STOIC = "scheduler:stoic_reflection_last_fired"
     _STATE_NIGHTLY = "scheduler:nightly_sync_last_fired"
+    _STATE_HEARTBEAT = "scheduler:heartbeat_last_fired"
+
+    # Heartbeat thresholds. WHOOP posts a recovery every morning, so >36h
+    # without one is a real outage (dead token, bot was down, webhook+poll
+    # both missed). Strava is intermittent — only flag a long gap so rest
+    # days / travel don't page you.
+    _HEARTBEAT_WHOOP_STALE_HOURS = 36
+    _HEARTBEAT_STRAVA_STALE_DAYS = 14
 
     def __init__(self, bot, config, coach):
         self.bot = bot
@@ -160,6 +170,17 @@ class Scheduler:
             if not await self._already_fired_today(self._STATE_NIGHTLY, today_iso):
                 await self._nightly_sync()
                 await self._mark_fired_today(self._STATE_NIGHTLY, today_iso)
+
+        # ── Data-feed heartbeat — once daily from 12:00 local ──────────────
+        # Runs after the morning-brief window (backstop 11:30) closes, so a
+        # healthy same-morning sync is never mistaken for stale. DMs the owner
+        # ONLY when a feed is broken — silence means everything is flowing.
+        # This is the guard that turns a silent multi-month outage into a
+        # same-day ping.
+        if (now.hour, now.minute) >= (12, 0) and now.hour < 14:
+            if not await self._already_fired_today(self._STATE_HEARTBEAT, today_iso):
+                await self._data_health_check(now)
+                await self._mark_fired_today(self._STATE_HEARTBEAT, today_iso)
 
     async def _fire_daily_brief_once(
         self, today_iso: str, reason: str
@@ -522,6 +543,72 @@ class Scheduler:
                 logger.warning(f"Notion reconciliation failed: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Nightly sync failed: {e}", exc_info=True)
+
+    async def _data_health_check(self, now: datetime):
+        """Daily liveness check on the data feeds. DMs the owner ONLY when
+        something is wrong — silence means healthy. Two layers:
+
+          1. Live WHOOP probe — hit /v2/recovery. A WhoopAuthError means the
+             refresh token is dead (the exact failure that silently killed
+             sync for ~2 months); tell the owner to re-auth. Any other error
+             means the API/network is unreachable right now.
+          2. DB freshness — compare the newest WHOOP recovery date and Strava
+             activity timestamp against the staleness thresholds.
+
+        Problems are collected and sent as a single concise DM.
+        """
+        problems: list[str] = []
+
+        # 1. Live WHOOP auth / reachability probe.
+        try:
+            await self.coach.whoop.get_recovery(days=1)
+        except WhoopAuthError:
+            problems.append(
+                "🔴 WHOOP token rejected — recovery/sleep/strain are NOT syncing. "
+                "Run `python whoop_auth.py` on the host and restart the service."
+            )
+        except Exception as e:
+            problems.append(
+                f"🟠 WHOOP API unreachable right now ({type(e).__name__})."
+            )
+
+        # 2a. WHOOP freshness in the DB.
+        try:
+            latest_whoop = await self.coach.db.get_latest_whoop_date()
+            if latest_whoop:
+                last = datetime.strptime(latest_whoop, "%Y-%m-%d").date()
+                age_days = (now.date() - last).days
+                if age_days * 24 > self._HEARTBEAT_WHOOP_STALE_HOURS:
+                    problems.append(
+                        f"🟠 No new WHOOP recovery since {latest_whoop} "
+                        f"({age_days}d ago)."
+                    )
+            else:
+                problems.append("🟠 No WHOOP recovery records in the database at all.")
+        except Exception as e:
+            logger.warning(f"Heartbeat WHOOP freshness check failed: {e}")
+
+        # 2b. Strava freshness in the DB (long threshold — runs aren't daily).
+        try:
+            ts = await self.coach.db.get_latest_strava_timestamp()
+            if ts:
+                age_days = (now - datetime.fromtimestamp(ts, self.tz)).days
+                if age_days > self._HEARTBEAT_STRAVA_STALE_DAYS:
+                    problems.append(
+                        f"🟠 No Strava activity in {age_days}d "
+                        f"(threshold {self._HEARTBEAT_STRAVA_STALE_DAYS}d)."
+                    )
+        except Exception as e:
+            logger.warning(f"Heartbeat Strava freshness check failed: {e}")
+
+        if problems:
+            body = "\n".join(f"• {p}" for p in problems)
+            await self._dm_owner(f"**⚠️ Data sync health check**\n{body}")
+            logger.warning(
+                f"Heartbeat found {len(problems)} issue(s); owner notified."
+            )
+        else:
+            logger.info("Heartbeat: all data feeds healthy.")
 
     @check_scheduled_tasks.before_loop
     async def before_loop(self):

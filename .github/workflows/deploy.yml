@@ -66,3 +66,19 @@ jobs:
               journalctl -u fitness-bot -n 30 --no-pager
               exit 1
             fi
+
+            # Restart the API service too, if it's installed. Guarded so a
+            # deploy still succeeds before fitness-api.service exists on the box.
+            if systemctl list-unit-files | grep -q '^fitness-api\.service'; then
+              systemctl restart fitness-api
+              sleep 2
+              if systemctl is-active --quiet fitness-api; then
+                echo "fitness-api restarted"
+              else
+                echo "fitness-api failed to start — recent logs:"
+                journalctl -u fitness-api -n 30 --no-pager
+                exit 1
+              fi
+            else
+              echo "fitness-api not installed yet — skipping"
+            fi
