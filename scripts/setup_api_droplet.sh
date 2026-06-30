@@ -42,6 +42,11 @@ echo "Installing/refreshing dependencies…"
 echo "✓ Dependencies installed"
 
 # 3. systemd unit.
+# NOTE: deliberately NO EnvironmentFile= here. config.py loads .env via
+# python-dotenv (which strips inline `# comments`); systemd's EnvironmentFile
+# parser does NOT strip them and would feed a comment into int(OWNER_USER_ID).
+# WorkingDirectory puts .env next to config.py so dotenv finds it — same as the
+# bot's own service.
 sudo tee /etc/systemd/system/fitness-api.service >/dev/null <<EOF
 [Unit]
 Description=fitness-api (Coach Aurelius API)
@@ -50,7 +55,6 @@ After=network.target
 [Service]
 User=$USER_NAME
 WorkingDirectory=$REPO
-EnvironmentFile=$REPO/.env
 ExecStart=$VENV/bin/uvicorn api_server:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5

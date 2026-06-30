@@ -58,7 +58,9 @@ After=network.target
 [Service]
 User=fitness-agent
 WorkingDirectory=/home/fitness-agent/fitness-bot
-EnvironmentFile=/home/fitness-agent/fitness-bot/.env
+# No EnvironmentFile= — config.py loads .env via python-dotenv (which strips
+# inline `# comments`; systemd's parser does not). WorkingDirectory puts .env
+# next to config.py so dotenv finds it.
 ExecStart=/home/fitness-agent/fitness-bot/venv/bin/uvicorn api_server:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5

@@ -164,13 +164,18 @@ def main():
     print(f"Using Client ID: {CLIENT_ID}")
     print()
 
-    # Start local server
-    srv = http.server.HTTPServer(("localhost", 8080), CallbackHandler)
-    thread = threading.Thread(target=srv.handle_request)
-    thread.daemon = True
-    thread.start()
+    # Start local callback server — best effort. On a headless host, or when
+    # the port is already taken (e.g. another app on :8080), it can't receive
+    # the redirect anyway, so we fall through to manual paste of the URL.
+    thread = None
+    try:
+        srv = http.server.HTTPServer(("localhost", 8080), CallbackHandler)
+        thread = threading.Thread(target=srv.handle_request)
+        thread.daemon = True
+        thread.start()
+    except OSError as e:
+        print(f"(Local callback server unavailable: {e} — using manual paste.)")
 
-    # Open browser
     auth_url = (
         f"https://api.prod.whoop.com/oauth/oauth2/auth"
         f"?client_id={urllib.parse.quote(CLIENT_ID)}"
@@ -179,11 +184,16 @@ def main():
         f"&scope={urllib.parse.quote(SCOPE, safe='')}"
         f"&state={STATE}"
     )
-    print("Opening browser for WHOOP authorization...")
-    webbrowser.open(auth_url)
-    print("Waiting for authorization (you have 2 minutes)...")
-
-    thread.join(timeout=120)
+    print("\nOpen this URL in a browser and approve access:\n")
+    print(auth_url)
+    print()
+    try:
+        webbrowser.open(auth_url)
+    except Exception:
+        pass
+    if thread is not None:
+        print("Waiting for authorization (you have 2 minutes)...")
+        thread.join(timeout=120)
 
     if not auth_code:
         print("\nNo code received automatically.")
