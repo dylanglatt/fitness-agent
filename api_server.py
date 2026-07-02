@@ -208,6 +208,7 @@ async def today():
         "session": {
             "type": (sess.get("session_type") or "rest").title(),
             "focus": (sess.get("focus") or sess.get("prescription", "")[:80] or "").strip(),
+            "isOverride": bool(sess.get("is_override")),
         },
         "recoverySessions": rec_today,
     }
@@ -359,6 +360,57 @@ async def log_set(payload: dict = Body(...)):
     await db.log_lift_set(lift_id, date, exercise, p.get("setNumber", 1),
                           reps=reps, weight_lb=weight, rpe=p.get("rpe"), source="app")
     return {"ok": True, "lift_id": lift_id}
+
+
+@app.post("/swap-session", dependencies=[Depends(auth)])
+async def swap_session(payload: dict = Body(...)):
+    """Override today's plan from the app — same semantics as Discord /swap.
+
+    Body: {"target": "push"|"pull"|"legs"|"run"|"rest"|"cross"|"reset"}
+    "reset" clears today's override, falling back to the weekly template.
+    Returns the now-effective session so the UI can update without a
+    second round-trip.
+    """
+    from data.plan_vocab import normalize_swap
+
+    target = ((payload or {}).get("target") or "").strip().lower()
+    today_iso = _today_iso()
+
+    if not target:
+        raise HTTPException(status_code=422, detail="missing 'target'")
+
+    if target == "reset":
+        await db.clear_daily_override(today_iso)
+    else:
+        normalized = normalize_swap(target)
+        if not normalized:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown target {target!r} — try push/pull/legs/run/rest/cross/reset",
+            )
+        new_type, new_focus = normalized
+        await db.set_daily_override(
+            date=today_iso,
+            session_type=new_type,
+            focus=new_focus,
+            prescription="",
+            notes="swap from iOS app",
+            source="app_swap",
+        )
+
+    # The cached morning brief may reference the old session — rebuild on
+    # next /today so the brief matches the new plan.
+    _brief_cache.pop(today_iso, None)
+
+    sess = await db.get_effective_session_for_date(today_iso) or {}
+    return {
+        "ok": True,
+        "session": {
+            "type": (sess.get("session_type") or "rest").title(),
+            "focus": (sess.get("focus") or sess.get("prescription", "")[:80] or "").strip(),
+            "isOverride": bool(sess.get("is_override")),
+        },
+    }
 
 
 @app.post("/recovery", dependencies=[Depends(auth)])

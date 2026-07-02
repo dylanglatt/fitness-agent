@@ -306,38 +306,11 @@ def register_commands(bot):
     # 'cross_train'), with the user-facing label preserved as `focus`.
     # That way /plan today shows e.g. "LIFT — Pull" rather than the bare
     # session_type, which matches how the weekly template reads.
+    #
+    # Vocab + normalization live in data/plan_vocab.py, shared with the
+    # app's POST /swap-session endpoint (api_server.py).
 
-    _SWAP_ALIASES = {
-        # session_type → list of accepted user inputs
-        "lift_push":  {"push", "lift_push", "bench"},
-        "lift_pull":  {"pull", "lift_pull", "row"},
-        "lift_legs":  {"legs", "lift_legs", "squat", "deadlift"},
-        "lift":       {"lift", "weights", "strength"},
-        "run":        {"run", "easy", "tempo", "intervals", "long"},
-        "rest":       {"rest", "off", "recovery"},
-        "cross_train": {"cross", "cross-train", "crosstrain", "bike", "swim", "yoga"},
-    }
-
-    def _normalize_swap(label: str) -> tuple[str, str] | None:
-        """Return (session_type, focus_label) for a user-typed swap target.
-
-        Returns None if the input doesn't match any known category. The
-        focus label is the title-cased original word so "/swap pull"
-        becomes session_type='lift', focus='Pull' — readable in both
-        adherence + brief output.
-        """
-        norm = (label or "").strip().lower()
-        for kind, aliases in _SWAP_ALIASES.items():
-            if norm in aliases:
-                if kind.startswith("lift_"):
-                    sub = kind.split("_", 1)[1].title()  # Push / Pull / Legs
-                    return ("lift", sub)
-                if kind == "lift":
-                    return ("lift", "lift")
-                if kind == "cross_train":
-                    return ("cross_train", norm.title())
-                return (kind, norm.title())
-        return None
+    from data.plan_vocab import normalize_swap as _normalize_swap
 
     @bot.hybrid_command(
         name="swap",
