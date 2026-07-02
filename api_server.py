@@ -222,16 +222,36 @@ async def train():
 
     # Today's prescribed exercises aren't structured in the plan, so surface the
     # most recent logged session's lifts as the working set (real "last" data).
+    # Grouped one entry per exercise with its structured sets from lift_sets;
+    # falls back to the free-text lifts rows when a date predates set logging.
     recent_lifts = await db.get_recent_lifts(days=21)
     by_date = defaultdict(list)
     for l in recent_lifts:
         by_date[str(l.get("date"))[:10]].append(l)
     dates = sorted(by_date.keys(), reverse=True)
 
+    def _set_label(s):
+        w, r = s.get("weight_lb"), s.get("reps")
+        label = f"{_round(w)} lb × {r}" if w and r else (f"{r} reps" if r else (s.get("notes") or "—"))
+        return f"{label} · failure" if s.get("to_failure") else label
+
     exercises = []
     if dates:
-        for l in by_date[dates[0]]:
-            exercises.append({"name": (l.get("exercise") or "").title(), "scheme": "", "target": "", "last": l.get("details") or ""})
+        grouped = {}  # name → [set labels], insertion-ordered
+        set_rows = await db.get_lift_sets_for_date(dates[0])
+        for s in set_rows:
+            name = (s.get("exercise") or "").title()
+            grouped.setdefault(name, []).append(_set_label(s))
+        if not grouped:
+            for l in by_date[dates[0]]:
+                name = (l.get("exercise") or "").title()
+                grouped.setdefault(name, []).append(l.get("details") or "—")
+        for name, sets in grouped.items():
+            exercises.append({
+                "name": name,
+                "sets": sets,
+                "summary": f"{len(sets)} set{'s' if len(sets) != 1 else ''}",
+            })
 
     # Recent workouts: one per day, volume from lift_sets.
     recent = []
