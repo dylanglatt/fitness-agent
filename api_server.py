@@ -220,11 +220,9 @@ async def train():
     today_iso = now.strftime("%Y-%m-%d")
     sess = await db.get_effective_session_for_date(today_iso) or {}
 
-    # Today's prescribed exercises aren't structured in the plan, so surface the
-    # most recent logged session's lifts as the working set (real "last" data).
-    # Grouped one entry per exercise with its structured sets from lift_sets;
-    # falls back to the free-text lifts rows when a date predates set logging.
-    recent_lifts = await db.get_recent_lifts(days=21)
+    # Lift history keyed by date. Prescribed exercises aren't structured in the
+    # plan, so the "last session" template surfaces the most recent logged lifts.
+    recent_lifts = await db.get_recent_lifts(days=45)
     by_date = defaultdict(list)
     for l in recent_lifts:
         by_date[str(l.get("date"))[:10]].append(l)
@@ -235,27 +233,25 @@ async def train():
         label = f"{_round(w)} lb × {r}" if w and r else (f"{r} reps" if r else (s.get("notes") or "—"))
         return f"{label} · failure" if s.get("to_failure") else label
 
-    exercises = []
-    if dates:
+    async def _grouped_exercises(d):
+        """One entry per exercise for date `d`, each with its structured sets
+        from lift_sets; falls back to free-text lifts rows for older dates."""
         grouped = {}  # name → [set labels], insertion-ordered
-        set_rows = await db.get_lift_sets_for_date(dates[0])
-        for s in set_rows:
-            name = (s.get("exercise") or "").title()
-            grouped.setdefault(name, []).append(_set_label(s))
+        for s in await db.get_lift_sets_for_date(d):
+            grouped.setdefault((s.get("exercise") or "").title(), []).append(_set_label(s))
         if not grouped:
-            for l in by_date[dates[0]]:
-                name = (l.get("exercise") or "").title()
-                grouped.setdefault(name, []).append(l.get("details") or "—")
-        for name, sets in grouped.items():
-            exercises.append({
-                "name": name,
-                "sets": sets,
-                "summary": f"{len(sets)} set{'s' if len(sets) != 1 else ''}",
-            })
+            for l in by_date.get(d, []):
+                grouped.setdefault((l.get("exercise") or "").title(), []).append(l.get("details") or "—")
+        return [
+            {"name": name, "sets": sets, "summary": f"{len(sets)} set{'s' if len(sets) != 1 else ''}"}
+            for name, sets in grouped.items()
+        ]
 
-    # Recent workouts: one per day, volume from lift_sets.
+    exercises = await _grouped_exercises(dates[0]) if dates else []
+
+    # Recent workouts: one per day, volume from lift_sets, expandable into sets.
     recent = []
-    for d in dates[:5]:
+    for d in dates[:8]:
         sets = await db.get_lift_sets_for_date(d)
         vol = sum((s.get("weight_lb") or 0) * (s.get("reps") or 0) for s in sets)
         ds = await db.get_effective_session_for_date(d) or {}
@@ -269,6 +265,7 @@ async def train():
             "volume": f"{int(vol):,} lb" if vol else "—",
             "duration": "—",
             "pr": None,
+            "exercises": await _grouped_exercises(d),
         })
 
     return {
