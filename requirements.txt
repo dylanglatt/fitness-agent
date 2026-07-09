@@ -10,3 +10,6 @@ aiohttp>=3.9.0
 # FastAPI service (api_server.py) — backend for the Coach Aurelius iOS app.
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
+# Crash reporting — errors from the bot and the FastAPI server go to Sentry,
+# which forwards them to Discord (#fitness-bot in the Sentry Alerts server).
+sentry-sdk>=2.0

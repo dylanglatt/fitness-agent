@@ -5,8 +5,20 @@ Run with: python main.py
 
 import asyncio
 import logging
+import os
+
 from bot.discord_bot import FitnessBot
 from config import Config
+
+# Crash reporting → Sentry (alerts land in Discord #fitness-bot).
+# Errors only — no tracing, no PII. Override DSN with SENTRY_DSN.
+import sentry_sdk
+sentry_sdk.init(
+    dsn=os.environ.get(
+        "SENTRY_DSN",
+        "https://8c0abd7435fe5906322bfcc32a2d1125@o4511632555048960.ingest.us.sentry.io/4511702338764800",
+    ),
+)
 
 logging.basicConfig(
     level=logging.INFO,

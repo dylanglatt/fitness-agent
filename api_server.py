@@ -32,6 +32,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import Config
 from data.database import Database
 
+# Crash reporting → Sentry (alerts land in Discord #fitness-bot).
+# Errors only — no tracing, no PII. Override DSN with SENTRY_DSN.
+import sentry_sdk
+sentry_sdk.init(
+    dsn=os.environ.get(
+        "SENTRY_DSN",
+        "https://8c0abd7435fe5906322bfcc32a2d1125@o4511632555048960.ingest.us.sentry.io/4511702338764800",
+    ),
+)
+
 logger = logging.getLogger("api_server")
 
 config = Config()
