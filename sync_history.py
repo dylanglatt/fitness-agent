@@ -8,6 +8,10 @@ Safe to re-run — all writes are UPSERTs keyed on stable IDs (sleep id, cycle
 id, strava activity id) or date (for recovery/sleep/cycle rolled up per day).
 Re-running just refreshes any records WHOOP or Strava updated after the fact.
 
+Run it ON THE HOST that owns the live database. It shares the bot's WHOOP
+token store (oauth_tokens), so a rotation here is visible to the running bot
+and vice versa. Running it against a stale checkout desyncs the token.
+
 Usage:
     python sync_history.py                # pull everything
     python sync_history.py --days 30      # only last 30 days (for testing)
@@ -38,7 +42,13 @@ def _iso_z(dt: datetime) -> str:
 
 
 async def backfill_whoop(config: Config, db: Database, start: datetime, end: datetime):
-    whoop = WhoopClient(config)
+    # Pass `db` — this is NOT optional. WHOOP rotates the refresh token on
+    # every exchange, and the authoritative copy lives in the oauth_tokens
+    # table (the DB copy wins over .env). A db-less WhoopClient seeds from
+    # .env, burns whatever token is there, and persists the rotation back to
+    # .env ONLY — leaving the DB copy consumed and the running bot dead on its
+    # next refresh. Running this script used to be a way to break the live bot.
+    whoop = WhoopClient(config, db=db)
     start_s = _iso_z(start)
     end_s = _iso_z(end)
 
