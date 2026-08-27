@@ -30,11 +30,14 @@ import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import anthropic
 import pytz
+
+import obs
 
 from ai.prompts import (
     SYSTEM_PROMPT,
@@ -107,15 +110,18 @@ def _estimate_cost_usd(
     return round(cost, 6)
 
 
-async def _log_claude_call(db, *, caller: str, model: str, response) -> None:
+async def _log_claude_call(db, *, caller: str, model: str, response) -> dict:
     """Extract usage from an Anthropic response and persist a row to llm_calls.
+
+    Returns the usage dict so the caller can ALSO put it on the log stream.
+    The llm_calls table has always been well-formed, but it was log-silent:
+    `journalctl` could not answer "what did last night's brief cost?" or "why
+    was that call slow?" without opening SQLite. Now both work.
 
     Safe to call on any response object — if usage is missing, all token
     fields go in as null. Wrapped in try/except by the DB layer so a logging
     failure can never take down the chat path.
     """
-    if db is None:
-        return
     usage = getattr(response, "usage", None)
     in_tok = getattr(usage, "input_tokens", None) if usage else None
     out_tok = getattr(usage, "output_tokens", None) if usage else None
@@ -124,6 +130,15 @@ async def _log_claude_call(db, *, caller: str, model: str, response) -> None:
     cache_read = getattr(usage, "cache_read_input_tokens", None) if usage else None
     cache_create = getattr(usage, "cache_creation_input_tokens", None) if usage else None
     cost = _estimate_cost_usd(model, in_tok, out_tok, cache_read, cache_create)
+    stats = {
+        "in_tok": in_tok,
+        "out_tok": out_tok,
+        "cache_read": cache_read,
+        "cache_write": cache_create,
+        "cost_usd": cost,
+    }
+    if db is None:
+        return stats
     await db.log_llm_call(
         caller=caller,
         model=model,
@@ -133,6 +148,7 @@ async def _log_claude_call(db, *, caller: str, model: str, response) -> None:
         cache_creation_tokens=cache_create,
         cost_usd=cost,
     )
+    return stats
 
 
 # ── Time formatting ─────────────────────────────────────────────────────────
@@ -651,20 +667,43 @@ class Coach:
         # returns plain text (stop_reason != "tool_use"). Cap iterations so a
         # buggy model can't spin forever AND so we don't pay for 6 round-trips
         # on a question that only needed one.
-        for _ in range(max_tool_iters):
+        for tool_iter in range(max_tool_iters):
+            call_model = create_kwargs.get("model") or self.model
+            started = time.perf_counter()
             response = await self.claude.messages.create(**create_kwargs)
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
             # Log the call for /cost. Each tool-use round-trip is its own
             # response and its own billable event, so log per-iteration —
             # not just on the final text response.
+            #
+            # This is the single chokepoint every LLM call in the codebase
+            # passes through, and it used to log NOTHING: not the caller, not
+            # the model, not tokens, not latency. One structured line here
+            # makes spend and latency answerable from the log stream as well
+            # as from SQLite.
+            stats: dict = {}
             try:
-                await _log_claude_call(
+                stats = await _log_claude_call(
                     self.db,
                     caller=caller,
-                    model=create_kwargs.get("model") or self.model,
+                    model=call_model,
                     response=response,
                 )
             except Exception as e:
-                logger.debug(f"_log_claude_call failed (non-fatal): {e}")
+                # Was debug — i.e. invisible. If cost logging breaks, /cost
+                # silently under-reports and nothing said so.
+                obs.source_failed(logger, "llm_calls_write", "ask_claude", e, caller=caller)
+            obs.log_event(
+                logger,
+                logging.INFO,
+                "llm.call",
+                caller=caller,
+                model=call_model,
+                duration_ms=elapsed_ms,
+                tool_iter=tool_iter,
+                stop_reason=getattr(response, "stop_reason", None),
+                **stats,
+            )
 
             if response.stop_reason != "tool_use":
                 # Plain text response — extract and return.
@@ -687,7 +726,21 @@ class Coach:
             tool_results = []
             for block in response.content:
                 if getattr(block, "type", None) == "tool_use":
-                    logger.info(f"Claude tool call: {block.name}({block.input})")
+                    # Argument KEYS at INFO, values at DEBUG only. The full
+                    # input dict at INFO was being attached as a Sentry
+                    # breadcrumb to every event — recovery scores, HRV, lift
+                    # history — which contradicts the "no PII" claim in
+                    # AGENTS.md.
+                    obs.log_event(
+                        logger,
+                        logging.INFO,
+                        "llm.tool_call",
+                        tool=block.name,
+                        arg_keys=",".join(sorted((block.input or {}).keys()))
+                        if isinstance(block.input, dict)
+                        else "-",
+                    )
+                    logger.debug("tool_call args %s(%s)", block.name, block.input)
                     result = await self._execute_tool(block.name, block.input)
                     tool_results.append({
                         "type": "tool_result",
@@ -697,7 +750,13 @@ class Coach:
             messages.append({"role": "user", "content": tool_results})
             create_kwargs["messages"] = messages
 
-        logger.warning("Claude tool-use loop hit max iterations; returning empty.")
+        obs.log_event(
+            logger,
+            logging.WARNING,
+            "llm.tool_loop_exhausted",
+            caller=caller,
+            max_tool_iters=max_tool_iters,
+        )
         return "Sorry, I got stuck looking things up. Try asking again."
 
     # ── Trend helpers ───────────────────────────────────────────────────────
@@ -1149,7 +1208,7 @@ class Coach:
         try:
             session_block = await self.active_session_context_block()
         except Exception as e:
-            logger.debug(f"Active session block failed: {e}")
+            obs.source_failed(logger, "active_lift_session", "chat", e)
             session_block = ""
         if session_block:
             lines.append("")
@@ -1171,7 +1230,7 @@ class Coach:
                 "Run `python whoop_auth.py` and restart to restore recovery data."
             )
         except Exception as e:
-            logger.debug(f"Tiered context: live WHOOP snapshot unavailable: {e}")
+            obs.source_failed(logger, "whoop_snapshot", "chat", e)
 
         # Last-3-days WHOOP daily rows. If we got fewer than 2 rows back,
         # the user is clearly asking from a sparse-data state — escalate
@@ -1179,7 +1238,7 @@ class Coach:
         try:
             daily = await self.db.get_whoop_daily(str(d3), str(today))
         except Exception as e:
-            logger.debug(f"Tiered context: WHOOP daily fetch failed: {e}")
+            obs.source_failed(logger, "whoop_daily", "chat", e)
             daily = []
         if len(daily) < 2:
             return await self._build_layered_context()
@@ -1204,7 +1263,7 @@ class Coach:
         try:
             acts = await self.db.get_strava_activities_range(str(d3), str(today))
         except Exception as e:
-            logger.debug(f"Tiered context: Strava range fetch failed: {e}")
+            obs.source_failed(logger, "strava_range", "chat", e)
             acts = []
         if acts:
             lines.append("")
@@ -1227,7 +1286,7 @@ class Coach:
         try:
             plan = await self.db.get_active_plan()
         except Exception as e:
-            logger.debug(f"Tiered context: active plan lookup failed: {e}")
+            obs.source_failed(logger, "active_plan", "chat", e)
             plan = None
         if plan:
             # Use the override-aware lookup so a /swap today on the morning
@@ -1235,7 +1294,7 @@ class Coach:
             try:
                 session = await self.db.get_effective_session_for_date(str(today))
             except Exception as e:
-                logger.debug(f"Tiered context: effective-session lookup failed: {e}")
+                obs.source_failed(logger, "effective_session", "chat", e)
                 session = (plan.get("weekly_template") or {}).get(
                     today.strftime("%A").lower()
                 )
@@ -1271,7 +1330,7 @@ class Coach:
         try:
             recent_lifts = await self.db.get_recent_lifts(days=14)
         except Exception as e:
-            logger.debug(f"Tiered context: recent-lifts fetch failed: {e}")
+            obs.source_failed(logger, "recent_lifts", "chat", e)
             recent_lifts = []
 
         # PLAN ADHERENCE — only when a plan exists. Pulls 14 days of Strava
@@ -1287,14 +1346,14 @@ class Coach:
                     d14, str(today)
                 )
             except Exception as e:
-                logger.debug(f"Tiered context: 14-day Strava fetch failed: {e}")
+                obs.source_failed(logger, "strava_14d", "chat", e)
                 acts_14d = []
             # Pull any daily overrides for the same 14-day window. Overrides
             # take precedence over the weekly template in adherence calc.
             try:
                 override_rows = await self.db.get_overrides_in_range(d14, str(today))
             except Exception as e:
-                logger.debug(f"Tiered context: overrides fetch failed: {e}")
+                obs.source_failed(logger, "plan_overrides", "chat", e)
                 override_rows = []
             overrides_by_date = {r["date"]: r for r in override_rows}
             adherence_lines = self._compute_plan_adherence(
@@ -1380,7 +1439,7 @@ class Coach:
         try:
             session_block = await self.active_session_context_block()
         except Exception as e:
-            logger.debug(f"Active session block failed: {e}")
+            obs.source_failed(logger, "active_lift_session", "brief", e)
             session_block = ""
         if session_block:
             lines.append("")
@@ -1429,7 +1488,7 @@ class Coach:
             try:
                 session = await self.db.get_effective_session_for_date(str(today))
             except Exception as e:
-                logger.debug(f"Brief: effective-session lookup failed: {e}")
+                obs.source_failed(logger, "effective_session", "brief", e)
                 session = (plan.get("weekly_template") or {}).get(day_name)
             lines.append("")
             lines.append(f"ACTIVE PLAN: {plan.get('name')}")
@@ -1494,21 +1553,21 @@ class Coach:
         try:
             lifts_14d = await self.db.get_recent_lifts(days=14)
         except Exception as e:
-            logger.debug(f"14-day lifts fetch for adherence failed: {e}")
+            obs.source_failed(logger, "lifts_14d", "brief", e)
             lifts_14d = []
         try:
             acts_14d_for_adherence = await self.db.get_strava_activities_range(
                 str(d14), str(today)
             )
         except Exception as e:
-            logger.debug(f"14-day Strava fetch for adherence failed: {e}")
+            obs.source_failed(logger, "strava_14d", "brief", e)
             acts_14d_for_adherence = []
         try:
             override_rows = await self.db.get_overrides_in_range(
                 str(d14), str(today),
             )
         except Exception as e:
-            logger.debug(f"Overrides fetch for adherence failed: {e}")
+            obs.source_failed(logger, "plan_overrides", "brief", e)
             override_rows = []
         overrides_by_date = {r["date"]: r for r in override_rows}
         adherence_lines = self._compute_plan_adherence(
@@ -1536,8 +1595,27 @@ class Coach:
             if readiness_block:
                 lines.append("")
                 lines.append(readiness_block)
+            # ai/training_state.py is 531 lines of logic that decides what the
+            # brief recommends, and it produced no record of its inputs or its
+            # verdict. Without this line it is impossible to reconstruct after
+            # the fact why the coach said "swap to pull" on a given morning.
+            obs.log_event(
+                logger,
+                logging.INFO,
+                "readiness.computed",
+                planned_kind=readiness.get("planned_kind"),
+                planned_sub=readiness.get("planned_sub"),
+                status=readiness.get("status"),
+                suggested="/".join(
+                    x for x in (readiness.get("suggested") or ()) if x
+                )
+                or "-",
+                freshest=readiness.get("freshest_pattern"),
+                lifts_seen=len(lifts_14d or []),
+                acts_seen=len(acts_14d_for_adherence or []),
+            )
         except Exception as e:
-            logger.warning(f"Training-readiness block failed (non-fatal): {e}")
+            obs.source_failed(logger, "training_readiness", "brief", e)
 
         # ── AUTOREGULATION — recovery→intensity band + deload signal (Phase 3).
         # Today's recovery often hasn't synced at brief time, so fall back to
@@ -1569,8 +1647,19 @@ class Coach:
             if autoreg_block:
                 lines.append("")
                 lines.append(autoreg_block)
+            obs.log_event(
+                logger,
+                logging.INFO,
+                "autoregulation.computed",
+                band=(band or {}).get("band"),
+                rpe_cap=(band or {}).get("rpe_cap"),
+                recovery=today_rec_score,
+                hrv=today_hrv,
+                hrv_baseline=hrv_baseline,
+                deload_suggested=(deload or {}).get("suggested"),
+            )
         except Exception as e:
-            logger.warning(f"Autoregulation block failed (non-fatal): {e}")
+            obs.source_failed(logger, "autoregulation", "brief", e)
 
         # ── Last 7 days detail
         if daily:
@@ -1629,7 +1718,7 @@ class Coach:
                 f"{today}T23:59:59.999Z",
             )
         except Exception as e:
-            logger.debug(f"WHOOP workouts-in-window fetch failed: {e}")
+            obs.source_failed(logger, "whoop_workouts", "brief", e)
             whoop_wos_14d = []
 
         def _whoop_overlap(a: dict) -> Optional[dict]:
@@ -1741,7 +1830,7 @@ class Coach:
         try:
             chat_recovery = await self.db.get_recent_recovery_sessions(days=14)
         except Exception as e:
-            logger.debug(f"Could not load recovery sessions: {e}")
+            obs.source_failed(logger, "recovery_sessions", "brief", e)
             chat_recovery = []
         try:
             whoop_recovery = ts.whoop_recovery_sessions(whoop_wos_14d)
@@ -1888,7 +1977,9 @@ class Coach:
                 whoop_match = await self.db.find_whoop_workout_for_strava_activity(a)
                 await self.notion.log_strava_activity(a, whoop_workout=whoop_match)
             except Exception as e:
-                logger.debug(f"Notion run log skipped for activity {a.get('id')}: {e}")
+                obs.source_failed(
+                    logger, "notion_run_log", "brief", e, activity_id=a.get("id")
+                )
 
         return brief
 
@@ -2024,12 +2115,12 @@ class Coach:
                 row = self.whoop.normalize_workout(rec)
                 await self.db.upsert_whoop_workout(row, rec)
             except Exception as e:
-                logger.debug(f"Debrief: whoop workout upsert failed: {e}")
+                obs.source_failed(logger, "whoop_workout_upsert", "debrief", e)
         for act in strava_acts:
             try:
                 await self.db.upsert_strava_activity(act)
             except Exception as e:
-                logger.debug(f"Debrief: strava activity upsert failed: {e}")
+                obs.source_failed(logger, "strava_activity_upsert", "debrief", e)
 
         # Choose the anchor workout: prefer the most recent WHOOP workout
         # (that's our HR source), fall back to the most recent Strava activity
@@ -2177,7 +2268,7 @@ class Coach:
                     f"Sleep {r.get('total_asleep_hours')}h"
                 )
         except Exception as e:
-            logger.debug(f"Debrief: recovery context fetch failed: {e}")
+            obs.source_failed(logger, "recovery_context", "debrief", e)
 
         # Active plan session for today, if any — lets the coach read the run
         # against what was prescribed instead of judging it in a vacuum.
@@ -2198,7 +2289,7 @@ class Coach:
                     if session.get("prescription"):
                         data_lines.append(f"  Prescription: {session['prescription']}")
         except Exception as e:
-            logger.debug(f"Debrief: active plan fetch failed: {e}")
+            obs.source_failed(logger, "active_plan", "debrief", e)
 
         data_block = "\n".join(data_lines)
 
@@ -2617,7 +2708,7 @@ Rules:
                     model=self.cheap_model, response=resp,
                 )
             except Exception as e:
-                logger.debug(f"_log_claude_call(lift_classifier) failed: {e}")
+                obs.source_failed(logger, "llm_calls_write", "lift_classifier", e)
             raw = resp.content[0].text
             start = raw.find("{")
             end = raw.rfind("}") + 1
@@ -2712,7 +2803,7 @@ If not (e.g. "headed to the sauna later" — no completion, no data): {{"is_sess
                     model=self.cheap_model, response=resp,
                 )
             except Exception as e:
-                logger.debug(f"_log_claude_call(recovery_session_classifier) failed: {e}")
+                obs.source_failed(logger, "llm_calls_write", "recovery_classifier", e)
             raw = resp.content[0].text
             start = raw.find("{")
             end = raw.rfind("}") + 1
@@ -2725,7 +2816,7 @@ If not (e.g. "headed to the sauna later" — no completion, no data): {{"is_sess
                     "notes": data.get("notes", "") or "",
                 }
         except Exception as e:
-            logger.debug(f"Recovery-session parse failed: {e}")
+            obs.source_failed(logger, "recovery_session_parse", "chat", e)
         return None
 
     # ── Active lift session (set-by-set guided workout) ────────────────────
@@ -2796,7 +2887,7 @@ Rules:
                     model=self.cheap_model, response=resp,
                 )
             except Exception as e:
-                logger.debug(f"_log_claude_call(lift_session_planner) failed: {e}")
+                obs.source_failed(logger, "llm_calls_write", "lift_session_planner", e)
             raw = resp.content[0].text
             start = raw.find("{")
             end = raw.rfind("}") + 1

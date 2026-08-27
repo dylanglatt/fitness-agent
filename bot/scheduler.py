@@ -531,7 +531,9 @@ class Scheduler:
                 row = whoop.normalize_workout(rec)
                 await db.upsert_whoop_workout(row, rec)
             except Exception as e:
-                logger.debug(f"Workout upsert failed during refresh: {e}")
+                obs.source_failed(
+                    logger, "whoop_workout_upsert", "brief_refresh", e
+                )
 
     async def _send_weekly_summary(self):
         logger.info("Sending weekly training summary...")
@@ -591,7 +593,9 @@ class Scheduler:
                     await db.upsert_whoop_workout(row, rec)
                     count_w += 1
                 except Exception as e:
-                    logger.debug(f"Workout upsert failed: {e}")
+                    obs.source_failed(
+                        logger, "whoop_workout_upsert", "nightly_sync", e
+                    )
             await db.set_sync_state(
                 "whoop",
                 datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -619,8 +623,16 @@ class Scheduler:
                 try:
                     act = await self.coach.strava.enrich_activity(act)
                 except Exception as e:
-                    logger.debug(
-                        f"Nightly enrichment skipped for {act.get('id')}: {e}"
+                    # This is the call that fetches Detailed fields + HR zones.
+                    # Failing it silently is exactly how Notion ends up with
+                    # rows that have null Avg HR and null Zone %, with nothing
+                    # in the log to say why.
+                    obs.source_failed(
+                        logger,
+                        "strava_enrichment",
+                        "nightly_sync",
+                        e,
+                        activity_id=act.get("id"),
                     )
                 await db.upsert_strava_activity(act)
                 count_a += 1

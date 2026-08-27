@@ -530,7 +530,7 @@ async def _run_split(today_iso):
                     z["easy"] += (r[0] or 0) + (r[1] or 0)
                     z["hard"] += (r[2] or 0) + (r[3] or 0) + (r[4] or 0)
     except Exception as e:
-        logger.debug("split query failed: %s", e)
+        logger.warning("split query failed: %s: %s", type(e).__name__, e)
     total = z["easy"] + z["hard"]
     if total <= 0:
         return {"easy": 0, "hard": 0}

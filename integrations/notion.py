@@ -29,6 +29,7 @@ in this module, not in callers.
 
 import json
 import logging
+import obs
 import re
 from datetime import datetime, timedelta
 
@@ -158,24 +159,46 @@ def zone_pcts_from_whoop_row(row: dict | None) -> dict[str, float] | None:
 def _zones_from_strava_distribution(
     zones: list[dict] | None,
     total_seconds: float | int | None,
-) -> dict[str, float] | None:
-    """Convert Strava's zones response to Zone1%..Zone5% dict.
+) -> tuple[dict[str, float] | None, str | None]:
+    """Convert Strava's zones response to (Zone1%..Zone5% dict, zone_source).
 
     Strava's GET /activities/{id}/zones returns a list of zone objects with
-    'type': 'heartrate' and 'distribution_buckets': [{'min':..,'max':..,'time':..}]
-    where time is seconds per bucket. We sum the HR zone bucket times and
-    express each as a percent of total. If zones aren't available (no HR
-    monitor for the activity), returns None and the Notion columns stay blank.
+    'type': 'heartrate' OR 'pace' and 'distribution_buckets':
+    [{'min':..,'max':..,'time':..}] where time is seconds per bucket. We sum
+    one zone type's bucket times and express each as a percent of total.
+
+    Heartrate is the preferred source and wins whenever it is present. But
+    this user's activities are uploaded to Strava BY WHOOP with the HR stream
+    stripped, so Strava has no heart rate to bucket and returns a *pace*
+    distribution instead (verified live: types: ['pace']). Before that
+    fallback existed this function returned None for every one of those
+    activities, which is why the Zone 1-5 % columns in Notion were
+    permanently null on exactly the runs the user cares about.
+
+    The second tuple element names where the numbers came from —
+    "heartrate", "pace", or None when nothing usable was found — so callers
+    can log or label the provenance. Pace-derived percentages occupy the same
+    five columns but are NOT heart-rate zones; a caller must not present them
+    as if they were.
     """
     if not zones or not total_seconds or total_seconds <= 0:
-        return None
-    hr_zone = next((z for z in zones if z.get("type") == "heartrate"), None)
-    if not hr_zone:
-        return None
-    buckets = hr_zone.get("distribution_buckets") or []
-    if not buckets:
-        return None
-    # Strava returns up to 5 HR zones; if fewer, the missing zones stay 0.
+        return None, None
+    # Preference order, not "first type with buckets": an activity carrying
+    # both distributions must always be scored off heart rate.
+    zone: dict | None = None
+    zone_source: str | None = None
+    for wanted in ("heartrate", "pace"):
+        candidate = next(
+            (z for z in zones if isinstance(z, dict) and z.get("type") == wanted),
+            None,
+        )
+        if candidate and (candidate.get("distribution_buckets") or []):
+            zone, zone_source = candidate, wanted
+            break
+    if not zone:
+        return None, None
+    buckets = zone.get("distribution_buckets") or []
+    # Strava returns up to 5 zones; if fewer, the missing zones stay 0.
     pct: dict[str, float] = {}
     for i, bucket in enumerate(buckets[:5]):
         t = bucket.get("time") or 0
@@ -184,7 +207,7 @@ def _zones_from_strava_distribution(
     # makes the "this run was all Z2" vs "missing data" distinction clear.
     for i in range(1, 6):
         pct.setdefault(f"zone_{i}_pct", 0.0)
-    return pct
+    return pct, zone_source
 
 
 # ── Property builders ────────────────────────────────────────────────────────
@@ -294,12 +317,30 @@ class NotionClient:
                     headers=self._headers(),
                 )
             except Exception as e:
+                # The string goes back to whoever asked (a /notionping reply);
+                # nothing was ever written to the log, so an unreachable Notion
+                # during a scheduled run left no trace at all.
+                obs.source_failed(
+                    logger, "notion_ping", "_ping_database", e, db_id=db_id
+                )
                 return False, f"Network error reaching Notion: {e}"
         if resp.status_code == 200:
             body = resp.json()
             title_rt = body.get("title") or []
             title = title_rt[0].get("plain_text") if title_rt else "(untitled)"
             return True, f"Connected to '{title}'."
+        # Everything from here down is a failure that used to be returned as
+        # a human-readable string and never logged — a revoked API key looked
+        # identical to a healthy one in the journal. One WARNING names the
+        # database and the status before we build the friendly message.
+        obs.log_event(
+            logger,
+            logging.WARNING,
+            "notion.ping_failed",
+            db_id=db_id,
+            status=resp.status_code,
+            detail=resp.text[:200],
+        )
         if resp.status_code == 401:
             return False, "401 Unauthorized — NOTION_API_KEY is invalid or revoked."
         if resp.status_code == 404:
@@ -426,7 +467,7 @@ class NotionClient:
         _set_rich_text(props, "Notes", notes)
         page = await self._create_page(self.schedule_db_id, props)
         if page:
-            logger.info(f"Notion Schedule row created for {date}.")
+            logger.debug("Notion Schedule row created for %s.", date)
             return page.get("id")
         return None
 
@@ -451,11 +492,21 @@ class NotionClient:
                     json=payload,
                 )
         except Exception as e:
-            logger.debug(f"Notion Schedule query error: {e}")
+            # Returning None here does not just lose a relation: the caller
+            # (find_or_create_schedule) reads it as "no row for this date" and
+            # CREATES a duplicate Schedule page. A failed lookup must be loud.
+            obs.source_failed(
+                logger, "notion_schedule", "find_schedule_for_date", e, date=date
+            )
             return None
         if resp.status_code != 200:
-            logger.debug(
-                f"Notion Schedule query failed: {resp.status_code} {resp.text[:200]}"
+            obs.log_event(
+                logger,
+                logging.WARNING,
+                "notion.schedule_query_failed",
+                date=date,
+                status=resp.status_code,
+                detail=resp.text[:200],
             )
             return None
         results = resp.json().get("results", [])
@@ -551,7 +602,7 @@ class NotionClient:
 
         page = await self._create_page(self.lifts_db_id, props)
         if page:
-            logger.info(f"Notion Lift row created: {exercise} ({date}).")
+            logger.debug("Notion Lift row created: %s (%s).", exercise, date)
             return page.get("id")
         return None
 
@@ -624,8 +675,9 @@ class NotionClient:
 
         page = await self._create_page(self.lift_sets_db_id, props)
         if page:
-            logger.info(
-                f"Notion Lift Set row created: {exercise} set {set_number} ({date})."
+            logger.debug(
+                "Notion Lift Set row created: %s set %s (%s).",
+                exercise, set_number, date,
             )
             return page.get("id")
         return None
@@ -687,7 +739,7 @@ class NotionClient:
 
         page = await self._create_page(self.runs_db_id, props)
         if page:
-            logger.info(f"Notion Run row created: {type} {name} ({date}).")
+            logger.debug("Notion Run row created: %s %s (%s).", type, name, date)
             return True
         return False
 
@@ -752,8 +804,33 @@ class NotionClient:
             zone_pcts = whoop_zone_pcts
             source = "WHOOP"
         else:
-            zone_pcts = _zones_from_strava_distribution(zones, activity.get("moving_time")) or {}
+            strava_zone_pcts, zone_source = _zones_from_strava_distribution(
+                zones, activity.get("moving_time")
+            )
+            zone_pcts = strava_zone_pcts or {}
             source = "Strava"
+            if zone_source is None and zones:
+                # We were handed a zones payload and still produced nothing.
+                # This is the silent path that left Zone 1-5 % null on every
+                # WHOOP-uploaded run — name the types Strava actually sent so
+                # the next unknown zone type is a one-line diagnosis.
+                obs.log_event(
+                    logger,
+                    logging.WARNING,
+                    "notion.zones_unusable",
+                    activity_id=activity_id,
+                    zone_types=[
+                        z.get("type") for z in zones if isinstance(z, dict)
+                    ],
+                )
+            elif zone_source == "pace":
+                # Pace zones share the Zone 1-5 % columns with HR zones but
+                # mean something different. Debug, not warning: for this user
+                # it is the normal steady state, not a fault.
+                logger.debug(
+                    "Notion Zone 1-5 %% sourced from Strava pace zones for %s.",
+                    activity_id,
+                )
 
         # HR: prefer WHOOP avg when the workout matched; fall back to Strava.
         avg_hr = (whoop_workout or {}).get("average_hr") or activity.get("average_heartrate")
@@ -806,7 +883,7 @@ class NotionClient:
 
         page = await self._create_page(self.daily_db_id, props)
         if page:
-            logger.info(f"Notion Daily Log row created for {date}.")
+            logger.debug("Notion Daily Log row created for %s.", date)
             return True
         return False
 
@@ -915,8 +992,17 @@ class NotionClient:
                 for m in _LIFTROW_MARKER.finditer(text):
                     try:
                         existing_lift_ids.add(int(m.group(1)))
-                    except ValueError:
-                        pass
+                    except ValueError as e:
+                        # A marker we can't parse is a marker we can't dedup
+                        # on, so this lift gets written to Notion a second
+                        # time. Silent `pass` is how duplicates breed.
+                        obs.source_failed(
+                            logger,
+                            "notion_liftrow_marker",
+                            "reconcile_recent",
+                            e,
+                            marker=m.group(0)[:40],
+                        )
 
             # 2. What does SQLite have for the same window?
             try:
@@ -978,7 +1064,17 @@ class NotionClient:
                 if raw:
                     try:
                         payload = json.loads(raw) if isinstance(raw, str) else raw
-                    except Exception:
+                    except Exception as e:
+                        # We fall back to the thin column-built dict below,
+                        # which has no _zones and no detailed HR — the row
+                        # gets written looking fine but thinner than it should.
+                        obs.source_failed(
+                            logger,
+                            "strava_raw_json",
+                            "reconcile_recent",
+                            e,
+                            activity_id=aid,
+                        )
                         payload = {}
                 if not payload:
                     payload = {
@@ -999,7 +1095,17 @@ class NotionClient:
 
                 try:
                     whoop_match = await db.find_whoop_workout_for_strava_activity(row)
-                except Exception:
+                except Exception as e:
+                    # No match means the row loses WHOOP HR and WHOOP zone
+                    # percentages and falls back to whatever Strava has, which
+                    # for these activities is often nothing at all.
+                    obs.source_failed(
+                        logger,
+                        "whoop_workout_match",
+                        "reconcile_recent",
+                        e,
+                        activity_id=aid,
+                    )
                     whoop_match = None
                 try:
                     ok = await self.log_strava_activity(
@@ -1013,4 +1119,15 @@ class NotionClient:
                 if ok:
                     result["activities"] += 1
 
+        # One summary line for the whole pass. The per-row "row created"
+        # lines are debug now, so this is the only thing an INFO-level
+        # journal shows for a reconcile — and it carries the counts.
+        obs.log_event(
+            logger,
+            logging.INFO,
+            "notion.reconcile_done",
+            days=days,
+            lifts_written=result["lifts"],
+            activities_written=result["activities"],
+        )
         return result

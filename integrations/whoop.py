@@ -5,6 +5,7 @@ Uses WHOOP API v2 (v1 was discontinued; see https://developer.whoop.com/docs/dev
 
 import httpx
 import logging
+import obs
 import os
 import re
 import tempfile
@@ -285,9 +286,21 @@ class WhoopClient:
         try:
             import pytz
             tz = pytz.timezone(local_tz) if local_tz else pytz.UTC
-        except Exception:
+        except Exception as e:
             import pytz
             tz = pytz.UTC
+            # Falling back to UTC silently corrupts date logic: after ~19:00
+            # Eastern "today" has already rolled over in UTC, so the filter
+            # below rejects this morning's recovery and the brief reports
+            # "no recovery yet" for a reason nobody could see. Never quiet.
+            obs.source_failed(
+                logger,
+                "whoop_local_tz",
+                "get_today_snapshot",
+                e,
+                requested_tz=local_tz,
+                fallback="UTC",
+            )
         today_local = datetime.now(tz).date()
 
         def _on_today(rec: dict, ts_keys: tuple[str, ...]) -> bool:
@@ -299,7 +312,19 @@ class WhoopClient:
                     dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                     if dt.astimezone(tz).date() == today_local:
                         return True
-                except Exception:
+                except Exception as e:
+                    # An unparseable timestamp means this record can never
+                    # match today, so the whole field comes back None and the
+                    # brief honestly says "no recovery yet" — for the wrong
+                    # reason. Name the key we choked on.
+                    obs.source_failed(
+                        logger,
+                        "whoop_snapshot",
+                        "timestamp_parse",
+                        e,
+                        ts_key=k,
+                        raw_ts=str(ts)[:40],
+                    )
                     continue
             return False
 

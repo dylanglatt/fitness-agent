@@ -1849,7 +1849,11 @@ class Database:
                 try:
                     await self.upsert_whoop_body_measurement(body)
                 except Exception as e:
-                    logger.debug(f"Body measurement upsert failed: {e}")
+                    logger.warning(
+                        "body_measurement upsert failed: %s: %s",
+                        type(e).__name__,
+                        e,
+                    )
                 if baseline is not None and target is not None and baseline != target:
                     total = abs(baseline - target)
                     done = abs(baseline - current_lb)

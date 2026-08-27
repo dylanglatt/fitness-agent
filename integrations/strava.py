@@ -5,6 +5,7 @@ Handles OAuth token refresh automatically.
 
 import httpx
 import logging
+import obs
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -121,11 +122,29 @@ class StravaClient:
                     headers={"Authorization": f"Bearer {self._access_token}"},
                 )
         except Exception as e:
-            logger.debug(f"Strava zones fetch failed for {activity_id}: {e}")
+            # Zones being "optional context" is exactly how the Zone 1-5 %
+            # columns went null for months without anyone noticing. Optional
+            # for control flow, never optional for the log.
+            obs.source_failed(
+                logger,
+                "strava_zones",
+                "get_activity_zones",
+                e,
+                activity_id=activity_id,
+            )
             return None
         if resp.status_code != 200:
-            logger.debug(
-                f"Strava zones {activity_id} returned {resp.status_code}: {resp.text[:200]}"
+            # Not an exception, so source_failed doesn't fit. A 200-with-[]
+            # is the normal "no paired HR sensor" case and stays quiet; any
+            # other status means we asked and Strava refused (rate limit,
+            # scope, deleted activity) and the caller silently loses zones.
+            obs.log_event(
+                logger,
+                logging.WARNING,
+                "strava.zones_http_error",
+                activity_id=activity_id,
+                status=resp.status_code,
+                detail=resp.text[:200],
             )
             return None
         data = resp.json() or []
@@ -155,7 +174,16 @@ class StravaClient:
                 # Detailed is a superset of Summary; merge with detail winning.
                 out = {**out, **detail}
         except Exception as e:
-            logger.debug(f"Enrichment detail fetch failed for {activity_id}: {e}")
+            # This is THE reason Notion rows have a null Avg HR: the Summary
+            # payload has no HR at all, so losing the Detailed fetch loses
+            # heart rate entirely while the write still "succeeds".
+            obs.source_failed(
+                logger,
+                "strava_activity_detail",
+                "enrich_activity",
+                e,
+                activity_id=activity_id,
+            )
         if fetch_zones:
             zones = await self.get_activity_zones(int(activity_id))
             if zones is not None:
