@@ -946,6 +946,28 @@ class NotionClient:
         rt = notes.get("rich_text") or []
         return "".join(r.get("plain_text", "") for r in rt)
 
+    async def existing_strava_markers(self, days: int = 7) -> set[str]:
+        """Strava activity ids already present in Notion, from BOTH databases.
+
+        WeightTraining activities are routed to the LIFTS DB by
+        log_strava_activity, so their [strava:<id>] markers live there, not in
+        Runs. Any caller that checks only one database will happily re-create
+        every row it can't see — which is exactly how the Lifts DB ended up
+        with 93 duplicated activities and the Runs DB gained one per morning.
+        """
+        since = (datetime.now().date() - timedelta(days=days)).isoformat()
+        ids: set[str] = set()
+        for configured, db_id in (
+            (self.is_configured_runs(), self.runs_db_id),
+            (self.is_configured_lifts(), self.lifts_db_id),
+        ):
+            if not configured:
+                continue
+            for page in await self._query_pages_since(db_id, "Date", since):
+                for m in _STRAVA_MARKER.finditer(self._notes_text(page)):
+                    ids.add(m.group(1))
+        return ids
+
     async def reconcile_recent(self, db, days: int = 7) -> dict:
         """Find SQLite lifts + Strava activities that don't have a Notion
         counterpart in the last `days` days, and write the missing ones.

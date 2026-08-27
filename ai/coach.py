@@ -2048,23 +2048,50 @@ class Coach:
         # One Runs row per Strava activity. Each activity also flows into the
         # Schedule DB (via find_or_create_schedule inside log_run) so that
         # day's Schedule entry exists and relates back. Non-run cardio
-        # (rides/hikes/swims/walks) lands here too, tagged by Type. Dedupe-by
-        # -date isn't enforced — if the same activity lands twice, the user
-        # can delete the dupe row manually.
+        # (rides/hikes/swims/walks) lands here too, tagged by Type.
+        #
+        # Dedup by [strava:<id>] marker is MANDATORY here. This loop used to
+        # write unconditionally, with a comment saying the user could delete
+        # dupes by hand. It runs every morning over a 1-day window, so
+        # yesterday evening's activity — already written by the Strava webhook
+        # — was re-created every single day. Eight of the nine duplicated runs
+        # in the live Notion were stamped at exactly the brief's fire time.
         #
         # For each activity we look up the matching WHOOP workout by
         # (date + ±30min) and pass it to log_strava_activity, which prefers
         # WHOOP's continuous-wrist HR + zone math over Strava's numbers.
         # Without this, new Runs rows would land with HR but no zones —
         # same gap the offline backfill closed.
+        try:
+            already_in_notion = await self.notion.existing_strava_markers(days=3)
+        except Exception as e:
+            # Fail CLOSED: if we can't tell what's already there, don't write.
+            # A missing row is fixed by the next reconcile pass; a duplicate
+            # row is permanent until someone deletes it by hand.
+            obs.source_failed(logger, "notion_strava_markers", "brief", e)
+            already_in_notion = None
+
+        written = skipped = 0
         for a in activities:
+            if already_in_notion is None or str(a.get("id")) in already_in_notion:
+                skipped += 1
+                continue
             try:
                 whoop_match = await self.db.find_whoop_workout_for_strava_activity(a)
                 await self.notion.log_strava_activity(a, whoop_workout=whoop_match)
+                written += 1
             except Exception as e:
                 obs.source_failed(
                     logger, "notion_run_log", "brief", e, activity_id=a.get("id")
                 )
+        obs.log_event(
+            logger,
+            logging.INFO,
+            "notion.brief_activity_log",
+            written=written,
+            skipped=skipped,
+            marker_lookup="failed" if already_in_notion is None else "ok",
+        )
 
         return brief
 
