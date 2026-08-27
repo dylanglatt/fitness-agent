@@ -108,18 +108,40 @@ class WhoopClient:
                 )
         _persist_refresh_token_to_env(token)
 
-    async def _ensure_token(self):
+    async def _reload_token_from_store(self) -> Optional[str]:
+        """Force a re-read of the durable token store, bypassing the cache.
+
+        _load_token_from_store deliberately runs once per process. That is fine
+        until someone re-authorizes: whoop_auth.py writes a fresh token into
+        oauth_tokens, but a long-running bot has already cached the old one and
+        keeps presenting the consumed token forever. The re-auth appears to do
+        nothing and the only cure was a service restart — which is exactly the
+        trap that kept WHOOP dark after a re-auth.
+        """
+        if self.db is None:
+            return None
+        try:
+            return await self.db.get_oauth_token("whoop")
+        except Exception as e:
+            obs.source_failed(logger, "whoop_token_store", "reload", e)
+            return None
+
+    async def _ensure_token(self, *, _allow_store_retry: bool = True):
         """Refresh access token if expired.
 
         WHOOP rotates refresh tokens on every exchange, so we must capture the
         new refresh_token from the response, update our in-memory copy, AND
         persist it to the durable store so the next process start doesn't use a
         consumed token and hit 400 Bad Request.
+
+        On a 400 we re-read the durable store once before giving up, so a
+        re-authorization takes effect on a running bot without a restart.
         """
         await self._load_token_from_store()
         if self._access_token and datetime.utcnow().timestamp() < self._token_expires_at - 60:
             return
 
+        attempted = self.refresh_token
         async with httpx.AsyncClient() as client:
             resp = await client.post(TOKEN_URL, data={
                 "client_id": self.client_id,
@@ -128,10 +150,25 @@ class WhoopClient:
                 "grant_type": "refresh_token",
             })
             if resp.status_code == 400:
+                # Self-heal: somebody may have just run whoop_auth.py. Re-read
+                # the store and retry once with whatever is there now.
+                if _allow_store_retry:
+                    fresh = await self._reload_token_from_store()
+                    if fresh and fresh != attempted:
+                        obs.log_event(
+                            logger,
+                            logging.WARNING,
+                            "whoop.token_reloaded",
+                            reason="400_on_cached_token",
+                            detail="a newer token was found in the store; retrying",
+                        )
+                        self.refresh_token = fresh
+                        return await self._ensure_token(_allow_store_retry=False)
                 raise WhoopAuthError(
                     "WHOOP refresh token rejected (400). The stored token is "
-                    "consumed or expired and cannot self-heal. Re-authorize with "
-                    "`python whoop_auth.py`, then restart the bot.",
+                    "consumed or expired. Re-authorize with "
+                    "`python whoop_auth.py` ON THE HOST (it must write to the "
+                    "oauth_tokens table, not just .env — the DB copy wins).",
                     status_code=400,
                 )
             resp.raise_for_status()

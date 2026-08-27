@@ -25,6 +25,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
@@ -38,7 +39,7 @@ sys.path.insert(
 from ai.coach import Coach  # noqa: E402
 from data.database import Database  # noqa: E402
 from integrations.webhook_server import _verify_whoop_signature  # noqa: E402
-from integrations.whoop import WhoopClient  # noqa: E402
+from integrations.whoop import WhoopClient, WhoopAuthError  # noqa: E402
 
 
 def _iso(dt: datetime) -> str:
@@ -318,3 +319,87 @@ class WorkoutNormalizerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WhoopTokenSelfHealTests(unittest.TestCase):
+    """A re-auth must take effect on a RUNNING bot.
+
+    WhoopClient caches the refresh token on first use (_load_token_from_store
+    runs once per process). whoop_auth.py writes a fresh token into
+    oauth_tokens, but the running process kept presenting the consumed one and
+    kept 400-ing, so the re-auth looked like it did nothing and the only cure
+    was a service restart. _ensure_token now re-reads the store once on a 400.
+    """
+
+    def _client(self, stored_tokens):
+        db = MagicMock()
+        db.get_oauth_token = AsyncMock(side_effect=list(stored_tokens))
+        db.set_oauth_token = AsyncMock(return_value=None)
+        cfg = MagicMock()
+        cfg.WHOOP_CLIENT_ID = "cid"
+        cfg.WHOOP_CLIENT_SECRET = "secret"
+        cfg.WHOOP_REFRESH_TOKEN = "seed"
+        return WhoopClient(cfg, db=db), db
+
+    def test_400_retries_once_with_a_freshly_stored_token(self):
+        client, _db = self._client(["stale-token", "fresh-token"])
+
+        posts = []
+
+        class _Resp:
+            def __init__(self, status, payload=None):
+                self.status_code = status
+                self._payload = payload or {}
+
+            def json(self):
+                return self._payload
+
+            def raise_for_status(self):
+                pass
+
+        class _FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, url, data=None):
+                posts.append(data["refresh_token"])
+                if data["refresh_token"] == "fresh-token":
+                    return _Resp(200, {"access_token": "at", "expires_in": 3600})
+                return _Resp(400)
+
+        with unittest.mock.patch.object(
+            sys.modules["integrations.whoop"].httpx, "AsyncClient", _FakeAsyncClient
+        ):
+            asyncio.run(client._ensure_token())
+
+        # First attempt used the cached/stale token, second used the fresh one
+        # pulled from the store — without a process restart.
+        self.assertEqual(posts, ["stale-token", "fresh-token"])
+        self.assertEqual(client._access_token, "at")
+
+    def test_400_still_raises_when_the_store_has_nothing_newer(self):
+        client, _db = self._client(["stale-token", "stale-token"])
+
+        class _Resp400:
+            status_code = 400
+
+        class _FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def post(self, url, data=None):
+                return _Resp400()
+
+        with unittest.mock.patch.object(
+            sys.modules["integrations.whoop"].httpx, "AsyncClient", _FakeAsyncClient
+        ):
+            with self.assertRaises(WhoopAuthError) as ctx:
+                asyncio.run(client._ensure_token())
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("oauth_tokens", str(ctx.exception))

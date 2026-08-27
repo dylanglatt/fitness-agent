@@ -123,11 +123,22 @@ def update_db_token(refresh_token):
     dependency-light and synchronous.
     """
     import sqlite3
-    db_path = os.getenv("DB_PATH", "data/fitness_agent.db")
-    db_path = os.path.join(os.path.dirname(__file__), db_path)
+    # The default here used to be `data/fitness_agent.db`, which is NOT the
+    # live database (`data/fitness_bot.db`). If DB_PATH was missing from .env,
+    # this silently skipped the DB write, left the STALE token in oauth_tokens
+    # — which the bot prefers over .env — and the re-auth appeared to succeed
+    # while changing nothing. The message below said the token would "migrate
+    # from .env on next bot start", but _load_token_from_store only migrates
+    # when the DB row is ABSENT, and it wasn't.
+    db_path = os.getenv("DB_PATH", "data/fitness_bot.db")
+    if not os.path.isabs(db_path):
+        db_path = os.path.join(os.path.dirname(__file__), db_path)
     if not os.path.exists(db_path):
-        print(f"  ⚠️  DB not found at {db_path} — skipping DB token write. "
-              f"It will migrate from .env on next bot start.")
+        print(f"  ❌ DB NOT FOUND at {db_path} — the DB token was NOT written.")
+        print("     The bot reads its WHOOP token from the oauth_tokens table,")
+        print("     which still holds the OLD token, so this re-auth will have")
+        print("     NO EFFECT. Set DB_PATH in .env to the live database and")
+        print("     re-run this script.")
         return
     try:
         con = sqlite3.connect(db_path)
