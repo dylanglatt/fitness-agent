@@ -151,6 +151,72 @@ async def _log_claude_call(db, *, caller: str, model: str, response) -> dict:
     return stats
 
 
+# ── Run best-effort formatting ──────────────────────────────────────────────
+
+# Strava's standard best-effort distances, shortest first. Used to order the
+# RUN PROGRESSION block; anything Strava reports that isn't here still renders,
+# just after these.
+_BEST_EFFORT_ORDER = [
+    "400m", "1/2 mile", "1K", "1 mile", "2 mile", "5K", "10K",
+    "15K", "10 mile", "20K", "Half-Marathon", "30K", "Marathon",
+]
+
+
+def _mmss(seconds) -> str:
+    """Seconds -> m:ss (or h:mm:ss past an hour). '-' when unknown."""
+    if seconds is None:
+        return "-"
+    try:
+        total = int(round(float(seconds)))
+    except (TypeError, ValueError):
+        return "-"
+    h, rem = divmod(total, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def _render_run_progression(rows: list[dict]) -> str:
+    """Render Strava best efforts as the objective running-progression block.
+
+    This exists because every activity reaching us is uploaded by WHOOP with
+    the heart-rate stream stripped, so avg HR, HR zones and suffer_score are
+    all null and the brief had no numeric read on running form at all — the
+    same gap that made the lifting side feel disconnected. Best efforts need
+    no HR: they are times over fixed distances, and they come free with the
+    Strava subscription.
+    """
+    if not rows:
+        return ""
+    by_name = {r.get("name"): r for r in rows}
+    ordered = [n for n in _BEST_EFFORT_ORDER if n in by_name]
+    ordered += [n for n in by_name if n not in _BEST_EFFORT_ORDER]
+    if not ordered:
+        return ""
+    lines = [
+        "RUN PROGRESSION (Strava best efforts, last 90d — times over fixed "
+        "distances; HR/zones are unavailable, see note):"
+    ]
+    for name in ordered:
+        r = by_name[name]
+        last_s, best_s = r.get("last_s"), r.get("best_s")
+        all_s = r.get("alltime_best_s")
+        parts = [f"{_mmss(last_s)} on {r.get('last_date')}"]
+        if best_s is not None and last_s is not None:
+            if last_s <= best_s:
+                parts.append("fastest in 90d")
+            else:
+                parts.append(f"90d best {_mmss(best_s)} (+{_mmss(last_s - best_s)})")
+        if all_s is not None and (best_s is None or all_s < best_s):
+            parts.append(f"all-time {_mmss(all_s)}")
+        lines.append(f"  {name}: " + " · ".join(parts) + f" [{r.get('n')} efforts]")
+    lines.append(
+        "  NOTE: activities arrive via WHOOP's Strava upload with the HR "
+        "stream stripped, so avg HR and HR zones are null by design. Judge "
+        "running progress on these times, not on zone distribution."
+    )
+    return "\n".join(lines)
+
+
 # ── Time formatting ─────────────────────────────────────────────────────────
 def _fmt_time(dt: datetime) -> str:
     """Human-friendly local time, e.g. '2:05 PM EDT'.
@@ -1660,6 +1726,25 @@ class Coach:
             )
         except Exception as e:
             obs.source_failed(logger, "autoregulation", "brief", e)
+
+        # ── RUN PROGRESSION — Strava best efforts (subscription feature).
+        # The brief had no numeric read on running form: HR and zones are null
+        # because WHOOP uploads to Strava with the HR stream stripped. Best
+        # efforts are times over fixed distances, so they work regardless.
+        try:
+            be_rows = await self.db.get_best_effort_summary(days=90)
+            be_block = _render_run_progression(be_rows)
+            if be_block:
+                lines.append("")
+                lines.append(be_block)
+            obs.log_event(
+                logger,
+                logging.INFO,
+                "run_progression.rendered",
+                distances=len(be_rows or []),
+            )
+        except Exception as e:
+            obs.source_failed(logger, "strava_best_efforts", "brief", e)
 
         # ── Last 7 days detail
         if daily:

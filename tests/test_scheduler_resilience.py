@@ -66,8 +66,7 @@ def _make_scheduler() -> Scheduler:
 
 def _marked_keys(sched: Scheduler) -> set[str]:
     return {
-        c.kwargs.get("source")
-        for c in sched.coach.db.set_sync_state.await_args_list
+        c.kwargs.get("source") for c in sched.coach.db.set_sync_state.await_args_list
     }
 
 
@@ -220,9 +219,7 @@ class HeartbeatTests(unittest.TestCase):
         sched = _make_scheduler()
         sched.coach.whoop = MagicMock()
         sched.coach.whoop.get_recovery = AsyncMock(return_value=[{"score": {}}])
-        sched.coach.db.get_latest_whoop_date = AsyncMock(
-            return_value="2026-08-27"
-        )
+        sched.coach.db.get_latest_whoop_date = AsyncMock(return_value="2026-08-27")
         sched.coach.db.get_latest_strava_timestamp = AsyncMock(
             return_value=datetime(2026, 8, 26, 12, 0, tzinfo=pytz.utc).timestamp()
         )

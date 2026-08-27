@@ -133,6 +133,35 @@ class Database:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_strava_date ON strava_activities(date)"
             )
+            # ── Strava best efforts (subscription-only) ────────────────────
+            # The Detailed activity response carries `best_efforts` for runs:
+            # 400m, 1/2 mile, 1K, 1 mile, 2 mile, 5K, 10K ... each with an
+            # elapsed time and a pr_rank. This is the one objective running
+            # progression signal that survives the fact that every activity
+            # reaching us is uploaded by WHOOP with the heart-rate stream
+            # stripped (has_heartrate: false, external_id "stripped_..."), so
+            # avg HR, HR zones and suffer_score are all null.
+            #
+            # It lives in its own table rather than being dug back out of
+            # raw_json because the whole point is querying ACROSS activities:
+            # "is my 5K time trending down?" is a GROUP BY, not a JSON scan.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS strava_best_efforts (
+                    activity_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    elapsed_time_s INTEGER,
+                    moving_time_s INTEGER,
+                    distance_m REAL,
+                    pr_rank INTEGER,
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    PRIMARY KEY (activity_id, name)
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_best_effort_name_date "
+                "ON strava_best_efforts(name, date)"
+            )
             # sync_state: last successful sync timestamp per source. Lets the
             # nightly job ask "what's new since last time?" without refetching
             # the world.
@@ -951,6 +980,95 @@ class Database:
 
     # ── Strava upserts ──────────────────────────────────────────────────────
 
+    @staticmethod
+    async def _upsert_best_efforts_conn(db, activity_id: int, date: str, activity: dict):
+        """Persist the `best_efforts` array from a Detailed activity.
+
+        Shares the caller's connection and transaction — this runs inside
+        upsert_strava_activity so an activity and its efforts commit together.
+        Summary activities have no best_efforts key, so a non-enriched upsert
+        is a no-op rather than a delete: we never destroy efforts we already
+        have just because this particular fetch skipped enrichment.
+        """
+        efforts = activity.get("best_efforts")
+        if not isinstance(efforts, list) or not efforts:
+            return
+        for e in efforts:
+            name = (e or {}).get("name")
+            if not name:
+                continue
+            await db.execute(
+                """
+                INSERT INTO strava_best_efforts
+                    (activity_id, name, date, elapsed_time_s, moving_time_s,
+                     distance_m, pr_rank, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(activity_id, name) DO UPDATE SET
+                    date=excluded.date,
+                    elapsed_time_s=excluded.elapsed_time_s,
+                    moving_time_s=excluded.moving_time_s,
+                    distance_m=excluded.distance_m,
+                    pr_rank=excluded.pr_rank,
+                    updated_at=datetime('now')
+                """,
+                (
+                    activity_id,
+                    name,
+                    date,
+                    e.get("elapsed_time"),
+                    e.get("moving_time"),
+                    e.get("distance"),
+                    e.get("pr_rank"),
+                ),
+            )
+
+    async def get_best_effort_progression(
+        self, name: str, limit: int = 8
+    ) -> list[dict]:
+        """Every recorded effort at one standard distance, newest first."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT date, elapsed_time_s, moving_time_s, distance_m, pr_rank
+                FROM strava_best_efforts
+                WHERE name = ? AND elapsed_time_s IS NOT NULL
+                ORDER BY date DESC
+                LIMIT ?
+                """,
+                (name, limit),
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def get_best_effort_summary(self, days: int = 90) -> list[dict]:
+        """Per standard distance: the best time in the window, the most recent
+        time, and the all-time best. That triple is what makes a progression
+        statement possible — "your 5K is 47s off your best, and your last one
+        was your fastest in 90 days" — instead of a bare number.
+        """
+        since = (datetime.now().date() - timedelta(days=days)).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT
+                    name,
+                    COUNT(*)                     AS n,
+                    MIN(elapsed_time_s)          AS best_s,
+                    MAX(date)                    AS last_date,
+                    (SELECT b2.elapsed_time_s FROM strava_best_efforts b2
+                      WHERE b2.name = b.name AND b2.date >= ?
+                      ORDER BY b2.date DESC LIMIT 1) AS last_s,
+                    (SELECT MIN(b3.elapsed_time_s) FROM strava_best_efforts b3
+                      WHERE b3.name = b.name)        AS alltime_best_s
+                FROM strava_best_efforts b
+                WHERE b.date >= ? AND b.elapsed_time_s IS NOT NULL
+                GROUP BY b.name
+                """,
+                (since, since),
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
     async def upsert_strava_activity(self, activity: dict):
         """Insert/update one Strava activity. Uses Strava's activity id as PK."""
         activity_id = activity.get("id")
@@ -996,6 +1114,7 @@ class Database:
                     json.dumps(activity),
                 ),
             )
+            await self._upsert_best_efforts_conn(db, activity_id, start_date, activity)
             await db.commit()
 
     # ── Sync state ──────────────────────────────────────────────────────────

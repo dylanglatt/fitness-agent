@@ -119,9 +119,11 @@ RELEASE = _release()
 
 # Attributes LogRecord always carries; anything else on the record is a field
 # we (or a caller's extra=) put there and should be rendered.
-_RESERVED = frozenset(
-    vars(logging.LogRecord("", 0, "", 0, "", (), None)).keys()
-) | {"message", "asctime", "taskName"}
+_RESERVED = frozenset(vars(logging.LogRecord("", 0, "", 0, "", (), None)).keys()) | {
+    "message",
+    "asctime",
+    "taskName",
+}
 
 
 class _ContextFilter(logging.Filter):
@@ -148,7 +150,7 @@ def _fmt_value(v: Any) -> str:
 class _TextFormatter(logging.Formatter):
     """Human format for dev and for `journalctl` reading:
 
-        14:02:11 [INFO ] ai.coach {brief-1a2b3c4d} brief.done duration_ms=1840 …
+    14:02:11 [INFO ] ai.coach {brief-1a2b3c4d} brief.done duration_ms=1840 …
     """
 
     default_time_format = "%Y-%m-%d %H:%M:%S"
@@ -306,7 +308,7 @@ def init_sentry(service: str) -> bool:
             server_name=service,
             integrations=[
                 LoggingIntegration(
-                    level=logging.WARNING,      # breadcrumbs
+                    level=logging.WARNING,  # breadcrumbs
                     event_level=logging.ERROR,  # events
                 )
             ],
@@ -322,9 +324,7 @@ def init_sentry(service: str) -> bool:
 # ── Emitting ─────────────────────────────────────────────────────────────────
 
 
-def log_event(
-    logger: logging.Logger, level: int, event: str, /, **fields: Any
-) -> None:
+def log_event(logger: logging.Logger, level: int, event: str, /, **fields: Any) -> None:
     """Emit one structured event line.
 
         log_event(log, logging.WARNING, "context.source_failed",

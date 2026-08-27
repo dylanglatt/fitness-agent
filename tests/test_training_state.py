@@ -7,10 +7,11 @@ Pure-logic tests — no DB, no LLM. Run: python -m pytest tests/test_training_st
 from datetime import date
 
 from ai.training_state import (
-    classify_exercise, classify_run, build_training_state,
+    classify_exercise, classify_run, build_training_state, is_lift_activity,
     classify_planned_session, assess_readiness,
     recovery_intensity_band, assess_deload,
     whoop_recovery_sessions, merge_recovery_sessions, render_recovery_block,
+    render_readiness_block,
     PUSH, PULL, LEGS, CORE, RUN_EASY, RUN_QUALITY, RUN_LONG,
 )
 
@@ -167,3 +168,84 @@ if __name__ == "__main__":
             print(f"FAIL {fn.__name__}: {e}")
     print(f"\n{len(fns) - failed}/{len(fns)} passed")
     sys.exit(1 if failed else 0)
+
+
+# ── Unclassified lifting sessions (Strava / WHOOP activities) ────────────────
+#
+# The bug: build_training_state derived push/pull/legs recency ONLY from the
+# chat-logged `lifts` table. The activities it was also handed went through
+# classify_run(), which returns None for weight training — so every Strava
+# `WeightTraining` and WHOOP `Weightlifting` session was invisible to the
+# engine, while _compute_plan_adherence counted them. The same brief could say
+# "lifts 1/3 last week" and "Push: not trained in 14d, READY" in adjacent
+# blocks, and the header called itself "authoritative".
+
+
+def _act(days_ago: int, sport: str, **kw) -> dict:
+    row = {"date": _iso(days_ago), "sport_type": sport}
+    row.update(kw)
+    return row
+
+
+def test_weight_training_activity_is_not_a_run():
+    assert classify_run(_act(1, "WeightTraining")) is None
+    assert is_lift_activity(_act(1, "WeightTraining"))
+    assert is_lift_activity(_act(1, "Weightlifting"))
+    assert is_lift_activity({"sport_name": "Strength Training"})
+    assert not is_lift_activity(_act(1, "Run"))
+    assert not is_lift_activity({})
+
+
+def test_activity_lifts_are_tracked_as_unclassified():
+    state = build_training_state(
+        lifts=[],
+        activities=[_act(1, "WeightTraining"), _act(4, "WeightTraining")],
+        today=TODAY,
+    )
+    ul = state["unlogged_lifts"]
+    assert ul["last_days_ago"] == 1
+    assert ul["count_7d"] == 2
+    # We know a lift happened; we still don't know which pattern.
+    assert state["patterns"] == {}
+
+
+def test_readiness_will_not_claim_ready_over_an_unclassified_lift():
+    """The regression that matters: chat logging lapses, Strava still shows a
+    lift yesterday, and the engine used to answer READY to everything."""
+    state = build_training_state(
+        lifts=[], activities=[_act(1, "WeightTraining")], today=TODAY
+    )
+    r = assess_readiness(state, ("lift", PUSH))
+    assert r["status"] == "unknown"
+    assert r["unlogged_lift_days_ago"] == 1
+    assert r["pattern_data_complete"] is False
+    assert "no movement pattern attached" in r["reason"]
+
+    block = render_readiness_block(state, r)
+    assert "INCOMPLETE" in block
+    assert "authoritative" not in block
+    assert "Unclassified lifting sessions" in block
+
+
+def test_real_chat_history_still_reads_as_ready():
+    """A pattern with genuine logged history outside the spacing window is
+    still READY — the caveat must not swallow real signal."""
+    state = build_training_state(
+        lifts=[{"date": _iso(5), "exercise": "bench press"}],
+        activities=[_act(1, "WeightTraining")],
+        today=TODAY,
+    )
+    r = assess_readiness(state, ("lift", PUSH))
+    assert r["status"] == "ready"
+    assert "no movement pattern attached" in r["reason"]  # caveat still shown
+
+
+def test_no_unclassified_lifts_keeps_the_authoritative_header():
+    state = build_training_state(
+        lifts=[{"date": _iso(5), "exercise": "bench press"}],
+        activities=[_act(2, "Run", distance_m=5000, average_speed_mps=3.0)],
+        today=TODAY,
+    )
+    r = assess_readiness(state, ("lift", PUSH))
+    assert r["pattern_data_complete"] is True
+    assert "authoritative" in render_readiness_block(state, r)

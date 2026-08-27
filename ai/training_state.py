@@ -63,6 +63,42 @@ _WORKOUT_TAG_TO_PATTERN = {"push": PUSH, "pull": PULL, "legs": LEGS}
 # Run types.
 RUN_EASY, RUN_QUALITY, RUN_LONG = "easy", "quality", "long"
 
+# Sport types that mean "this was a lifting session" when they arrive as an
+# ACTIVITY (Strava / WHOOP) rather than as a chat-logged exercise.
+#
+# Why this exists: build_training_state derived push/pull/legs recency purely
+# from the `lifts` table, and the activities it was handed only ever went
+# through classify_run(), which returns None for weight training. So every
+# Strava `WeightTraining` and WHOOP `Weightlifting` session was invisible to
+# the readiness engine — while _compute_plan_adherence counted them. The same
+# brief could say "lifts 1/3 last week" and "Push: not trained in 14d, READY"
+# in adjacent blocks. Any week the chat log lapses, the anti-push-after-push
+# engine reports READY for everything, which is exactly when it matters.
+#
+# We can't recover the movement pattern from a Strava activity — it only says
+# "WeightTraining". So these are tracked as UNCLASSIFIED lifts: enough to stop
+# the engine claiming a pattern is untrained, not enough to claim which one.
+# Honest uncertainty beats confident wrong.
+_LIFT_SPORT_HINTS = (
+    "weighttraining",
+    "weight training",
+    "weightlifting",
+    "weight lifting",
+    "strengthtraining",
+    "strength training",
+    "crossfit",
+    "functionalstrength",
+)
+
+
+def is_lift_activity(activity: dict) -> bool:
+    """True if a Strava/WHOOP activity row represents a lifting session."""
+    sport = (activity.get("sport_type") or activity.get("sport_name") or "")
+    sport = sport.strip().lower()
+    if not sport:
+        return False
+    return any(h in sport for h in _LIFT_SPORT_HINTS)
+
 
 def classify_exercise(
     name: str, workout_tag: Optional[str] = None
@@ -154,7 +190,22 @@ def build_training_state(
 
     runs: dict[str, dict] = {}
     last_hard_run_days_ago: Optional[int] = None
+    # Lifting sessions that came in as activities. We know WHEN, not WHAT.
+    unlogged_last: Optional[int] = None
+    unlogged_7d = 0
+    unlogged_dates: list[str] = []
     for act in activities or []:
+        if is_lift_activity(act):
+            d = _parse_date(act.get("date"))
+            if not d or d > today:
+                continue
+            days_ago = (today - d).days
+            if unlogged_last is None or days_ago < unlogged_last:
+                unlogged_last = days_ago
+            if days_ago <= 6:
+                unlogged_7d += 1
+            unlogged_dates.append(d.isoformat())
+            continue
         rtype = classify_run(act)
         if rtype is None:
             continue
@@ -177,6 +228,11 @@ def build_training_state(
         "runs": runs,
         "last_hard_run_days_ago": last_hard_run_days_ago,
         "last_legs_days_ago": last_legs_days_ago,
+        "unlogged_lifts": {
+            "last_days_ago": unlogged_last,
+            "count_7d": unlogged_7d,
+            "dates": sorted(set(unlogged_dates), reverse=True),
+        },
     }
 
 
@@ -245,6 +301,16 @@ def assess_readiness(
     ready_patterns = [p for p in LIFT_PATTERNS if pattern_status[p][1] == "ready"]
     freshest = max(ready_patterns, key=freshness_key) if ready_patterns else None
 
+    # A lifting session that arrived as a Strava/WHOOP activity tells us a
+    # lift happened without telling us which pattern. If one landed inside the
+    # spacing window, every "READY" below is a guess — say so rather than
+    # asserting it.
+    unlogged = state.get("unlogged_lifts") or {}
+    unlogged_days_ago = unlogged.get("last_days_ago")
+    unlogged_recent = (
+        unlogged_days_ago is not None and unlogged_days_ago < spacing_days
+    )
+
     result = {
         "planned_kind": kind,
         "planned_sub": sub,
@@ -253,7 +319,17 @@ def assess_readiness(
         "freshest_pattern": freshest,
         "pattern_status": pattern_status,
         "suggested": None,
+        "unlogged_lift_days_ago": unlogged_days_ago,
+        "pattern_data_complete": not unlogged_recent,
     }
+
+    def _caveat() -> str:
+        when = "today" if unlogged_days_ago == 0 else f"{unlogged_days_ago}d ago"
+        return (
+            f" NOTE: a lifting session was recorded {when} from Strava/WHOOP "
+            "with no movement pattern attached, so per-pattern recency below "
+            "may be incomplete — confirm what was trained before progressing."
+        )
 
     if kind == "rest":
         result["reason"] = "Rest day."
@@ -266,6 +342,8 @@ def assess_readiness(
                 "Lift day, pattern unspecified — pick the freshest ready pattern"
                 f"{f' ({freshest})' if freshest else ''}."
             )
+            if unlogged_recent:
+                result["reason"] += _caveat()
             if freshest:
                 result["suggested"] = ("lift", freshest)
             return result
@@ -284,6 +362,14 @@ def assess_readiness(
             f"{sub} last trained "
             f"{'never' if days_ago is None else f'{days_ago} day(s) ago'} — ready."
         )
+        if unlogged_recent:
+            # We only downgrade when the pattern has NO chat-logged history —
+            # that's the case where "not trained in 14d" is most likely to be
+            # flatly wrong. A pattern with real history that is simply outside
+            # the spacing window stays READY.
+            if days_ago is None:
+                result["status"] = "unknown"
+            result["reason"] += _caveat()
         return result
 
     if kind == "run":
@@ -505,16 +591,36 @@ def render_readiness_block(state: dict, readiness: dict) -> str:
     """Render the deterministic readiness assessment as a context block for the
     morning-brief prompt. Returns '' if there's nothing useful to say."""
     patterns = state.get("patterns", {})
-    if not patterns and not state.get("runs"):
+    unlogged = state.get("unlogged_lifts") or {}
+    if not patterns and not state.get("runs") and not unlogged.get("dates"):
         return ""  # no logged history yet — nothing to assess
 
-    lines = ["TRAINING READINESS (computed from logged sessions — authoritative):"]
+    # The header used to say "authoritative" unconditionally, which was a lie
+    # whenever a lift reached us as a Strava/WHOOP activity instead of a chat
+    # log — per-pattern recency simply cannot see those.
+    complete = readiness.get("pattern_data_complete", True)
+    header = (
+        "TRAINING READINESS (computed from logged sessions — authoritative):"
+        if complete
+        else "TRAINING READINESS (computed — INCOMPLETE, see caveat below):"
+    )
+    lines = [header]
     for pat in LIFT_PATTERNS:
         days_ago, st = readiness["pattern_status"].get(pat, (None, "ready"))
         when = "not in last 14d" if days_ago is None else f"{days_ago}d ago"
         cnt = patterns.get(pat, {}).get("count_7d", 0)
         flag = "READY" if st == "ready" else "TOO SOON (<48h)"
+        if days_ago is None and not complete:
+            flag = "UNKNOWN (no chat log; see caveat)"
         lines.append(f"  {pat.title()}: last {when}, {cnt}x in 7d — {flag}")
+
+    ul_last = unlogged.get("last_days_ago")
+    if ul_last is not None:
+        when = "today" if ul_last == 0 else f"{ul_last}d ago"
+        lines.append(
+            f"  Unclassified lifting sessions (Strava/WHOOP, pattern unknown): "
+            f"last {when}, {unlogged.get('count_7d', 0)}x in 7d"
+        )
 
     lhr = state.get("last_hard_run_days_ago")
     if lhr is not None:
