@@ -29,9 +29,20 @@ from datetime import datetime, timedelta, timezone
 import pytz
 from discord.ext import tasks
 
+import obs
 from integrations.whoop import WhoopAuthError
 
 logger = logging.getLogger(__name__)
+
+
+def _capture(exc: BaseException) -> None:
+    """Send an exception to Sentry if it's configured. Never raises."""
+    try:
+        import sentry_sdk
+
+        sentry_sdk.capture_exception(exc)
+    except Exception:
+        pass
 
 
 def _parse_hhmm(s: str) -> tuple[int, int]:
@@ -142,34 +153,117 @@ class Scheduler:
         except Exception as e:
             logger.warning(f"sync_state write failed for {state_key}: {e}")
 
+    async def _run_job(
+        self,
+        job_name: str,
+        fn,
+        today_iso: str,
+        *,
+        rid_prefix: str,
+        mark_on_success: str | None,
+        mark_on_failure: str | None,
+    ) -> bool:
+        """Run one scheduled job behind a hard failure boundary.
+
+        Before this existed, every scheduled job ran naked inside the 1-minute
+        task loop. An unhandled exception anywhere — an anthropic.APIError, a
+        KeyError, a dead WHOOP token — propagated into discord.ext.tasks,
+        which is only willing to retry its own connection errors. Anything
+        else STOPPED THE LOOP PERMANENTLY, taking the morning brief, the
+        weekly summary, the Sunday reflection, the nightly sync AND the health
+        heartbeat with it, and leaving one library ERROR line as the only
+        evidence. That is a single point of total, silent failure.
+
+        Now: each job is isolated (one failing job cannot skip the others),
+        logged CRITICAL with a stack trace, reported to Sentry, and DM'd to
+        the owner. The day is then marked fired so the 1-minute loop does not
+        retry — and re-alert — sixty times an hour on a persistent fault.
+
+        Returns True if the job ran cleanly.
+        """
+        with obs.request_scope(rid_prefix):
+            try:
+                async with obs.timed(logger, f"job.{job_name}", job=job_name):
+                    await fn()
+            except Exception as e:
+                obs.log_event(
+                    logger,
+                    logging.CRITICAL,
+                    "job.failed",
+                    job=job_name,
+                    err=type(e).__name__,
+                    detail=str(e)[:300],
+                    retry="tomorrow",
+                    exc_info=True,
+                )
+                _capture(e)
+                if mark_on_failure:
+                    await self._mark_fired_today(mark_on_failure, today_iso)
+                await self._dm_owner(
+                    f"🔴 **`{job_name}` failed** and will not retry until "
+                    f"tomorrow.\n```{type(e).__name__}: {str(e)[:400]}```"
+                )
+                return False
+            if mark_on_success:
+                await self._mark_fired_today(mark_on_success, today_iso)
+            return True
+
     @tasks.loop(minutes=1)
     async def check_scheduled_tasks(self):
         now = datetime.now(self.tz)
         today_iso = now.date().isoformat()
 
         # ── Daily morning brief — data-driven window ───────────────────────
+        # The brief marks its own fired-state inside _fire_daily_brief_once
+        # (under the lock that keeps the poll loop and the recovery webhook
+        # from double-sending), so only the failure path marks here.
         if not await self._already_fired_today(self._STATE_DAILY_BRIEF, today_iso):
-            await self._maybe_fire_daily_brief(now, today_iso)
+            await self._run_job(
+                "daily_brief",
+                lambda: self._maybe_fire_daily_brief(now, today_iso),
+                today_iso,
+                rid_prefix="brief",
+                mark_on_success=None,
+                mark_on_failure=self._STATE_DAILY_BRIEF,
+            )
 
         # ── Weekly training summary — Sundays from 7:00 PM local ───────────
         # Window-based ("any tick at or after target time, once per day") so a
         # single skipped 1-min tick never silently drops a Sunday.
         if now.weekday() == 6 and (now.hour, now.minute) >= (19, 0):
             if not await self._already_fired_today(self._STATE_WEEKLY, today_iso):
-                await self._send_weekly_summary()
-                await self._mark_fired_today(self._STATE_WEEKLY, today_iso)
+                await self._run_job(
+                    "weekly_summary",
+                    self._send_weekly_summary,
+                    today_iso,
+                    rid_prefix="week",
+                    mark_on_success=self._STATE_WEEKLY,
+                    mark_on_failure=self._STATE_WEEKLY,
+                )
 
         # ── Sunday Stoic reflection — Sundays from 8:30 PM (after summary) ─
         if now.weekday() == 6 and (now.hour, now.minute) >= (20, 30):
             if not await self._already_fired_today(self._STATE_STOIC, today_iso):
-                await self._send_stoic_reflection()
-                await self._mark_fired_today(self._STATE_STOIC, today_iso)
+                await self._run_job(
+                    "stoic_reflection",
+                    self._send_stoic_reflection,
+                    today_iso,
+                    rid_prefix="stoic",
+                    mark_on_success=self._STATE_STOIC,
+                    mark_on_failure=self._STATE_STOIC,
+                )
 
         # ── Nightly incremental sync — from 3:05 AM local ──────────────────
         if (now.hour, now.minute) >= (3, 5) and now.hour < 5:
             if not await self._already_fired_today(self._STATE_NIGHTLY, today_iso):
-                await self._nightly_sync()
-                await self._mark_fired_today(self._STATE_NIGHTLY, today_iso)
+                await self._run_job(
+                    "nightly_sync",
+                    self._nightly_sync,
+                    today_iso,
+                    rid_prefix="sync",
+                    mark_on_success=self._STATE_NIGHTLY,
+                    mark_on_failure=self._STATE_NIGHTLY,
+                )
 
         # ── Data-feed heartbeat — once daily from 12:00 local ──────────────
         # Runs after the morning-brief window (backstop 11:30) closes, so a
@@ -179,8 +273,14 @@ class Scheduler:
         # same-day ping.
         if (now.hour, now.minute) >= (12, 0) and now.hour < 14:
             if not await self._already_fired_today(self._STATE_HEARTBEAT, today_iso):
-                await self._data_health_check(now)
-                await self._mark_fired_today(self._STATE_HEARTBEAT, today_iso)
+                await self._run_job(
+                    "heartbeat",
+                    lambda: self._data_health_check(now),
+                    today_iso,
+                    rid_prefix="beat",
+                    mark_on_success=self._STATE_HEARTBEAT,
+                    mark_on_failure=self._STATE_HEARTBEAT,
+                )
 
     async def _fire_daily_brief_once(
         self, today_iso: str, reason: str
@@ -366,13 +466,15 @@ class Scheduler:
             return False
 
     async def _send_daily_brief(self, reason: str = ""):
-        logger.info(f"Sending daily brief (reason={reason})...")
+        obs.log_event(logger, logging.INFO, "brief.start", reason=reason)
+        degraded: list[str] = []
         # Upsert today (and yesterday, for safety) into SQLite so the 7-day
         # block in the context actually shows today as a row, not a gap.
         try:
             await self._refresh_recent_whoop_into_db(days=2)
         except Exception as e:
-            logger.warning(f"Pre-brief WHOOP refresh failed (non-fatal): {e}")
+            degraded.append("whoop_refresh")
+            obs.source_failed(logger, "whoop_refresh", "brief", e)
         # Reconcile any lifts / activities the real-time path missed since
         # the last brief. Walks SQLite vs Notion for the last 7 days and
         # writes only the gaps (dedup by [liftrow:<id>] / [strava:<id>]
@@ -381,15 +483,23 @@ class Scheduler:
         try:
             missing = await self.coach.notion.reconcile_recent(self.coach.db, days=7)
             if missing.get("lifts") or missing.get("activities"):
-                logger.info(
-                    f"Pre-brief Notion reconciliation: wrote "
-                    f"{missing.get('lifts', 0)} missing lifts and "
-                    f"{missing.get('activities', 0)} missing activities."
+                obs.log_event(
+                    logger,
+                    logging.INFO,
+                    "notion.reconcile",
+                    stage="pre_brief",
+                    lifts=missing.get("lifts", 0),
+                    activities=missing.get("activities", 0),
                 )
         except Exception as e:
-            logger.warning(f"Pre-brief Notion reconciliation failed: {e}")
-        brief = await self.coach.daily_brief()
-        await self._dm_owner(brief)
+            degraded.append("notion_reconcile")
+            obs.source_failed(logger, "notion_reconcile", "brief", e)
+        async with obs.timed(logger, "brief.done", reason=reason) as ctx:
+            brief = await self.coach.daily_brief()
+            delivered = await self._dm_owner(brief)
+            ctx["chars"] = len(brief or "")
+            ctx["delivered"] = bool(delivered)
+            ctx["degraded"] = ",".join(degraded) or "-"
 
     async def _refresh_recent_whoop_into_db(self, days: int = 2):
         """Quick upsert of the last N days of WHOOP data into SQLite.
@@ -560,14 +670,37 @@ class Scheduler:
         problems: list[str] = []
 
         # 1. Live WHOOP auth / reachability probe.
+        #
+        # A dead refresh token is THE failure mode that took this system down
+        # for a month without anyone noticing: the DM went out, but the catch
+        # block logged nothing, so `journalctl` showed a perfectly healthy bot
+        # and there was no second place to notice. A dead token is now
+        # CRITICAL — the highest severity in the codebase, reserved for
+        # exactly two conditions (this and a stopped scheduler loop) — and it
+        # goes to Sentry as well as the log and the DM.
         try:
             await self.coach.whoop.get_recovery(days=1)
-        except WhoopAuthError:
+        except WhoopAuthError as e:
+            obs.log_event(
+                logger,
+                logging.CRITICAL,
+                "whoop.token_dead",
+                remedy="run whoop_auth.py on the host, then restart the service",
+                detail=str(e)[:200],
+            )
+            _capture(e)
             problems.append(
                 "🔴 WHOOP token rejected — recovery/sleep/strain are NOT syncing. "
                 "Run `python whoop_auth.py` on the host and restart the service."
             )
         except Exception as e:
+            obs.log_event(
+                logger,
+                logging.WARNING,
+                "whoop.unreachable",
+                err=type(e).__name__,
+                detail=str(e)[:200],
+            )
             problems.append(
                 f"🟠 WHOOP API unreachable right now ({type(e).__name__})."
             )
@@ -604,12 +737,73 @@ class Scheduler:
         if problems:
             body = "\n".join(f"• {p}" for p in problems)
             await self._dm_owner(f"**⚠️ Data sync health check**\n{body}")
-            logger.warning(
-                f"Heartbeat found {len(problems)} issue(s); owner notified."
+            # Log every problem individually, not just the count. The DM is
+            # easy to miss or mute; the log is the durable record.
+            for prob in problems:
+                obs.log_event(
+                    logger, logging.WARNING, "heartbeat.problem", problem=prob
+                )
+            obs.log_event(
+                logger,
+                logging.WARNING,
+                "heartbeat.done",
+                healthy=False,
+                problems=len(problems),
+                notified=True,
             )
         else:
-            logger.info("Heartbeat: all data feeds healthy.")
+            obs.log_event(
+                logger, logging.INFO, "heartbeat.done", healthy=True, problems=0
+            )
 
     @check_scheduled_tasks.before_loop
     async def before_loop(self):
         await self.bot.wait_until_ready()
+
+    @check_scheduled_tasks.error
+    async def on_loop_error(self, exc: BaseException):
+        """Last line of defence for the scheduler.
+
+        _run_job already isolates every individual job, so reaching here means
+        something outside them broke — a DB read in the fired-today guard, a
+        timezone error, an event-loop fault. discord.ext.tasks calls this and
+        then STOPS the loop, so without a restart the bot goes quiet forever
+        while still appearing healthy in `systemctl status`. Restart on a
+        short delay (not immediately: if the fault is persistent we don't want
+        a tight crash-loop) and make it loud.
+        """
+        obs.log_event(
+            logger,
+            logging.CRITICAL,
+            "scheduler.loop_died",
+            err=type(exc).__name__,
+            detail=str(exc)[:300],
+            action="restarting_in_60s",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        _capture(exc)
+        try:
+            await self._dm_owner(
+                f"🔴 **Scheduler loop crashed** — restarting in 60s. All "
+                f"scheduled jobs were stopped.\n"
+                f"```{type(exc).__name__}: {str(exc)[:400]}```"
+            )
+        except Exception:
+            pass
+        asyncio.create_task(self._restart_loop_after(60))
+
+    async def _restart_loop_after(self, delay_s: int) -> None:
+        await asyncio.sleep(delay_s)
+        try:
+            self.check_scheduled_tasks.restart()
+            obs.log_event(logger, logging.WARNING, "scheduler.loop_restarted")
+        except Exception as e:
+            obs.log_event(
+                logger,
+                logging.CRITICAL,
+                "scheduler.restart_failed",
+                err=type(e).__name__,
+                detail=str(e)[:300],
+                exc_info=True,
+            )
+            _capture(e)
