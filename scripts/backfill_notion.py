@@ -380,17 +380,33 @@ async def existing_strava_ids(notion: NotionClient) -> set[str]:
 
 
 async def existing_daily_dates(notion: NotionClient) -> set[str]:
-    """Return the set of dates already present in Daily Log (via the Day
-    column), so we don't double-write on re-run."""
+    """Dates whose Daily Log row already HAS WHOOP data, so we skip them.
+
+    This used to return every date that had a row at all. That conflated "a
+    row exists" with "this date is done" — and during the month the WHOOP
+    token was dead the morning brief created a row every day with every
+    physiology number null. Those empty shells permanently blocked the
+    backfill: 23 days of recovered data had nowhere to land, and the script
+    cheerfully reported success.
+
+    A row now only counts as done if Recovery Score is populated. Everything
+    else is re-offered to log_daily_entry, which upserts (see
+    NotionClient.log_daily_entry) and so fills the blanks in place rather than
+    creating a second row for the same day.
+    """
     if not notion.is_configured_daily():
         return set()
     pages = await _paginate_query(notion, notion.daily_db_id)
     dates: set[str] = set()
     for page in pages:
-        day = page.get("properties", {}).get("Day", {}).get("date") or {}
+        props = page.get("properties", {})
+        day = (props.get("Day", {}) or {}).get("date") or {}
         start = day.get("start")
-        if start:
-            dates.add(start[:10])
+        if not start:
+            continue
+        if (props.get("Recovery Score", {}) or {}).get("number") is None:
+            continue  # empty shell — let the backfill refill it
+        dates.add(start[:10])
     return dates
 
 
@@ -436,7 +452,10 @@ async def run_backfill(args: argparse.Namespace) -> int:
             )
         if not args.strava_only:
             done_dates = await existing_daily_dates(notion)
-            logger.info(f"  → {len(done_dates)} dates already in Daily Log")
+            logger.info(
+                f"  → {len(done_dates)} dates already in Daily Log WITH data "
+                f"(empty rows will be refilled in place)"
+            )
 
     # ── Strava → Runs ───────────────────────────────────────────────────────
     strava_ok = strava_fail = 0

@@ -427,6 +427,65 @@ class NotionClient:
         )
         return None
 
+    async def _update_page(self, page_id: str, properties: dict) -> dict | None:
+        """PATCH /v1/pages/{id}. Same never-raise contract as _create_page.
+
+        Notion merges the properties you send and leaves the rest alone, and
+        our _set_* helpers drop None values — so patching with a partial
+        summary can only fill blanks, never blank out data that is already
+        there.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.patch(
+                    f"{NOTION_BASE}/pages/{page_id}",
+                    headers=self._headers(),
+                    json={"properties": properties},
+                )
+        except Exception as e:
+            logger.warning(f"Notion update_page network error: {e}")
+            return None
+        if resp.status_code == 200:
+            return resp.json()
+        logger.warning(
+            f"Notion update_page failed: {resp.status_code} {resp.text[:300]}"
+        )
+        return None
+
+    async def find_daily_page_for_date(self, date: str) -> str | None:
+        """Page id of the Daily Log row for `date`, or None. Keyed on the Day
+        date property (Date is the title, not a date)."""
+        if not self.is_configured_daily():
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    f"{NOTION_BASE}/databases/{self.daily_db_id}/query",
+                    headers=self._headers(),
+                    json={
+                        "page_size": 1,
+                        "filter": {
+                            "property": "Day",
+                            "date": {"equals": date},
+                        },
+                    },
+                )
+        except Exception as e:
+            obs.source_failed(logger, "notion_daily_lookup", "log_daily_entry", e, date=date)
+            return None
+        if resp.status_code != 200:
+            obs.log_event(
+                logger,
+                logging.WARNING,
+                "notion.daily_lookup_failed",
+                date=date,
+                status=resp.status_code,
+                detail=resp.text[:200],
+            )
+            return None
+        results = (resp.json() or {}).get("results") or []
+        return results[0]["id"] if results else None
+
     # ── Schedule DB writes ──────────────────────────────────────────────────
 
     async def log_schedule(
@@ -880,6 +939,21 @@ class NotionClient:
         _set_rich_text(props, "Daily Brief", summary.get("daily_brief"))
         if schedule_page_id:
             props["Schedule"] = {"relation": [{"id": schedule_page_id}]}
+
+        # UPSERT, not insert. This used to always create. During the month the
+        # WHOOP token was dead, the morning brief still ran every day and
+        # created a Daily Log row for each date with every physiology number
+        # null. Those empty shells then blocked the backfill forever, because
+        # scripts/backfill_notion.py treats "a row exists for this date" as
+        # "this date is done" — so 23 days of recovered WHOOP data had nowhere
+        # to land. Patching fills the blanks instead.
+        existing_id = await self.find_daily_page_for_date(date)
+        if existing_id:
+            page = await self._update_page(existing_id, props)
+            if page:
+                logger.debug("Notion Daily Log row updated for %s.", date)
+                return True
+            return False
 
         page = await self._create_page(self.daily_db_id, props)
         if page:
