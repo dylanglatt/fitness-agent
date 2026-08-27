@@ -4,27 +4,16 @@ Run with: python main.py
 """
 
 import asyncio
-import logging
-import os
 
-from bot.discord_bot import FitnessBot
-from config import Config
+# obs must be configured before anything else logs or raises. It imports no
+# project code, so this is safe as the first import.
+import obs
 
-# Crash reporting → Sentry (alerts land in Discord #fitness-bot).
-# Errors only — no tracing, no PII. Override DSN with SENTRY_DSN.
-import sentry_sdk
-sentry_sdk.init(
-    dsn=os.environ.get(
-        "SENTRY_DSN",
-        "https://8c0abd7435fe5906322bfcc32a2d1125@o4511632555048960.ingest.us.sentry.io/4511702338764800",
-    ),
-)
+logger = obs.setup_logging("fitness-bot")
+obs.init_sentry("fitness-bot")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-logger = logging.getLogger(__name__)
+from bot.discord_bot import FitnessBot  # noqa: E402  (after logging setup, on purpose)
+from config import Config  # noqa: E402
 
 
 async def main():

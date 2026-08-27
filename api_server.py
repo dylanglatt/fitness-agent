@@ -32,15 +32,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import Config
 from data.database import Database
 
-# Crash reporting → Sentry (alerts land in Discord #fitness-bot).
-# Errors only — no tracing, no PII. Override DSN with SENTRY_DSN.
-import sentry_sdk
-sentry_sdk.init(
-    dsn=os.environ.get(
-        "SENTRY_DSN",
-        "https://8c0abd7435fe5906322bfcc32a2d1125@o4511632555048960.ingest.us.sentry.io/4511702338764800",
-    ),
-)
+# Logging + crash reporting. This process previously called getLogger without
+# ever calling basicConfig — and uvicorn configures only its own loggers, never
+# the root — so every INFO line this module emitted was silently dropped and
+# warnings arrived via logging.lastResort with no timestamp or level. setup_logging
+# fixes that for the API exactly as it does for the bot.
+import obs
+
+obs.setup_logging("fitness-api")
+obs.init_sentry("fitness-api")
 
 logger = logging.getLogger("api_server")
 
