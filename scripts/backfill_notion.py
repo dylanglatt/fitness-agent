@@ -347,19 +347,35 @@ async def _paginate_query(
 
 
 async def existing_strava_ids(notion: NotionClient) -> set[str]:
-    """Scan the Runs DB for [strava:N] markers in Notes. Returns the set of
-    activity ids already imported, so subsequent runs can skip them."""
-    if not notion.is_configured_runs():
-        return set()
-    pages = await _paginate_query(notion, notion.runs_db_id)
+    """Scan BOTH the Runs DB and the Lifts DB for [strava:N] markers.
+
+    This used to scan only the Runs DB — which silently made the script
+    unsafe to re-run for anything that isn't cardio. WeightTraining
+    activities are routed to the LIFTS DB by log_strava_activity (see the
+    _STRAVA_LIFT_TYPES branch below), so their dedup markers live there.
+    Scanning only Runs meant every lifting session looked "not yet imported"
+    on every single run, and each re-run appended another copy: a survey of
+    the live Notion found 79 of 96 Strava-marked lifting activities
+    duplicated, one of them six times over.
+
+    integrations/notion.py::reconcile_recent already learned this lesson and
+    seeds its marker set from the Lifts DB for exactly this reason; this
+    script was never updated to match.
+    """
     ids: set[str] = set()
-    for page in pages:
-        props = page.get("properties", {})
-        notes_prop = props.get("Notes", {})
-        rt = notes_prop.get("rich_text") or []
-        text = "".join(r.get("plain_text", "") for r in rt)
-        for m in _STRAVA_MARKER.finditer(text):
-            ids.add(m.group(1))
+
+    async def _scan(db_id: str) -> None:
+        for page in await _paginate_query(notion, db_id):
+            props = page.get("properties", {})
+            rt = (props.get("Notes", {}) or {}).get("rich_text") or []
+            text = "".join(r.get("plain_text", "") for r in rt)
+            for m in _STRAVA_MARKER.finditer(text):
+                ids.add(m.group(1))
+
+    if notion.is_configured_runs():
+        await _scan(notion.runs_db_id)
+    if notion.is_configured_lifts():
+        await _scan(notion.lifts_db_id)
     return ids
 
 
@@ -414,7 +430,10 @@ async def run_backfill(args: argparse.Namespace) -> int:
     if not args.dry_run:
         if not args.whoop_only:
             done_strava = await existing_strava_ids(notion)
-            logger.info(f"  → {len(done_strava)} Strava activities already in Runs DB")
+            logger.info(
+                f"  → {len(done_strava)} Strava activities already in Notion "
+                f"(Runs + Lifts)"
+            )
         if not args.strava_only:
             done_dates = await existing_daily_dates(notion)
             logger.info(f"  → {len(done_dates)} dates already in Daily Log")
