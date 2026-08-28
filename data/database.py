@@ -821,6 +821,36 @@ class Database:
             )
             await db.commit()
 
+    async def extend_lift_session(self, extra: list[dict]) -> int:
+        """Append exercises to the in-flight session. Returns the new total.
+
+        Backs "you're through the plan, here's what else you train" instead of
+        "All planned exercises done. /liftend to close out", which told Dylan
+        to finish early whenever the parsed plan came up short.
+        """
+        if not extra:
+            return 0
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT exercises_json FROM active_lift_session WHERE id = 1"
+            ) as cur:
+                row = await cur.fetchone()
+            if not row:
+                return 0
+            try:
+                current = json.loads(row["exercises_json"] or "[]")
+            except Exception:
+                current = []
+            current.extend(extra)
+            await db.execute(
+                "UPDATE active_lift_session SET exercises_json = ?, "
+                "last_activity_at = ? WHERE id = 1",
+                (json.dumps(current), datetime.now().isoformat(timespec="seconds")),
+            )
+            await db.commit()
+        return len(current)
+
     async def update_lift_session_position(
         self,
         current_exercise_idx: int,
@@ -2143,6 +2173,39 @@ class Database:
             lst.sort(key=lambda x: (-x["n_sets"], x["exercise"]))
         return {"by_pattern": by_pattern, "unresolved_sets": unresolved,
                 "weeks": weeks, "total_sets": len(rows)}
+
+    async def get_exercise_session_history(self, weeks: int = 16) -> dict:
+        """Canonical exercise -> per-session sets, oldest first.
+
+        The shape ai/session_planner.next_load() needs:
+            {"bench press": [{"date": "...", "sets": [{"weight_lb", "reps"}]}]}
+
+        This replaces regex-scraping `lifts.details` for a weight, which is
+        what the guided session used to do while structured weight/reps sat
+        unused in lift_sets two tables over.
+        """
+        since = (datetime.now() - timedelta(weeks=weeks)).strftime("%Y-%m-%d")
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT date, exercise, reps, weight_lb FROM lift_sets "
+                "WHERE date >= ? ORDER BY date ASC, set_number ASC",
+                (since,),
+            )
+            rows = [dict(r) for r in await cur.fetchall()]
+
+        out: dict[str, list[dict]] = {}
+        for r in rows:
+            name = canonical_exercise(r["exercise"])
+            if not name:
+                continue
+            sessions = out.setdefault(name, [])
+            if not sessions or sessions[-1]["date"] != r["date"]:
+                sessions.append({"date": r["date"], "sets": []})
+            sessions[-1]["sets"].append(
+                {"weight_lb": r["weight_lb"], "reps": r["reps"]}
+            )
+        return out
 
     # ── Feed staleness ──────────────────────────────────────────────────
 

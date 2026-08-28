@@ -52,6 +52,7 @@ from integrations.strava import StravaClient
 from integrations.whoop import WhoopClient, WhoopAuthError
 from integrations.notion import NotionClient
 from integrations.weather import WeatherClient
+from ai import session_planner as sp
 from ai import training_state as ts
 
 logger = logging.getLogger(__name__)
@@ -3335,7 +3336,9 @@ If not (e.g. "headed to the sauna later" — no completion, no data): {{"is_sess
     # Session state lives in the active_lift_session table (singleton).
     # 2-hour silence auto-ends the session on next interaction.
 
-    LIFT_SESSION_TIMEOUT_HOURS = 2
+    # 2h ended sessions that had a break in them. A lift session with a
+    # warmup, a long rest and a chat interruption legitimately spans hours.
+    LIFT_SESSION_TIMEOUT_HOURS = 5
 
     async def _parse_prescription_to_exercises(
         self, prescription: str
@@ -3496,23 +3499,191 @@ Rules:
         set_idx = session["current_set_idx"]
         exercises = session["exercises"]
         if ex_idx >= len(exercises):
-            return "All planned exercises done. `/liftend` to close out."
+            return await self._plan_complete_prompt()
         ex = exercises[ex_idx]
         name = ex.get("name", "Exercise")
         total_sets = ex.get("sets", 3)
         reps = ex.get("reps", "?")
         notes = ex.get("notes", "")
-        rec_w, rec_note = await self._recommend_for_exercise(name)
-        head = f"**{name}** — set {set_idx + 1}/{total_sets} · target {reps} reps"
+        # Load and rationale were decided when the session was planned, from
+        # the structured set history. _recommend_for_exercise used to regex a
+        # weight out of free text here and add +5 unconditionally.
+        rec_w = ex.get("target_weight_lb")
+        rec_note = ex.get("reason") or ""
+        if rec_w is None and not rec_note:
+            rec_w, rec_note, _action = await self._recommend_for_exercise_v2(name, reps)
+        remaining = len(exercises) - ex_idx - 1
+        head = (
+            f"**{name}** — set {set_idx + 1}/{total_sets} · target {reps} reps"
+        )
         if notes:
             head += f"  _({notes})_"
-        if rec_w is not None:
-            line2 = f"Recommended: **{rec_w:g} lb × {reps}**"
+        line2 = (
+            f"Target: **{rec_w:g} lb × {reps}**" if rec_w is not None
+            else "Target: pick a working weight"
+        )
+        line3 = f"_{rec_note}_" if rec_note else ""
+        tail = (
+            f"_{remaining} exercise{'s' if remaining != 1 else ''} left after this._"
+            if remaining > 0 else "_Last exercise of the session._"
+        )
+        line4 = "Reply with what you did (e.g. `155 x 6`, `6`, `skip`, `done`)."
+        return "\n".join([x for x in (head, line2, line3, tail, line4) if x])
+
+    async def _plan_complete_prompt(self) -> str:
+        """Shown when the planned exercises are done.
+
+        The old reply was "All planned exercises done. `/liftend` to close
+        out." — an instruction to stop, delivered the moment a short parsed
+        plan ran out, which is why sessions ended early. Now it reports what
+        was completed and offers more work from the library; ending is a
+        choice Dylan makes, not the default suggestion.
+        """
+        session = await self.db.get_active_lift_session()
+        planned = len(session.get("exercises") or []) if session else 0
+        logged = len([
+            h for h in (session.get("history") or []) if not h.get("skipped")
+        ]) if session else 0
+        extra = await self.suggest_additional_exercises(limit=3)
+        lines = [
+            f"**Planned work complete** — {planned} exercises, {logged} sets logged."
+        ]
+        if extra:
+            lines.append("Still in your library for this pattern:")
+            for e in extra:
+                w = e.get("target_weight_lb")
+                load = f"{w:g} lb" if w else "your working weight"
+                lines.append(f"  • {e['name']} {e['sets']}x{e['reps']} @ {load}")
+            lines.append(
+                "Reply `more` to add the next two, name a lift to add it, "
+                "or `/liftend` when you're actually done."
+            )
         else:
-            line2 = "Recommended: pick a working weight"
-        line3 = f"_{rec_note}_"
-        line4 = "Reply with what you actually did (e.g. `155 x 6`, `6`, `skip`, `done`)."
-        return "\n".join([head, line2, line3, line4])
+            lines.append("`/liftend` to close out, or name any lift to keep going.")
+        return "\n".join(lines)
+
+    async def _recommend_for_exercise_v2(
+        self, exercise_name: str, target_reps: int = 6
+    ) -> tuple[Optional[float], str, str]:
+        """Load recommendation from STRUCTURED set history.
+
+        Replaces _recommend_for_exercise, which read lifts.details free text
+        with a regex and then added +5/+10 unconditionally — its docstring
+        promised to hold the weight when reps were missed, but nothing in the
+        code ever looked at reps.
+        """
+        try:
+            hist = await self.db.get_exercise_session_history(weeks=16)
+        except Exception as e:
+            obs.source_failed(logger, "exercise_history", "liftstart", e)
+            return None, "", "pick"
+        from data.exercise_vocab import canonical_exercise
+
+        key = canonical_exercise(exercise_name) or exercise_name.lower()
+        return sp.next_load(hist.get(key) or [], target_reps, exercise_name)
+
+    async def _build_session_plan(
+        self, pattern: Optional[str], prescription: str = ""
+    ) -> tuple[list[dict], str]:
+        """Build today's lift plan from history, not from parsed prose.
+
+        Returns (exercises, source) where source is "planner" or "prescription".
+
+        The old path asked Haiku to read `prescription` — free text from a
+        weekly template that was auto-seeded in April 2026 and never
+        customized — and turned that into a session. So "what should I lift"
+        was answered by an LLM's reading of generic prose rather than by
+        anything Dylan has ever done. The planner instead selects from his
+        real movement library, orders compounds before isolation, weights
+        goal lifts first, and computes a target load per exercise from the
+        actual set history.
+        """
+        if not pattern:
+            pattern = "push"
+        try:
+            vocab = await self.db.get_exercise_vocabulary(weeks=26)
+            library = (vocab.get("by_pattern") or {}).get(pattern) or []
+            history = await self.db.get_exercise_session_history(weeks=16)
+        except Exception as e:
+            obs.source_failed(logger, "session_plan_inputs", "liftstart", e)
+            library, history = [], {}
+
+        # Lifts named by an active goal lead the session.
+        goal_lifts: list[str] = []
+        try:
+            titles = " | ".join(
+                (g.get("title") or "").lower()
+                for g in await self.db.list_goals(status="active")
+            )
+            goal_lifts = [
+                i["exercise"] for i in library if i["exercise"].lower() in titles
+            ]
+        except Exception as e:
+            obs.source_failed(logger, "goal_lifts", "liftstart", e)
+
+        # Phase decides whether lifting is being pushed or merely held.
+        is_primary = True
+        try:
+            phase = await self.db.get_active_phase()
+            if phase and (phase.get("focus") or "") in ("marathon", "base", "taper"):
+                is_primary = False
+        except Exception as e:
+            obs.source_failed(logger, "phase_for_session", "liftstart", e)
+
+        band = None
+        try:
+            snap = await self.whoop.get_today_snapshot()
+            score = ((snap or {}).get("recovery") or {}).get("score") or {}
+            band = ts.recovery_intensity_band(
+                score.get("recovery_score"), score.get("hrv_rmssd_milli"), None
+            ).get("band")
+        except Exception:
+            band = None  # no recovery data is not a failure; plan without it
+
+        plan = sp.plan_session(
+            pattern, library, history,
+            goal_lifts=goal_lifts,
+            is_primary_phase=is_primary,
+            intensity_band=band,
+        )
+        if plan:
+            obs.log_event(
+                logger, logging.INFO, "session.planned",
+                pattern=pattern, exercises=len(plan), band=band or "-",
+                primary_phase=is_primary, goal_lifts=len(goal_lifts),
+            )
+            return plan, "planner"
+
+        # Nothing in the library for this pattern. Fall back to the old
+        # prescription parse rather than returning an empty session.
+        parsed = await self._parse_prescription_to_exercises(prescription)
+        return parsed, "prescription"
+
+    async def suggest_additional_exercises(self, limit: int = 3) -> list[dict]:
+        """Movements from the library not yet done in this session.
+
+        Backs "you're through the plan — here's what else you train" instead
+        of "All planned exercises done. /liftend to close out", which is what
+        told Dylan to finish early whenever the parsed plan was short.
+        """
+        session = await self.db.get_active_lift_session()
+        if not session:
+            return []
+        done = {
+            (h.get("exercise") or "").lower()
+            for h in (session.get("history") or [])
+        }
+        done |= {(e.get("name") or "").lower() for e in (session.get("exercises") or [])}
+        pattern = (session.get("workout_label") or "").strip().lower() or "push"
+        try:
+            vocab = await self.db.get_exercise_vocabulary(weeks=26)
+            library = (vocab.get("by_pattern") or {}).get(pattern) or []
+            history = await self.db.get_exercise_session_history(weeks=16)
+        except Exception as e:
+            obs.source_failed(logger, "extend_session", "liftstart", e)
+            return []
+        remaining = [i for i in library if i["exercise"].lower() not in done]
+        return sp.plan_session(pattern, remaining, history)[:limit]
 
     async def start_lift_session(self, force: bool = False) -> str:
         """Begin a guided lift session from today's planned prescription.
@@ -3540,7 +3711,14 @@ Rules:
                 "If you're lifting anyway, run `/liftstart force:true`."
             )
         prescription = sess_def.get("prescription", "")
-        exercises = await self._parse_prescription_to_exercises(prescription)
+        # Pattern comes from the readiness engine's decision where possible —
+        # the same push/pull/legs call the brief made — falling back to the
+        # session focus text.
+        focus_text = (sess_def.get("focus") or "").lower()
+        pattern = next(
+            (p for p in ("push", "pull", "legs", "core") if p in focus_text), None
+        )
+        exercises, plan_source = await self._build_session_plan(pattern, prescription)
         if not exercises:
             # When force=True is used on a non-lift day, the parser
             # correctly returns no exercises (its rules skip cardio +
@@ -3560,18 +3738,29 @@ Rules:
                 "Couldn't parse today's lift prescription into structured "
                 "exercises. Check `/plan today` and try again."
             )
-        focus = sess_def.get("focus", "lift")
+        focus = pattern or sess_def.get("focus", "lift")
         await self.db.start_lift_session(workout_label=focus, exercises=exercises)
         session = await self.db.get_active_lift_session()
-        ex_summary = ", ".join(
-            f"{e['name']} {e['sets']}x{e['reps']}" for e in exercises[:5]
-        )
-        if len(exercises) > 5:
-            ex_summary += f", +{len(exercises) - 5} more"
+        # Show the WHOLE session up front with loads. Dylan should know
+        # exactly what he is lifting before he starts, not be asked one
+        # exercise at a time.
+        plan_lines = []
+        total_sets = 0
+        for e in exercises:
+            total_sets += e.get("sets", 0)
+            w = e.get("target_weight_lb")
+            load = f"{w:g} lb" if w else "pick a working weight"
+            tag = f" _{e['notes']}_" if e.get("notes") else ""
+            plan_lines.append(
+                f"  {len(plan_lines) + 1}. **{e['name']}** "
+                f"{e['sets']}x{e['reps']} @ {load}{tag}"
+            )
+        src = "" if plan_source == "planner" else " _(from plan text)_"
         header = (
-            f"💪 Lift session started — **{focus}**\n"
-            f"Plan: {ex_summary}\n"
-            "—\n"
+            f"💪 **{focus.title()} session** — {len(exercises)} exercises, "
+            f"{total_sets} working sets{src}\n"
+            + "\n".join(plan_lines)
+            + "\n\nFinish the whole thing. Reply with each set as you go.\n—\n"
         )
         return header + await self._format_next_set_prompt(session)
 
@@ -3607,7 +3796,24 @@ Rules:
         history = session["history"]
 
         if ex_idx >= len(exercises):
-            return "All planned exercises done. `/liftend` to close out."
+            if low in ("more", "add", "extend", "keep going", "continue"):
+                extra = await self.suggest_additional_exercises(limit=2)
+                if not extra:
+                    return (
+                        "Nothing else in your library for this pattern. "
+                        "Name any lift to add it, or `/liftend` to close out."
+                    )
+                await self.db.extend_lift_session(extra)
+                session = await self.db.get_active_lift_session()
+                return (
+                    "Added: "
+                    + ", ".join(f"{e['name']} {e['sets']}x{e['reps']}" for e in extra)
+                    + "\n—\n"
+                    + await self._format_next_set_prompt(session)
+                )
+            if low in ("stop", "end", "/liftend", "liftend", "done", "finished"):
+                return await self.end_lift_session()
+            return await self._plan_complete_prompt()
         ex = exercises[ex_idx]
         ex_name = ex["name"]
         total_sets = ex["sets"]
