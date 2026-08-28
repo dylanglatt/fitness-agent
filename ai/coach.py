@@ -52,6 +52,7 @@ from integrations.strava import StravaClient
 from integrations.whoop import WhoopClient, WhoopAuthError
 from integrations.notion import NotionClient
 from integrations.weather import WeatherClient
+from ai import recovery_planner as rp
 from ai import session_planner as sp
 from ai import training_state as ts
 
@@ -2375,6 +2376,59 @@ class Coach:
                 lines.append(rec_block)
         except Exception as e:
             logger.warning(f"Recovery-sessions block failed (non-fatal): {e}")
+
+        # ── RECOVERY PRESCRIPTION — direct it, don't just acknowledge it.
+        # The prompt used to say "only suggest adding recovery work if the
+        # block is genuinely empty", so a consistent sauna user was told what
+        # he had already done and never what to do today.
+        try:
+            planned_s = locals().get("session") or {}
+            rk = (planned_s.get("session_type") or "rest").lower()
+            rsub = (planned_s.get("focus") or "").lower()
+            band_now = None
+            try:
+                band_now = (locals().get("band") or {}).get("band")
+            except Exception:
+                band_now = None
+            # Frequency over the last 7 days, from the merged WHOOP +
+            # chat set computed just above — the same rows the descriptive
+            # block renders, so the prescription and the history agree.
+            recent_recovery: dict = {}
+            cutoff = (today - timedelta(days=7)).isoformat()
+            for r in (locals().get("merged_recovery") or []):
+                if str(r.get("date") or "")[:10] < cutoff:
+                    continue
+                t = str(r.get("session_type") or "").strip().lower().replace(" ", "_")
+                if t:
+                    recent_recovery[t] = recent_recovery.get(t, 0) + 1
+            phase_focus = ""
+            try:
+                phase_focus = (
+                    (await self.db.get_active_phase(str(today))) or {}
+                ).get("focus", "")
+            except Exception:
+                phase_focus = ""
+            rec_plan = rp.plan_recovery(
+                session_kind=rk,
+                session_sub=rsub,
+                band=band_now,
+                phase_focus=phase_focus,
+                recent=recent_recovery,
+                access=getattr(self.config, "RECOVERY_ACCESS", {"sauna": "easy"}),
+            )
+            rec_block = rp.render_recovery_prescription(rec_plan)
+            if rec_block:
+                lines.append("")
+                lines.append(rec_block)
+            obs.log_event(
+                logger, logging.INFO, "recovery.prescribed",
+                band=band_now or "-", session=rk,
+                recs=len(rec_plan.get("recommendations") or []),
+                warnings=len(rec_plan.get("warnings") or []),
+            )
+        except Exception as e:
+            obs.source_failed(logger, "recovery_prescription", "brief", e)
+
 
         if notes:
             lines.append("")

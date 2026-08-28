@@ -93,6 +93,32 @@ class Config:
     HOME_LNG: float = float(os.getenv("HOME_LNG", "0.0") or 0.0)
     HOME_CITY: str = os.getenv("HOME_CITY", "")
 
+    # ── Recovery modality access ────────────────────────────────────────────
+    # Which recovery modalities Dylan can actually use, and how easily. A
+    # modality behind a trip to another gym has to be worth the trip, so the
+    # planner only recommends it when it is clearly the right call rather than
+    # as a default. Sauna is at his usual gym; cold plunge and steam are at
+    # other locations.
+    #
+    # Format: "sauna=easy,cold_plunge=trip,steam=trip". Values: easy | trip.
+    # Drop a modality from the list entirely if it is unavailable.
+    RECOVERY_ACCESS_RAW: str = os.getenv(
+        "RECOVERY_ACCESS", "sauna=easy,cold_plunge=trip,steam=trip"
+    )
+
+    @property
+    def RECOVERY_ACCESS(self) -> dict:
+        out: dict = {}
+        for part in (self.RECOVERY_ACCESS_RAW or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            name, _, level = part.partition("=")
+            name = name.strip().lower()
+            if name:
+                out[name] = (level.strip().lower() or "easy")
+        return out
+
     # ── Webhook server (Strava + WHOOP push) ────────────────────────────────
     # We co-host an aiohttp server in the same event loop as the Discord bot
     # so Strava/WHOOP can push events as they happen instead of the bot
