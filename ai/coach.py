@@ -217,6 +217,135 @@ def _render_run_progression(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _render_exercise_library(vocab: dict) -> str:
+    """Render the movements Dylan actually performs.
+
+    The brief invented workouts. On 2026-08-26 it prescribed back squat, leg
+    press, walking lunges and Bulgarian split squats — none of which appear in
+    408 logged sets. This is the fix: give the model his real movement library
+    and forbid prescribing outside it without saying so.
+    """
+    by_pattern = (vocab or {}).get("by_pattern") or {}
+    if not by_pattern:
+        return ""
+    order = ["push", "pull", "legs", "core", "other"]
+    lines = [
+        f"EXERCISE LIBRARY (what Dylan actually trains — last "
+        f"{vocab.get('weeks', 26)} weeks):"
+    ]
+    for pat in order:
+        items = by_pattern.get(pat)
+        if not items:
+            continue
+        rendered = ", ".join(
+            f"{i['exercise']} ({i['n_sets']} set"
+            f"{'s' if i['n_sets'] != 1 else ''}, last {i['last_date']})"
+            for i in items[:10]
+        )
+        lines.append(f"  {pat.upper()}: {rendered}")
+    thin = [p for p in ("push", "pull", "legs") if not by_pattern.get(p)]
+    if thin:
+        lines.append(
+            f"  NOT TRAINED AT ALL: {', '.join(thin)} — no logged sets in the "
+            "window. Say so rather than inventing a session."
+        )
+    if vocab.get("unresolved_sets"):
+        lines.append(
+            f"  ({vocab['unresolved_sets']} sets could not be identified by the "
+            "parser and are excluded.)"
+        )
+    lines.append(
+        "  PRESCRIBE FROM THIS LIST. If a movement Dylan needs is genuinely "
+        "absent, you may introduce it — but say explicitly that it is new and "
+        "why, and start conservatively."
+    )
+    return "\n".join(lines)
+
+
+def _render_data_freshness(stale: dict) -> str:
+    """Render how stale each feed is, in days.
+
+    The brief opened two consecutive days with "WHOOP isn't synced — train to
+    feel", exactly as it would for a phone left charging. WHOOP had been dead
+    for thirty days. Nothing in the context carried the AGE of the gap, so the
+    model had no way to distinguish a late sync from a broken integration —
+    and the single most useful thing it could have said went unsaid.
+    """
+    if not stale:
+        return ""
+    LABEL = {
+        "whoop_recovery": ("WHOOP recovery", 2),
+        "strava": ("Strava activity", 10),
+        "lift_log": ("Chat lift log", 10),
+    }
+    problems = []
+    for key, (label, threshold) in LABEL.items():
+        info = stale.get(key) or {}
+        age = info.get("age_days")
+        if age is None:
+            problems.append(f"  {label}: NO RECORDS AT ALL.")
+        elif age > threshold:
+            problems.append(
+                f"  {label}: last record {info['last_date']} — {age} DAYS AGO."
+            )
+    if not problems:
+        return ""
+    return "\n".join(
+        ["DATA FRESHNESS WARNING — these feeds are stale:"]
+        + problems
+        + [
+            "  This is an OUTAGE, not a late sync. Lead the brief by naming the "
+            "gap in days and telling Dylan to fix it. Do not silently train "
+            "around missing data for days on end."
+        ]
+    )
+
+
+def _render_yesterday(prev: dict | None, actual: dict | None) -> str:
+    """Prescribed vs. done, for the previous day.
+
+    Every brief was a standalone snapshot with no memory of its own advice. A
+    coach that cannot remember what it told you yesterday cannot hold you to
+    it, and cannot notice it has prescribed the same session three days
+    running while you ignored it.
+    """
+    if not prev:
+        return ""
+    presc = prev.get("prescribed_kind") or prev.get("planned_kind") or ""
+    sub = prev.get("prescribed_sub") or prev.get("planned_sub") or ""
+    if not presc:
+        return ""
+    label = presc + (f" / {sub}" if sub else "")
+    lifts = (actual or {}).get("lifts") or {}
+    acts = (actual or {}).get("activities") or []
+    done_bits = []
+    if lifts:
+        done_bits.append(
+            ", ".join(f"{k} x{v}" for k, v in list(lifts.items())[:6])
+        )
+    for a in acts[:3]:
+        mi = (a.get("distance_m") or 0) / 1609.34
+        done_bits.append(
+            f"{a.get('sport_type', 'activity')}"
+            + (f" {mi:.1f}mi" if mi >= 0.1 else "")
+        )
+    lines = [f"YESTERDAY ({prev.get('date')}) — prescribed: {label}"]
+    if done_bits:
+        lines.append("  Actually logged: " + " | ".join(done_bits))
+        lines.append(
+            "  Open with one sentence on whether that matched, and carry it "
+            "forward. Do not re-prescribe a session that was completed."
+        )
+    else:
+        lines.append("  Actually logged: NOTHING.")
+        lines.append(
+            "  If the same session has now been skipped more than once, say so "
+            "plainly and either lower the bar or ask what is in the way. Do "
+            "not simply repeat the prescription a third time."
+        )
+    return "\n".join(lines)
+
+
 def _render_phase_block(
     phase: Optional[dict], nxt: Optional[dict], today: _date
 ) -> str:
@@ -302,10 +431,20 @@ def _render_strength_progression(rows: list[dict]) -> str:
             parts.append("*** PR — best on record ***")
         elif r.get("best_e1rm_alltime"):
             gap = r["best_e1rm_alltime"] - (r["last_e1rm"] or 0)
-            parts.append(
-                f"all-time {r['best_e1rm_alltime']} ({r['alltime_date']}, "
-                f"{gap:g} lb off)"
-            )
+            if gap <= 0.5:
+                # Last session IS the best on record, but there is not enough
+                # history behind it to call a PR. Saying "all-time 21, 0 lb
+                # off" for a lift with one session reads as noise.
+                n_all = r.get("sessions_alltime") or 0
+                parts.append(
+                    "best so far" + (f", only {n_all} session on record"
+                                     if n_all <= 1 else "")
+                )
+            else:
+                parts.append(
+                    f"all-time {r['best_e1rm_alltime']} ({r['alltime_date']}, "
+                    f"{gap:g} lb off)"
+                )
         if r["trend"] != "flat":
             parts.append(f"trend {r['trend']} {r['delta_lb']:+g} lb")
         n = r["n_sessions"]
@@ -1612,6 +1751,8 @@ class Coach:
         d365 = today - timedelta(days=365)
         d14 = today - timedelta(days=14)
 
+        # Reset per-build; daily_brief persists this as the day's decision.
+        self._brief_decision: dict = {}
         lines: list[str] = []
         lines.append(f"TODAY: {today.strftime('%A, %B %d, %Y')}")
         lines.append(f"CURRENT TIME: {_fmt_time(now_local)}")
@@ -1773,6 +1914,17 @@ class Coach:
             state = ts.build_training_state(lifts_14d, acts_14d_for_adherence, today)
             planned = ts.classify_planned_session(locals().get("session"))
             readiness = ts.assess_readiness(state, planned)
+            sug = readiness.get("suggested") or ()
+            self._brief_decision.update({
+                "planned_kind": readiness.get("planned_kind") or "",
+                "planned_sub": readiness.get("planned_sub") or "",
+                "readiness_status": readiness.get("status") or "",
+                # What the engine actually decided: the swap if it suggested
+                # one, otherwise the plan. This is the line tomorrow's brief
+                # checks against what was logged.
+                "prescribed_kind": (sug[0] if sug else readiness.get("planned_kind")) or "",
+                "prescribed_sub": (sug[1] if len(sug) > 1 else readiness.get("planned_sub")) or "",
+            })
             readiness_block = ts.render_readiness_block(state, readiness)
             if readiness_block:
                 lines.append("")
@@ -1883,12 +2035,53 @@ class Coach:
         except Exception as e:
             obs.source_failed(logger, "strength_progression", "brief", e)
 
+        # ── EXERCISE LIBRARY — stop the model inventing movements.
+        try:
+            vocab = await self.db.get_exercise_vocabulary(weeks=26)
+            vocab_block = _render_exercise_library(vocab)
+            if vocab_block:
+                lines.append("")
+                lines.append(vocab_block)
+        except Exception as e:
+            obs.source_failed(logger, "exercise_vocabulary", "brief", e)
+
+        # ── DATA FRESHNESS — lead with it when a feed is dark.
+        try:
+            stale = await self.db.get_feed_staleness()
+            fresh_block = _render_data_freshness(stale)
+            if fresh_block:
+                lines.append("")
+                lines.append(fresh_block)
+                obs.log_event(
+                    logger,
+                    logging.WARNING,
+                    "brief.stale_feeds",
+                    whoop_age=(stale.get("whoop_recovery") or {}).get("age_days"),
+                    strava_age=(stale.get("strava") or {}).get("age_days"),
+                    lift_age=(stale.get("lift_log") or {}).get("age_days"),
+                )
+        except Exception as e:
+            obs.source_failed(logger, "feed_staleness", "brief", e)
+
+        # ── YESTERDAY — what was prescribed vs what was logged.
+        try:
+            yday = (today - timedelta(days=1)).isoformat()
+            prev = await self.db.get_brief_for_date(yday)
+            actual = await self.db.get_logged_work_for_date(yday)
+            yblock = _render_yesterday(prev, actual)
+            if yblock:
+                lines.append("")
+                lines.append(yblock)
+        except Exception as e:
+            obs.source_failed(logger, "brief_continuity", "brief", e)
+
         # ── TRAINING PHASE — what is primary RIGHT NOW.
         # Read before goals on purpose: the goals say where you are going, the
         # phase says which one you are allowed to chase this month.
         try:
             phase = await self.db.get_active_phase(str(today))
             nxt = await self.db.get_next_phase(str(today))
+            self._brief_decision["phase_name"] = (phase or {}).get("name", "")
             phase_block = _render_phase_block(phase, nxt, today)
             if phase_block:
                 lines.append("")
@@ -2165,6 +2358,24 @@ class Coach:
         stoic_quote = get_daily_stoic_quote()
         prompt = DAILY_BRIEF_PROMPT.format(data=context, stoic_quote=stoic_quote)
         brief = await self._ask_claude(prompt, allow_tools=False, caller="daily_brief")
+
+        # Persist the DETERMINISTIC decision (not the prose) so tomorrow's
+        # brief can check prescribed-vs-done. Prose cannot be compared against
+        # what was logged; "lift / pull" can.
+        try:
+            d = getattr(self, "_brief_decision", {}) or {}
+            await self.db.log_brief(
+                date=self._now().strftime("%Y-%m-%d"),
+                phase_name=d.get("phase_name", ""),
+                planned_kind=d.get("planned_kind", ""),
+                planned_sub=d.get("planned_sub", ""),
+                readiness_status=d.get("readiness_status", ""),
+                prescribed_kind=d.get("prescribed_kind", ""),
+                prescribed_sub=d.get("prescribed_sub", ""),
+                summary=(brief or "")[:400],
+            )
+        except Exception as e:
+            obs.source_failed(logger, "brief_history_write", "brief", e)
 
         # Best-effort Notion log. Two writes now — one daily-summary row, plus
         # one row per Strava activity that came in since yesterday. Each write

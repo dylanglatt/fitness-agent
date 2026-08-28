@@ -11,6 +11,8 @@ import aiosqlite
 import json
 import logging
 from datetime import datetime, timedelta
+
+from data.exercise_vocab import canonical_exercise
 from pathlib import Path
 from typing import Optional
 
@@ -195,6 +197,25 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_phase_dates "
                 "ON training_phases(start_date, end_date)"
             )
+            # ── Brief history — what was PRESCRIBED, so tomorrow can check.
+            # Every brief was a standalone snapshot: it never referenced what
+            # it told you yesterday or whether you did it. A coach with no
+            # memory of its own advice cannot hold you to anything, and cannot
+            # notice that it has prescribed the same session three days
+            # running while you ignored it.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS brief_history (
+                    date TEXT PRIMARY KEY,
+                    phase_name TEXT DEFAULT '',
+                    planned_kind TEXT DEFAULT '',
+                    planned_sub TEXT DEFAULT '',
+                    readiness_status TEXT DEFAULT '',
+                    prescribed_kind TEXT DEFAULT '',
+                    prescribed_sub TEXT DEFAULT '',
+                    summary TEXT DEFAULT '',
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
             # sync_state: last successful sync timestamp per source. Lets the
             # nightly job ask "what's new since last time?" without refetching
             # the world.
@@ -599,16 +620,22 @@ class Database:
         # exercise; keep the most frequent spelling for display.
         by_ex: dict[str, dict] = {}
         for r in rows:
-            key = (r["exercise"] or "").strip().lower()
+            # Canonical name, so "barbell row" and "barbell rows" are one lift
+            # rather than two half-histories, and parser placeholders like
+            # "dumbbell exercise" are excluded instead of tracked.
+            key = canonical_exercise(r["exercise"])
             if not key:
                 continue
             slot = by_ex.setdefault(
-                key, {"names": {}, "days": {}, "alltime": (0.0, None)}
+                key, {"names": {}, "days": {}, "alltime": (0.0, None), "hist": {}}
             )
             slot["names"][r["exercise"]] = slot["names"].get(r["exercise"], 0) + 1
             est = e1rm(r["weight_lb"], r["reps"])
             if est > slot["alltime"][0]:
                 slot["alltime"] = (est, r["date"])
+            # Per-day all-time history, used for PR semantics below.
+            if est > slot["hist"].get(r["date"], 0):
+                slot["hist"][r["date"]] = est
             if r["date"] < since:
                 continue  # counted for all-time, excluded from the window
             day = slot["days"].setdefault(
@@ -629,7 +656,7 @@ class Database:
             ests = [days[d]["top"][2] for d in dates if days[d]["top"]]
             last_date = dates[-1]
             last = days[last_date]
-            display = max(slot["names"].items(), key=lambda kv: kv[1])[0]
+            display = key[:1].upper() + key[1:]
 
             trend, delta = "flat", 0.0
             if len(ests) >= 4:
@@ -641,6 +668,18 @@ class Database:
 
             alltime_est, alltime_date = slot["alltime"]
             last_est = last["top"][2] if last["top"] else None
+            # A PR must BEAT every prior session, and there must be priors to
+            # beat. Without this every first-ever session reads as a PR, which
+            # fires the marker on nearly every lift and makes it worthless.
+            hist = slot["hist"]
+            prior = [v for k, v in hist.items() if k != last_date]
+            best_prior = max(prior) if prior else None
+            is_pr = bool(
+                last_est is not None
+                and best_prior is not None
+                and len(prior) >= 2
+                and last_est > best_prior + 0.5
+            )
             out.append({
                 "exercise": display,
                 "n_sessions": len(dates),
@@ -654,11 +693,8 @@ class Database:
                 "best_e1rm_window": round(max(ests)) if ests else None,
                 "best_e1rm_alltime": round(alltime_est) if alltime_est else None,
                 "alltime_date": alltime_date,
-                # A PR means the most recent session matched or beat every
-                # session on record, not just the window.
-                "is_pr": bool(
-                    last_est and alltime_est and last_est >= alltime_est - 0.5
-                ),
+                "is_pr": is_pr,
+                "sessions_alltime": len(hist),
                 "trend": trend,
                 "delta_lb": round(delta),
                 "trained_recently": last_date >= recent_cutoff,
@@ -2053,6 +2089,167 @@ class Database:
                 "SELECT * FROM training_phases ORDER BY start_date ASC"
             )
             return [dict(r) for r in await cur.fetchall()]
+
+    # ── Exercise vocabulary ─────────────────────────────────────────────
+
+    async def get_exercise_vocabulary(self, weeks: int = 26) -> dict:
+        """The movements Dylan ACTUALLY performs, grouped by pattern.
+
+        Exists because the brief invented workouts. On 2026-08-26 it
+        prescribed "Legs — Squat focus": back squat, leg press, walking
+        lunges, Bulgarian split squats. Across 408 logged sets he has two
+        squat sets, both hack squat, and has never logged the other three. The
+        readiness engine said "Legs: READY" with no exercise data behind it,
+        so the model filled the gap from a textbook.
+
+        Returns {pattern: [{exercise, n_sets, n_sessions, last_date}]} plus an
+        "unresolved" count so the parser's placeholder rate stays visible.
+        """
+        from ai import training_state as ts
+
+        since = (datetime.now() - timedelta(weeks=weeks)).strftime("%Y-%m-%d")
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT date, exercise FROM lift_sets WHERE date >= ?", (since,)
+            )
+            rows = [dict(r) for r in await cur.fetchall()]
+
+        agg: dict[str, dict] = {}
+        unresolved = 0
+        for r in rows:
+            name = canonical_exercise(r["exercise"])
+            if not name:
+                unresolved += 1
+                continue
+            slot = agg.setdefault(
+                name, {"n_sets": 0, "dates": set(), "last_date": ""}
+            )
+            slot["n_sets"] += 1
+            slot["dates"].add(r["date"])
+            if r["date"] > slot["last_date"]:
+                slot["last_date"] = r["date"]
+
+        by_pattern: dict[str, list] = {}
+        for name, slot in agg.items():
+            pattern, _muscle = ts.classify_exercise(name)
+            by_pattern.setdefault(pattern or "other", []).append({
+                "exercise": name[:1].upper() + name[1:],
+                "n_sets": slot["n_sets"],
+                "n_sessions": len(slot["dates"]),
+                "last_date": slot["last_date"],
+            })
+        for lst in by_pattern.values():
+            lst.sort(key=lambda x: (-x["n_sets"], x["exercise"]))
+        return {"by_pattern": by_pattern, "unresolved_sets": unresolved,
+                "weeks": weeks, "total_sets": len(rows)}
+
+    # ── Feed staleness ──────────────────────────────────────────────────
+
+    async def get_feed_staleness(self) -> dict:
+        """Days since each data feed last produced a record.
+
+        The brief opened both of the last two days with "WHOOP isn't synced —
+        train to feel", phrased as a routine morning inconvenience. It had
+        been dead for thirty days. The brief could not tell a late sync from
+        a month-long outage because nothing ever told it the age of the gap.
+        """
+        today = datetime.now().date()
+
+        def age(d: Optional[str]) -> Optional[int]:
+            if not d:
+                return None
+            try:
+                return (today - datetime.strptime(d[:10], "%Y-%m-%d").date()).days
+            except Exception:
+                return None
+
+        out: dict = {}
+        async with aiosqlite.connect(self.db_path) as db:
+            for key, sql in (
+                ("whoop_recovery", "SELECT MAX(date) FROM whoop_recovery"),
+                ("strava", "SELECT MAX(date) FROM strava_activities"),
+                ("lift_log", "SELECT MAX(date) FROM lift_sets"),
+            ):
+                try:
+                    async with db.execute(sql) as cur:
+                        row = await cur.fetchone()
+                    last = row[0] if row else None
+                except Exception:
+                    last = None
+                out[key] = {"last_date": last, "age_days": age(last)}
+        return out
+
+    # ── Brief history ───────────────────────────────────────────────────
+
+    async def log_brief(
+        self,
+        *,
+        date: str,
+        phase_name: str = "",
+        planned_kind: str = "",
+        planned_sub: str = "",
+        readiness_status: str = "",
+        prescribed_kind: str = "",
+        prescribed_sub: str = "",
+        summary: str = "",
+    ) -> None:
+        """Record what today's brief prescribed, so tomorrow can check it.
+
+        Stores the DETERMINISTIC decision (engine kind/sub), not the LLM's
+        prose — prose cannot be compared against what was logged.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO brief_history
+                    (date, phase_name, planned_kind, planned_sub,
+                     readiness_status, prescribed_kind, prescribed_sub, summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(date) DO UPDATE SET
+                    phase_name=excluded.phase_name,
+                    planned_kind=excluded.planned_kind,
+                    planned_sub=excluded.planned_sub,
+                    readiness_status=excluded.readiness_status,
+                    prescribed_kind=excluded.prescribed_kind,
+                    prescribed_sub=excluded.prescribed_sub,
+                    summary=excluded.summary
+                """,
+                (date, phase_name, planned_kind, planned_sub, readiness_status,
+                 prescribed_kind, prescribed_sub, summary),
+            )
+            await db.commit()
+
+    async def get_brief_for_date(self, date: str) -> Optional[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM brief_history WHERE date = ?", (date,)
+            )
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def get_logged_work_for_date(self, date: str) -> dict:
+        """What actually happened on `date` — lifts (canonical names) and
+        activities. The other half of the continuity check."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT exercise, COUNT(*) n FROM lift_sets WHERE date = ? "
+                "GROUP BY exercise", (date,)
+            )
+            lift_rows = [dict(r) for r in await cur.fetchall()]
+            cur = await db.execute(
+                "SELECT sport_type, name, distance_m, moving_time_s "
+                "FROM strava_activities WHERE date = ?", (date,)
+            )
+            acts = [dict(r) for r in await cur.fetchall()]
+        lifts: dict[str, int] = {}
+        for r in lift_rows:
+            name = canonical_exercise(r["exercise"])
+            if name:
+                lifts[name] = lifts.get(name, 0) + r["n"]
+        return {"lifts": lifts, "activities": acts}
 
     async def create_goal(
         self,
