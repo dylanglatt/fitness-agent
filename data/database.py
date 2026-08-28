@@ -515,6 +515,129 @@ class Database:
                 row = await cursor.fetchone()
         return row is not None
 
+    async def get_strength_progression(
+        self, weeks: int = 12, limit: int = 6
+    ) -> list[dict]:
+        """Per-exercise strength progression, for the morning brief.
+
+        This is the number the coach never had. lift_sets has carried weight,
+        reps and set number all along, and _summarize_lift_progression has
+        computed e1RM from it — but only as an LLM tool, gated behind
+        allow_tools, and daily_brief runs allow_tools=False. So the brief could
+        not reach it even if it wanted to, and lifts arrived at the model as
+        free text: "Cable lateral raise | 3x12 @ 15". No weight, no e1RM, no
+        PR, no volume. That is the single biggest reason the coaching felt
+        disconnected from the training.
+
+        Per exercise (most-trained first, anything trained in the last 7 days
+        always included):
+          exercise, n_sessions, last_date, last_top_set, last_e1rm,
+          best_e1rm_window, best_e1rm_alltime, alltime_date, is_pr, trend,
+          delta_lb, last_volume_lb
+
+        e1RM is Epley (w × (1 + reps/30)) — it overestimates slightly at high
+        reps, which is fine for a trend signal and is the same formula
+        _summarize_lift_progression already uses, so the two never disagree.
+
+        All-time bests are computed over ALL history, not the window, so "PR"
+        means a genuine record rather than "best of the last 12 weeks".
+        """
+        since = (datetime.now() - timedelta(weeks=weeks)).strftime("%Y-%m-%d")
+        recent_cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT date, exercise, reps, weight_lb
+                FROM lift_sets
+                WHERE weight_lb IS NOT NULL AND reps IS NOT NULL
+                  AND weight_lb > 0 AND reps > 0
+                ORDER BY date ASC
+                """
+            )
+            rows = [dict(r) for r in await cur.fetchall()]
+        if not rows:
+            return []
+
+        def e1rm(w: float, reps: int) -> float:
+            return w * (1 + reps / 30.0)
+
+        # Group by normalized name so "Bench press" and "bench Press" are one
+        # exercise; keep the most frequent spelling for display.
+        by_ex: dict[str, dict] = {}
+        for r in rows:
+            key = (r["exercise"] or "").strip().lower()
+            if not key:
+                continue
+            slot = by_ex.setdefault(
+                key, {"names": {}, "days": {}, "alltime": (0.0, None)}
+            )
+            slot["names"][r["exercise"]] = slot["names"].get(r["exercise"], 0) + 1
+            est = e1rm(r["weight_lb"], r["reps"])
+            if est > slot["alltime"][0]:
+                slot["alltime"] = (est, r["date"])
+            if r["date"] < since:
+                continue  # counted for all-time, excluded from the window
+            day = slot["days"].setdefault(
+                r["date"], {"top": None, "volume": 0.0, "n_sets": 0}
+            )
+            day["volume"] += r["weight_lb"] * r["reps"]
+            day["n_sets"] += 1
+            cand = (r["weight_lb"], r["reps"], est)
+            if day["top"] is None or est > day["top"][2]:
+                day["top"] = cand
+
+        out: list[dict] = []
+        for key, slot in by_ex.items():
+            days = slot["days"]
+            if not days:
+                continue
+            dates = sorted(days)
+            ests = [days[d]["top"][2] for d in dates if days[d]["top"]]
+            last_date = dates[-1]
+            last = days[last_date]
+            display = max(slot["names"].items(), key=lambda kv: kv[1])[0]
+
+            trend, delta = "flat", 0.0
+            if len(ests) >= 4:
+                mid = len(ests) // 2
+                first = sum(ests[:mid]) / mid
+                second = sum(ests[mid:]) / (len(ests) - mid)
+                delta = second - first
+                trend = "up" if delta >= 5 else "down" if delta <= -5 else "flat"
+
+            alltime_est, alltime_date = slot["alltime"]
+            last_est = last["top"][2] if last["top"] else None
+            out.append({
+                "exercise": display,
+                "n_sessions": len(dates),
+                "last_date": last_date,
+                "last_top_set": (
+                    f"{last['top'][0]:g} x {last['top'][1]}" if last["top"] else None
+                ),
+                "last_e1rm": round(last_est) if last_est else None,
+                "last_volume_lb": round(last["volume"]),
+                "last_n_sets": last["n_sets"],
+                "best_e1rm_window": round(max(ests)) if ests else None,
+                "best_e1rm_alltime": round(alltime_est) if alltime_est else None,
+                "alltime_date": alltime_date,
+                # A PR means the most recent session matched or beat every
+                # session on record, not just the window.
+                "is_pr": bool(
+                    last_est and alltime_est and last_est >= alltime_est - 0.5
+                ),
+                "trend": trend,
+                "delta_lb": round(delta),
+                "trained_recently": last_date >= recent_cutoff,
+            })
+
+        # Most-trained first, but never drop something trained this week just
+        # because it is new — that is exactly what the coach needs to see.
+        out.sort(key=lambda r: (r["trained_recently"], r["n_sessions"]), reverse=True)
+        recent = [r for r in out if r["trained_recently"]]
+        rest = [r for r in out if not r["trained_recently"]]
+        return (recent + rest)[: max(limit, len(recent))]
+
     async def get_lift_sets_for_exercise(
         self,
         exercise: str,

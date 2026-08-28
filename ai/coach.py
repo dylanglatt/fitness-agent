@@ -217,6 +217,45 @@ def _render_run_progression(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _render_strength_progression(rows: list[dict]) -> str:
+    """Render per-lift strength progression for the brief prompt.
+
+    The brief previously saw lifts only as free-text strings — "Cable lateral
+    raise | 3x12 @ 15" — so it could describe what happened but never reason
+    about whether it was progress. This puts the actual numbers in front of
+    the model: last top set, estimated 1RM, all-time best, and whether the
+    last session was a PR.
+    """
+    if not rows:
+        return ""
+    lines = [
+        "STRENGTH PROGRESSION (from logged sets, last 12w — est. 1RM is Epley, "
+        "a trend signal not a tested max):"
+    ]
+    for r in rows:
+        parts = [f"last {r['last_date']}: {r['last_top_set']}"]
+        if r.get("last_e1rm"):
+            parts.append(f"e1RM {r['last_e1rm']}")
+        if r.get("is_pr"):
+            parts.append("*** PR — best on record ***")
+        elif r.get("best_e1rm_alltime"):
+            gap = r["best_e1rm_alltime"] - (r["last_e1rm"] or 0)
+            parts.append(
+                f"all-time {r['best_e1rm_alltime']} ({r['alltime_date']}, "
+                f"{gap:g} lb off)"
+            )
+        if r["trend"] != "flat":
+            parts.append(f"trend {r['trend']} {r['delta_lb']:+g} lb")
+        n = r["n_sessions"]
+        parts.append(f"{n} session" + ("s" if n != 1 else ""))
+        lines.append(f"  {r['exercise']}: " + " · ".join(parts))
+    lines.append(
+        "  Use these numbers when prescribing load. Progress a lift only when "
+        "the last session hit its reps cleanly and recovery allows it."
+    )
+    return "\n".join(lines)
+
+
 # ── Time formatting ─────────────────────────────────────────────────────────
 def _fmt_time(dt: datetime) -> str:
     """Human-friendly local time, e.g. '2:05 PM EDT'.
@@ -1399,6 +1438,21 @@ class Coach:
             obs.source_failed(logger, "recent_lifts", "chat", e)
             recent_lifts = []
 
+        # Strength numbers in the CHAT path too. The brief and chat had become
+        # two different brains answering the same question: ask "what should I
+        # train today" in chat and it saw no readiness, no trends and no
+        # numbers, only free-text lift strings. "How is my bench progressing"
+        # is a chat question far more often than a brief one, so this is the
+        # path that needed it most.
+        try:
+            strength = await self.db.get_strength_progression(weeks=12, limit=5)
+            strength_block = _render_strength_progression(strength)
+            if strength_block:
+                lines.append("")
+                lines.append(strength_block)
+        except Exception as e:
+            obs.source_failed(logger, "strength_progression", "chat", e)
+
         # PLAN ADHERENCE — only when a plan exists. Pulls 14 days of Strava
         # activities (one extra DB read, cheap) and reuses the 14-day lifts
         # already in hand. 14 days covers last week's Mon → today, so the
@@ -1745,6 +1799,52 @@ class Coach:
             )
         except Exception as e:
             obs.source_failed(logger, "strava_best_efforts", "brief", e)
+
+        # ── STRENGTH PROGRESSION — the numbers the brief never had.
+        # lift_sets has carried weight/reps all along and e1RM was computable,
+        # but only through an LLM tool gated behind allow_tools — and the brief
+        # runs allow_tools=False, so it could never reach it. Deterministic
+        # block instead: no tool round-trip, always present.
+        try:
+            strength = await self.db.get_strength_progression(weeks=12, limit=6)
+            strength_block = _render_strength_progression(strength)
+            if strength_block:
+                lines.append("")
+                lines.append(strength_block)
+            obs.log_event(
+                logger,
+                logging.INFO,
+                "strength_progression.rendered",
+                exercises=len(strength or []),
+                prs=sum(1 for r in (strength or []) if r.get("is_pr")),
+            )
+        except Exception as e:
+            obs.source_failed(logger, "strength_progression", "brief", e)
+
+        # ── GOALS — what the training is actually FOR.
+        # The goals table has been written by /goal and the iOS app since it
+        # existed and read by neither the brief nor chat, so the coach has
+        # never known what it was training you toward. Every recommendation
+        # was made in a vacuum.
+        try:
+            goals = await self.db.list_goals(status="active")
+            if goals:
+                lines.append("")
+                lines.append("ACTIVE GOALS (what today's session is in service of):")
+                for g in goals[:6]:
+                    bits = [g.get("title") or "goal"]
+                    if g.get("target_value") is not None:
+                        bits.append(
+                            f"target {g['target_value']:g}"
+                            f"{(' ' + g['target_unit']) if g.get('target_unit') else ''}"
+                        )
+                    if g.get("baseline_value") is not None:
+                        bits.append(f"from {g['baseline_value']:g}")
+                    if g.get("deadline"):
+                        bits.append(f"by {g['deadline']}")
+                    lines.append("  - " + " · ".join(bits))
+        except Exception as e:
+            obs.source_failed(logger, "goals", "brief", e)
 
         # ── Last 7 days detail
         if daily:
