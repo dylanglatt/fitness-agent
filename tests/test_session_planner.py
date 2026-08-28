@@ -133,11 +133,14 @@ class PlanSessionTests(unittest.TestCase):
         self.assertTrue(all(e["sets"] == 2 for e in maint))
 
     def test_load_comes_from_history_not_a_guess(self):
+        """Double progression: 6 clean reps in a 6-8 range earns a REP, not a
+        load jump. The weight moves when the top of the range is cleared."""
         hist = {"bench press": [_sess("2026-08-20", (205, 6), (205, 6), (205, 6))]}
         plan = plan_session("push", LIBRARY, hist, goal_lifts=["bench press"])
         bench = plan[0]
-        self.assertEqual(bench["target_weight_lb"], 210)
-        self.assertEqual(bench["action"], "progress")
+        self.assertEqual(bench["target_weight_lb"], 205)
+        self.assertEqual(bench["reps"], "7")
+        self.assertEqual(bench["action"], "add_rep")
         # A lift with no history is honest about it rather than inventing a load.
         dips = next(e for e in plan if e["name"] == "Dips")
         self.assertIsNone(dips["target_weight_lb"])
@@ -270,16 +273,19 @@ class SessionShapeTests(unittest.TestCase):
             for e in plan_session("push", lib, hist, goal_lifts=["bench press"])
         }
         bench = plan["Bench press"]
-        self.assertEqual((bench["sets"], bench["reps"]), (3, "6"))
+        # 6 clean reps sits at the BOTTOM of the 6-8 range: same weight, one
+        # more rep. Linear progression would have said 210 and stalled.
+        self.assertEqual((bench["sets"], bench["reps"]), (3, "7"))
+        self.assertEqual(bench["target_weight_lb"], 205)
+        self.assertEqual(bench["rep_range"], "6-8")
         self.assertEqual(bench["warmup"], {"weight_lb": 135, "reps": 10})
-        self.assertEqual(bench["target_weight_lb"], 210)  # hit all 6s -> +5
 
         ohp = plan["Overhead press"]
-        self.assertEqual((ohp["sets"], ohp["reps"]), (3, "10"))
-        self.assertEqual(ohp["target_weight_lb"], 100)
+        self.assertEqual((ohp["sets"], ohp["reps"]), (3, "11"))
+        self.assertEqual(ohp["target_weight_lb"], 95)
 
         inc = plan["Incline dumbbell press"]
-        self.assertEqual((inc["sets"], inc["reps"]), (3, "8"))
+        self.assertEqual((inc["sets"], inc["reps"]), (3, "9"))  # 8-10 range
         # Only the opening lift gets a warmup set — a "45 lb bar" warmup on a
         # dumbbell press is nonsense, and it is not how he trains.
         self.assertIsNone(inc["warmup"])
@@ -287,5 +293,128 @@ class SessionShapeTests(unittest.TestCase):
 
         lat = plan["Single arm cable lateral raise"]
         self.assertTrue(lat["per_side"])
-        self.assertEqual(lat["reps"], "12")
+        self.assertEqual(lat["reps"], "13")  # 12-14 range, clean at 12 -> +1 rep
         self.assertIsNone(lat["warmup"])
+
+
+class DoubleProgressionTests(unittest.TestCase):
+    """The ladder a real coach runs: reps climb inside the range, then the
+    weight climbs and the reps reset. Adding load every session is novice
+    programming — it stalls, and the old rule then repeated the same weight
+    forever."""
+
+    def _step(self, sessions):
+        from ai.session_planner import next_prescription
+
+        return next_prescription(sessions, "Bench press", rep_range=(6, 8))
+
+    def test_the_full_ladder(self):
+        s = [_sess("2026-08-01", (205, 6), (205, 6), (205, 6))]
+        p = self._step(s)
+        self.assertEqual(
+            (p["weight_lb"], p["target_reps"], p["action"]), (205, 7, "add_rep")
+        )
+
+        s.append(_sess("2026-08-08", (205, 7), (205, 7), (205, 7)))
+        p = self._step(s)
+        self.assertEqual(
+            (p["weight_lb"], p["target_reps"], p["action"]), (205, 8, "add_rep")
+        )
+
+        s.append(_sess("2026-08-15", (205, 8), (205, 8), (205, 8)))
+        p = self._step(s)
+        self.assertEqual(
+            (p["weight_lb"], p["target_reps"], p["action"]), (210, 6, "add_weight")
+        )
+        self.assertIn("Cleared the top of the range", p["reason"])
+
+    def test_a_ragged_set_holds_the_weight(self):
+        """8, 8, 6 is not clearing the range — the worst set decides."""
+        s = [_sess("2026-08-15", (205, 8), (205, 8), (205, 6))]
+        p = self._step(s)
+        self.assertEqual(p["action"], "add_rep")
+        self.assertEqual(p["weight_lb"], 205)
+
+    def test_missing_the_bottom_repeats_then_deloads(self):
+        s = [_sess("2026-08-08", (215, 5), (215, 4), (215, 4))]
+        self.assertEqual(self._step(s)["action"], "repeat")
+        s.append(_sess("2026-08-15", (215, 5), (215, 4), (215, 4)))
+        p = self._step(s)
+        self.assertEqual(p["action"], "deload")
+        self.assertEqual(p["weight_lb"], 195)
+
+    def test_three_flat_sessions_at_the_same_weight_is_a_stall(self):
+        """Not a failure — just no movement. A coach backs off and rebuilds
+        rather than letting it sit there for months."""
+        s = [
+            _sess(f"2026-08-{d:02d}", (205, 7), (205, 7), (205, 7)) for d in (1, 8, 15)
+        ]
+        p = self._step(s)
+        self.assertEqual(p["action"], "deload")
+        self.assertIn("without moving", p["reason"])
+
+    def test_rep_range_starts_from_how_he_actually_trains(self):
+        from ai.session_planner import rep_range_for
+
+        self.assertEqual(
+            rep_range_for([_sess("2026-08-15", (205, 6), (205, 6))], 8), (6, 8)
+        )
+        self.assertEqual(
+            rep_range_for([_sess("2026-08-15", (95, 10), (95, 10))], 6), (10, 12)
+        )
+        self.assertEqual(rep_range_for([], 6), (6, 8))
+
+
+class ProgressionPaceTests(unittest.TestCase):
+    """A per-set rule can run for a year and quietly miss the goal by 40 lb.
+    Nothing in the system would ever have said so."""
+
+    def _ramp(self, start_e1rm_weight, weeks, gain_per_week):
+        out = []
+        for i in range(weeks):
+            w = start_e1rm_weight + gain_per_week * i
+            out.append(
+                {
+                    "date": f"2026-{1 + i // 4:02d}-{1 + (i % 4) * 7:02d}",
+                    "sets": [{"weight_lb": round(w), "reps": 6}],
+                }
+            )
+        return out
+
+    def test_behind_pace_is_named_with_the_numbers(self):
+        from ai.session_planner import progression_pace
+
+        # ~1 lb/week on the bar, needing far more to reach 315 e1RM.
+        pace = progression_pace(
+            self._ramp(200, 12, 1.0), 315, "2027-06-30", "2026-08-28"
+        )
+        self.assertIsNotNone(pace)
+        self.assertFalse(pace["on_pace"])
+        self.assertIn("BEHIND pace", pace["note"])
+        self.assertIn("Needs", pace["note"])
+
+    def test_on_pace_says_so(self):
+        from ai.session_planner import progression_pace
+
+        pace = progression_pace(
+            self._ramp(200, 12, 3.0), 260, "2027-06-30", "2026-08-28"
+        )
+        self.assertTrue(pace["on_pace"])
+        self.assertIn("On pace", pace["note"])
+
+    def test_flat_progress_is_called_out(self):
+        from ai.session_planner import progression_pace
+
+        pace = progression_pace(
+            self._ramp(200, 12, 0.0), 315, "2027-06-30", "2026-08-28"
+        )
+        self.assertIn("flat or falling", pace["note"])
+
+    def test_not_enough_history_returns_none(self):
+        from ai.session_planner import progression_pace
+
+        self.assertIsNone(
+            progression_pace(
+                [_sess("2026-08-01", (205, 6))], 315, "2027-06-30", "2026-08-28"
+            )
+        )

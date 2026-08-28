@@ -61,6 +61,181 @@ def _round_to(value: float, step: float) -> float:
     return round(value / step) * step
 
 
+def rep_range_for(sessions: list[dict], default_low: int) -> tuple[int, int]:
+    """The rep range to run double progression in.
+
+    The bottom of the range is what Dylan actually trains at (bench 6, OHP 10,
+    lateral raise 12), so his session shape is preserved. The top is +2, which
+    is the room to earn the next load increase.
+    """
+    low = infer_target_reps(sessions, default_low)
+    return low, low + 2
+
+
+def next_prescription(
+    sessions: list[dict],
+    exercise: str,
+    *,
+    rep_range: Optional[tuple[int, int]] = None,
+    default_reps: int = 6,
+    intensity_band: Optional[str] = None,
+) -> dict:
+    """Decide load AND reps for the next session — double progression.
+
+    Adding weight every time you clear a single rep target is linear
+    progression. It works for a novice and stalls fast for anyone else: you
+    add 5 lb, miss, repeat, miss again, and the weight never moves. The
+    previous rule did exactly that, so the load either climbed unsustainably
+    or sat still.
+
+    Double progression is what a coach actually programs:
+      • Hit the TOP of the range on every working set  -> add weight, reset
+        reps to the bottom of the range. The load moves, earned.
+      • Hit at least the BOTTOM on every set           -> keep the weight, add
+        one rep. Progress without a load jump you have not earned.
+      • Miss the bottom on any set                     -> repeat.
+      • Same weight stuck for 3+ sessions with no rep gain, or two failed
+        sessions -> deload ~10% and rebuild. A stall is a signal, not
+        something to grind through.
+
+    Returns {weight_lb, target_reps, action, reason} where action is
+    "add_weight" | "add_rep" | "repeat" | "deload" | "pick".
+    """
+    low, high = rep_range or rep_range_for(sessions, default_reps)
+    inc = load_increment(exercise)
+    step = INCREMENT_SMALL if inc == INCREMENT_SMALL else INCREMENT_MEDIUM
+
+    def working(sets: list[dict]) -> list[dict]:
+        weighted = [s for s in sets if s.get("weight_lb")]
+        if not weighted:
+            return []
+        top = max(s["weight_lb"] for s in weighted)
+        return [s for s in weighted if s["weight_lb"] == top]
+
+    if not sessions:
+        return {
+            "weight_lb": None,
+            "target_reps": low,
+            "action": "pick",
+            "reason": (
+                f"No history for this lift — pick a weight you can get {low} "
+                f"clean reps with and log it."
+            ),
+        }
+
+    last = sessions[-1]
+    last_working = working(last.get("sets") or [])
+    if not last_working:
+        return {
+            "weight_lb": None,
+            "target_reps": low,
+            "action": "pick",
+            "reason": f"Last session ({last.get('date')}) had no weighted sets.",
+        }
+
+    w = last_working[0]["weight_lb"]
+    reps = [(s.get("reps") or 0) for s in last_working]
+    worst, best = min(reps), max(reps)
+
+    if intensity_band == "red":
+        return {
+            "weight_lb": _round_to(w * 0.9, step),
+            "target_reps": low,
+            "action": "deload",
+            "reason": (
+                f"Recovery is red — {_round_to(w * 0.9, step):g} lb for {low}, "
+                "well under working weight. Movement quality, not load."
+            ),
+        }
+
+    # How long has this weight been stuck without the reps improving?
+    same_weight_sessions = 0
+    best_at_weight: list[int] = []
+    for sess in reversed(sessions):
+        ws = working(sess.get("sets") or [])
+        if not ws or ws[0]["weight_lb"] != w:
+            break
+        same_weight_sessions += 1
+        best_at_weight.append(max((s.get("reps") or 0) for s in ws))
+    stalled = (
+        same_weight_sessions >= 3 and len(set(best_at_weight)) == 1 and worst < high
+    )
+
+    if stalled:
+        deload = _round_to(w * 0.9, step)
+        return {
+            "weight_lb": deload,
+            "target_reps": low + 1,
+            "action": "deload",
+            "reason": (
+                f"{w:g} lb has sat at {best} reps for {same_weight_sessions} "
+                f"sessions without moving. Drop to {deload:g} lb for {low + 1} "
+                "and build back through the range — grinding a stall is not a "
+                "stimulus."
+            ),
+        }
+
+    if worst >= high:
+        nxt = _round_to(w + inc, step)
+        return {
+            "weight_lb": nxt,
+            "target_reps": low,
+            "action": "add_weight",
+            "reason": (
+                f"Cleared the top of the range — {high} reps on every set at "
+                f"{w:g} lb on {last.get('date')}. Add {inc:g} lb and reset to "
+                f"{low}."
+            ),
+        }
+
+    if worst >= low:
+        nxt_reps = min(worst + 1, high)
+        band_note = (
+            " Recovery is yellow, so this is a rep, not a load jump."
+            if intensity_band == "yellow"
+            else ""
+        )
+        return {
+            "weight_lb": w,
+            "target_reps": nxt_reps,
+            "action": "add_rep",
+            "reason": (
+                f"Got {worst}-{best} at {w:g} lb on {last.get('date')}. Same "
+                f"weight, go for {nxt_reps} on every set — weight moves at "
+                f"{high}.{band_note}"
+            ),
+        }
+
+    # Missed the bottom of the range.
+    prev = working(sessions[-2].get("sets") or []) if len(sessions) > 1 else []
+    missed_twice = bool(
+        prev
+        and prev[0]["weight_lb"] == w
+        and min((s.get("reps") or 0) for s in prev) < low
+    )
+    if missed_twice:
+        deload = _round_to(w * 0.9, step)
+        return {
+            "weight_lb": deload,
+            "target_reps": low,
+            "action": "deload",
+            "reason": (
+                f"Missed {low} reps at {w:g} lb twice running (best {best}). "
+                f"Back off to {deload:g} lb and rebuild — a third failed "
+                "session is not a stimulus."
+            ),
+        }
+    return {
+        "weight_lb": w,
+        "target_reps": low,
+        "action": "repeat",
+        "reason": (
+            f"Got {worst} of {low} at {w:g} lb on {last.get('date')} — repeat "
+            "and own the bottom of the range before adding anything."
+        ),
+    }
+
+
 def next_load(
     sessions: list[dict],
     target_reps: int,
@@ -159,6 +334,82 @@ def next_load(
         f"{last.get('date')} — repeat the weight and own it.",
         "repeat",
     )
+
+
+def progression_pace(
+    sessions: list[dict],
+    target_e1rm: float,
+    deadline_iso: str,
+    today_iso: str,
+) -> Optional[dict]:
+    """Is the current rate of progress actually going to hit the goal?
+
+    The part a coach does that a set-by-set rule cannot: look at the slope and
+    say whether it lands. Without this, "add 5 lb when you clear the range"
+    can run for a year and quietly miss by 40 lb, and nothing in the system
+    would ever have said so.
+
+    Returns None when there is not enough history to draw a line.
+    """
+    from datetime import date as _d
+
+    pts = []
+    for sess in sessions:
+        weighted = [
+            s for s in (sess.get("sets") or []) if s.get("weight_lb") and s.get("reps")
+        ]
+        if not weighted:
+            continue
+        best = max(s["weight_lb"] * (1 + s["reps"] / 30.0) for s in weighted)
+        try:
+            pts.append((_d.fromisoformat(str(sess["date"])[:10]), best))
+        except Exception:
+            continue
+    if len(pts) < 4:
+        return None
+    pts.sort()
+    span_weeks = (pts[-1][0] - pts[0][0]).days / 7.0
+    if span_weeks < 2:
+        return None
+    current = pts[-1][1]
+    per_week = (current - pts[0][1]) / span_weeks
+    try:
+        deadline = _d.fromisoformat(deadline_iso[:10])
+        today = _d.fromisoformat(today_iso[:10])
+    except Exception:
+        return None
+    weeks_left = max((deadline - today).days / 7.0, 0.1)
+    projected = current + per_week * weeks_left
+    needed = (target_e1rm - current) / weeks_left
+    on_pace = projected >= target_e1rm
+    if per_week <= 0:
+        note = (
+            f"e1RM is flat or falling ({current:.0f} lb). At this rate the "
+            f"{target_e1rm:.0f} lb goal does not happen — something has to "
+            "change: the stall protocol, volume, or the deadline."
+        )
+    elif on_pace:
+        note = (
+            f"On pace: {current:.0f} lb now, +{per_week:.1f} lb/week over the "
+            f"last {span_weeks:.0f} weeks, projecting {projected:.0f} lb by "
+            f"{deadline_iso}."
+        )
+    else:
+        note = (
+            f"BEHIND pace: {current:.0f} lb now, +{per_week:.1f} lb/week, "
+            f"projecting {projected:.0f} lb by {deadline_iso} against a "
+            f"{target_e1rm:.0f} lb target. Needs +{needed:.1f} lb/week. "
+            "Either the rate changes or the target does — say which."
+        )
+    return {
+        "current_e1rm": round(current),
+        "per_week": round(per_week, 2),
+        "projected": round(projected),
+        "needed_per_week": round(needed, 2),
+        "on_pace": on_pace,
+        "weeks_left": round(weeks_left),
+        "note": note,
+    }
 
 
 # ── Session shape ────────────────────────────────────────────────────────────
@@ -313,7 +564,8 @@ def plan_session(
             default_reps = REPS_ISOLATION
         else:
             default_reps = REPS_ACCESSORY
-        reps = infer_target_reps(history.get(low) or [], default_reps)
+        sessions_for_lift = history.get(low) or []
+        rng = rep_range_for(sessions_for_lift, default_reps)
 
         if not is_primary_phase:
             sets = SETS_MAINTENANCE
@@ -324,13 +576,17 @@ def plan_session(
         if intensity_band == "red":
             sets = max(2, sets - 1)
 
-        weight, reason, action = next_load(
-            history.get(low) or [], reps, name, intensity_band=intensity_band
+        presc = next_prescription(
+            sessions_for_lift, name, rep_range=rng, intensity_band=intensity_band
         )
+        weight = presc["weight_lb"]
+        reps = presc["target_reps"]
+        reason = presc["reason"]
+        action = presc["action"]
         # Set count follows history too, unless the phase has parked this
         # modality at maintenance (in which case the phase wins).
         if is_primary_phase:
-            sets = infer_target_sets(history.get(low) or [], sets)
+            sets = infer_target_sets(sessions_for_lift, sets)
             if intensity_band == "red":
                 sets = max(2, sets - 1)
         role = "GOAL LIFT" if is_goal else ("Main" if idx == 0 else "Accessory")
@@ -339,6 +595,7 @@ def plan_session(
                 "name": name,
                 "sets": sets,
                 "reps": str(reps),
+                "rep_range": f"{rng[0]}-{rng[1]}",
                 "target_weight_lb": weight,
                 # Warmup only on the opening lift. Dylan's push day is one warmup
                 # set on bench and straight into working sets on everything after,

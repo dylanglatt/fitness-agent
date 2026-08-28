@@ -372,7 +372,8 @@ def _render_session_plan(plan: list[dict], pattern: str) -> str:
         if wu:
             bits.append(f"1x{wu['reps']} @ {wu['weight_lb']:g} lb (warmup)")
         load = f" @ {w:g} lb" if w else " @ working weight"
-        bits.append(f"{e['sets']}x{e['reps']}{side}{load}")
+        rng = f" (range {e['rep_range']})" if e.get("rep_range") else ""
+        bits.append(f"{e['sets']}x{e['reps']}{side}{load}{rng}")
         line = f"  {i}. {e['name']}: " + " then ".join(bits)
         if e.get("notes"):
             line += f"  [{e['notes']}]"
@@ -490,6 +491,10 @@ def _render_strength_progression(rows: list[dict]) -> str:
             parts.append(f"trend {r['trend']} {r['delta_lb']:+g} lb")
         n = r["n_sessions"]
         parts.append(f"{n} session" + ("s" if n != 1 else ""))
+        if r.get("pace_note"):
+            lines.append(f"  {r['exercise']}: " + " · ".join(parts))
+            lines.append(f"       GOAL PACE: {r['pace_note']}")
+            continue
         lines.append(f"  {r['exercise']}: " + " · ".join(parts))
     lines.append(
         "  Use these numbers when prescribing load. Progress a lift only when "
@@ -2062,6 +2067,34 @@ class Coach:
         # block instead: no tool round-trip, always present.
         try:
             strength = await self.db.get_strength_progression(weeks=12, limit=6)
+            # Goal pace: is the current rate actually going to hit the target?
+            # A per-set rule can run for a year and quietly miss by 40 lb.
+            try:
+                goals_for_pace = await self.db.list_goals(status="active")
+                hist_for_pace = await self.db.get_exercise_session_history(weeks=52)
+                for row in strength:
+                    ex_low = row["exercise"].lower()
+                    g = next(
+                        (
+                            g for g in goals_for_pace
+                            if g.get("target_value")
+                            and ex_low in (g.get("title") or "").lower()
+                            and g.get("deadline")
+                        ),
+                        None,
+                    )
+                    if not g:
+                        continue
+                    pace = sp.progression_pace(
+                        hist_for_pace.get(ex_low) or [],
+                        float(g["target_value"]),
+                        g["deadline"],
+                        str(today),
+                    )
+                    if pace:
+                        row["pace_note"] = pace["note"]
+            except Exception as e:
+                obs.source_failed(logger, "progression_pace", "brief", e)
             strength_block = _render_strength_progression(strength)
             if strength_block:
                 lines.append("")
@@ -3713,7 +3746,10 @@ Rules:
         from data.exercise_vocab import canonical_exercise
 
         key = canonical_exercise(exercise_name) or exercise_name.lower()
-        return sp.next_load(hist.get(key) or [], target_reps, exercise_name)
+        p = sp.next_prescription(
+            hist.get(key) or [], exercise_name, default_reps=target_reps
+        )
+        return p["weight_lb"], p["reason"], p["action"]
 
     async def _build_session_plan(
         self, pattern: Optional[str], prescription: str = ""
