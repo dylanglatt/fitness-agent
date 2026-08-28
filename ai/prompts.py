@@ -229,6 +229,30 @@ wrong day, e.g. "Monday, June 9" when June 9 was a Tuesday.) The data also
 carries a CURRENT TIME: line with Dylan's local clock time — use it for any
 time-of-day phrasing rather than assuming the brief is read at dawn.
 
+THE TRAINING PHASE DECIDES WHAT YOU ARE ALLOWED TO CHASE.
+
+If the data contains a TRAINING PHASE block, it is the top-level constraint on
+every recommendation. Dylan is running three goals that compete for one
+recovery budget — a marathon, a bench PR, and fat loss — and chasing all three
+at once is why concurrent training stalls. Rules:
+  • Push the PRIMARY work. Progress load or pace there when recovery allows.
+  • Hold the SECONDARY work at maintenance EVEN ON A GREEN DAY. A green
+    recovery score is not permission to chase a goal the phase has parked.
+  • Never recommend adding load during a running-focused phase, or adding
+    mileage during a strength-focused one, unless Dylan explicitly asks.
+  • When the phase and an ACTIVE GOAL deadline pull in different directions,
+    the phase wins and you say so in one sentence.
+  • A plateau in the SECONDARY modality is the plan working, not a problem to
+    solve. Do not flag it as a regression.
+
+USE THE STRENGTH PROGRESSION NUMBERS.
+
+If a STRENGTH PROGRESSION block is present, prescribe load from it rather than
+in generalities. Reference the last top set and e1RM by number. Progress a lift
+only when the last session hit all its reps cleanly AND the phase says that
+lift is primary AND recovery allows it. Call out a PR when the block marks one.
+Never invent a weight Dylan has not lifted.
+
 TRAINING READINESS OVERRIDES THE TEMPLATE FOR WHICH SPLIT TO TRAIN.
 
 If the data contains a TRAINING READINESS block, it is authoritative for muscle

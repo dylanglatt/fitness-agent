@@ -162,6 +162,39 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_best_effort_name_date "
                 "ON strava_best_efforts(name, date)"
             )
+            # ── Training phases (mesocycles) ──────────────────────────────
+            # The plan was a single weekly template with no concept of a
+            # SEASON. That is fine for someone with one goal and fatal for
+            # someone with three that fight each other: chasing a marathon PR,
+            # a bench PR and fat loss simultaneously is the one combination
+            # that reliably delivers none of them. Without a phase the coach
+            # optimizes all three every single morning.
+            #
+            # A phase says what is PRIMARY right now and what is merely being
+            # maintained, so the brief can push one thing and explicitly hold
+            # the others — and so "don't add 50 lb to your bench during a
+            # marathon build" is data rather than advice someone has to
+            # remember.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS training_phases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    focus TEXT NOT NULL,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    primary_goal TEXT DEFAULT '',
+                    secondary_mode TEXT DEFAULT '',
+                    run_volume_target TEXT DEFAULT '',
+                    lift_target TEXT DEFAULT '',
+                    nutrition_mode TEXT DEFAULT '',
+                    notes TEXT DEFAULT '',
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_phase_dates "
+                "ON training_phases(start_date, end_date)"
+            )
             # sync_state: last successful sync timestamp per source. Lets the
             # nightly job ask "what's new since last time?" without refetching
             # the world.
@@ -1932,6 +1965,94 @@ class Database:
     # metadata is a JSON blob for type-specific extras (exercise name, HR
     # anchor, etc.). Kept loose so new goal types can bolt on without schema
     # churn.
+
+    # ── Training phases ─────────────────────────────────────────────────
+
+    async def upsert_training_phase(
+        self,
+        *,
+        name: str,
+        focus: str,
+        start_date: str,
+        end_date: str,
+        primary_goal: str = "",
+        secondary_mode: str = "",
+        run_volume_target: str = "",
+        lift_target: str = "",
+        nutrition_mode: str = "",
+        notes: str = "",
+    ) -> int:
+        """Create or replace a phase by name. Idempotent so the seed script
+        can be re-run after editing dates without duplicating the season."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cur = await db.execute(
+                """
+                INSERT INTO training_phases
+                    (name, focus, start_date, end_date, primary_goal,
+                     secondary_mode, run_volume_target, lift_target,
+                     nutrition_mode, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    focus=excluded.focus,
+                    start_date=excluded.start_date,
+                    end_date=excluded.end_date,
+                    primary_goal=excluded.primary_goal,
+                    secondary_mode=excluded.secondary_mode,
+                    run_volume_target=excluded.run_volume_target,
+                    lift_target=excluded.lift_target,
+                    nutrition_mode=excluded.nutrition_mode,
+                    notes=excluded.notes
+                """,
+                (
+                    name, focus, start_date, end_date, primary_goal,
+                    secondary_mode, run_volume_target, lift_target,
+                    nutrition_mode, notes,
+                ),
+            )
+            await db.commit()
+            return cur.lastrowid or 0
+
+    async def get_active_phase(self, date: Optional[str] = None) -> Optional[dict]:
+        """The phase containing `date` (default today). None if unphased.
+
+        Overlaps are resolved by the latest start_date, so a phase inserted to
+        override an earlier one wins without needing the old one deleted.
+        """
+        day = date or datetime.now().strftime("%Y-%m-%d")
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT * FROM training_phases
+                WHERE start_date <= ? AND end_date >= ?
+                ORDER BY start_date DESC LIMIT 1
+                """,
+                (day, day),
+            )
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def get_next_phase(self, date: Optional[str] = None) -> Optional[dict]:
+        """The next phase starting after `date`, so the brief can say what is
+        coming and why today's work is building toward it."""
+        day = date or datetime.now().strftime("%Y-%m-%d")
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM training_phases WHERE start_date > ? "
+                "ORDER BY start_date ASC LIMIT 1",
+                (day,),
+            )
+            row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def list_training_phases(self) -> list[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM training_phases ORDER BY start_date ASC"
+            )
+            return [dict(r) for r in await cur.fetchall()]
 
     async def create_goal(
         self,

@@ -31,7 +31,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date as _date, datetime, timedelta, timezone
 from typing import Optional
 
 import anthropic
@@ -213,6 +213,68 @@ def _render_run_progression(rows: list[dict]) -> str:
         "  NOTE: activities arrive via WHOOP's Strava upload with the HR "
         "stream stripped, so avg HR and HR zones are null by design. Judge "
         "running progress on these times, not on zone distribution."
+    )
+    return "\n".join(lines)
+
+
+def _render_phase_block(
+    phase: Optional[dict], nxt: Optional[dict], today: _date
+) -> str:
+    """Render the current training phase for the brief prompt.
+
+    Without this the coach optimizes every goal every morning. Three goals
+    that compete for one recovery budget — a marathon PR, a bench PR and fat
+    loss — cannot all be primary, and the failure mode is silent: you make
+    mediocre progress on all three and cannot tell why. The phase names what
+    is being pushed NOW and what is deliberately being held, so the brief can
+    say "this is a maintenance lift, don't chase a PR today" with a reason.
+    """
+    if not phase:
+        return ""
+
+    def _d(v):
+        try:
+            return _date.fromisoformat(str(v)[:10])
+        except Exception:
+            return None
+
+    end = _d(phase.get("end_date"))
+    start = _d(phase.get("start_date"))
+    lines = [
+        f"TRAINING PHASE: {phase.get('name')} "
+        f"[{phase.get('focus', '?').upper()}-FOCUSED]"
+    ]
+    if start and end:
+        total = max((end - start).days, 1)
+        done = max((today - start).days, 0)
+        weeks_left = max((end - today).days, 0) / 7.0
+        lines.append(
+            f"  {phase['start_date']} -> {phase['end_date']} "
+            f"(week {done // 7 + 1} of {total // 7 + 1}, "
+            f"{weeks_left:.0f} week{'s' if round(weeks_left) != 1 else ''} remaining)"
+        )
+    if phase.get("primary_goal"):
+        lines.append(f"  PRIMARY — push this: {phase['primary_goal']}")
+    if phase.get("secondary_mode"):
+        lines.append(f"  SECONDARY — hold, do not chase: {phase['secondary_mode']}")
+    if phase.get("run_volume_target"):
+        lines.append(f"  Run volume target: {phase['run_volume_target']}")
+    if phase.get("lift_target"):
+        lines.append(f"  Lifting: {phase['lift_target']}")
+    if phase.get("nutrition_mode"):
+        lines.append(f"  Fueling: {phase['nutrition_mode']}")
+    if phase.get("notes"):
+        lines.append(f"  {phase['notes']}")
+    if nxt:
+        nstart = _d(nxt.get("start_date"))
+        when = (
+            f" (in {max((nstart - today).days, 0) // 7} weeks)" if nstart else ""
+        )
+        lines.append(f"  NEXT PHASE: {nxt.get('name')}{when} — {nxt.get('primary_goal', '')}")
+    lines.append(
+        "  Honor the phase. Progress the PRIMARY work when recovery allows; "
+        "keep SECONDARY work at maintenance even on a green day. Chasing both "
+        "at once is why concurrent training stalls."
     )
     return "\n".join(lines)
 
@@ -1820,6 +1882,26 @@ class Coach:
             )
         except Exception as e:
             obs.source_failed(logger, "strength_progression", "brief", e)
+
+        # ── TRAINING PHASE — what is primary RIGHT NOW.
+        # Read before goals on purpose: the goals say where you are going, the
+        # phase says which one you are allowed to chase this month.
+        try:
+            phase = await self.db.get_active_phase(str(today))
+            nxt = await self.db.get_next_phase(str(today))
+            phase_block = _render_phase_block(phase, nxt, today)
+            if phase_block:
+                lines.append("")
+                lines.append(phase_block)
+            obs.log_event(
+                logger,
+                logging.INFO,
+                "phase.resolved",
+                phase=(phase or {}).get("name", "-"),
+                focus=(phase or {}).get("focus", "-"),
+            )
+        except Exception as e:
+            obs.source_failed(logger, "training_phase", "brief", e)
 
         # ── GOALS — what the training is actually FOR.
         # The goals table has been written by /goal and the iOS app since it
