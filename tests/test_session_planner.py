@@ -13,7 +13,9 @@ import unittest
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from ai.session_planner import (  # noqa: E402
-    load_increment, next_load, plan_session,
+    load_increment,
+    next_load,
+    plan_session,
 )
 
 
@@ -69,8 +71,10 @@ class NextLoadTests(unittest.TestCase):
 
     def test_recovery_band_overrides_progression(self):
         s = [_sess("2026-08-20", (205, 6), (205, 6))]
-        self.assertEqual(next_load(s, 6, "Bench press", intensity_band="yellow")[1:],
-                         next_load(s, 6, "Bench press", intensity_band="yellow")[1:])
+        self.assertEqual(
+            next_load(s, 6, "Bench press", intensity_band="yellow")[1:],
+            next_load(s, 6, "Bench press", intensity_band="yellow")[1:],
+        )
         w, _r, action = next_load(s, 6, "Bench press", intensity_band="yellow")
         self.assertEqual((w, action), (205, "repeat"))
         w, _r, action = next_load(s, 6, "Bench press", intensity_band="red")
@@ -78,9 +82,24 @@ class NextLoadTests(unittest.TestCase):
 
 
 LIBRARY = [
-    {"exercise": "Overhead press", "n_sets": 46, "n_sessions": 15, "last_date": "2026-08-25"},
-    {"exercise": "Bench press", "n_sets": 54, "n_sessions": 18, "last_date": "2026-08-25"},
-    {"exercise": "Cable lateral raise", "n_sets": 4, "n_sessions": 2, "last_date": "2026-08-25"},
+    {
+        "exercise": "Overhead press",
+        "n_sets": 46,
+        "n_sessions": 15,
+        "last_date": "2026-08-25",
+    },
+    {
+        "exercise": "Bench press",
+        "n_sets": 54,
+        "n_sessions": 18,
+        "last_date": "2026-08-25",
+    },
+    {
+        "exercise": "Cable lateral raise",
+        "n_sets": 4,
+        "n_sessions": 2,
+        "last_date": "2026-08-25",
+    },
     {"exercise": "Dips", "n_sets": 7, "n_sessions": 3, "last_date": "2026-08-12"},
 ]
 
@@ -108,8 +127,9 @@ class PlanSessionTests(unittest.TestCase):
     def test_maintenance_phase_cuts_volume(self):
         primary = plan_session("push", LIBRARY, {}, is_primary_phase=True)
         maint = plan_session("push", LIBRARY, {}, is_primary_phase=False)
-        self.assertGreater(sum(e["sets"] for e in primary),
-                           sum(e["sets"] for e in maint))
+        self.assertGreater(
+            sum(e["sets"] for e in primary), sum(e["sets"] for e in maint)
+        )
         self.assertTrue(all(e["sets"] == 2 for e in maint))
 
     def test_load_comes_from_history_not_a_guess(self):
@@ -140,23 +160,132 @@ class RepInferenceTests(unittest.TestCase):
 
     def test_reps_follow_history_not_the_movement_class(self):
         from ai.session_planner import infer_target_reps
-        ohp = [_sess("2026-08-07", (105, 8), (105, 8)),
-               _sess("2026-08-14", (110, 8), (110, 8))]
+
+        ohp = [
+            _sess("2026-08-07", (105, 8), (105, 8)),
+            _sess("2026-08-14", (110, 8), (110, 8)),
+        ]
         self.assertEqual(infer_target_reps(ohp, 6), 8)
 
     def test_falls_back_to_the_default_without_history(self):
         from ai.session_planner import infer_target_reps
+
         self.assertEqual(infer_target_reps([], 6), 6)
         self.assertEqual(infer_target_reps([_sess("2026-08-14", (None, None))], 10), 10)
 
     def test_planner_uses_the_inferred_target(self):
-        hist = {"overhead press": [
-            _sess("2026-08-07", (105, 8), (105, 8)),
-            _sess("2026-08-14", (110, 8), (110, 6)),
-        ]}
+        hist = {
+            "overhead press": [
+                _sess("2026-08-07", (105, 8), (105, 8)),
+                _sess("2026-08-14", (110, 8), (110, 6)),
+            ]
+        }
         plan = {e["name"]: e for e in plan_session("push", LIBRARY, hist)}
         ohp = plan["Overhead press"]
         self.assertEqual(ohp["reps"], "8")
         # 6 of 8 on the top set is a MISS -> repeat, not progress.
         self.assertEqual(ohp["action"], "repeat")
         self.assertEqual(ohp["target_weight_lb"], 110)
+
+
+class SessionShapeTests(unittest.TestCase):
+    """Dylan's actual push day: bench 1x10 @135 then 3x6 @205, OHP 3x10 @95,
+    incline DB press 3x8 @65, single-arm cable lateral raise 3x12 each side,
+    single-arm tricep pushdown 3x12 @20."""
+
+    def test_warmup_matches_how_he_actually_warms_up(self):
+        from ai.session_planner import warmup_for
+
+        wu = warmup_for(205, "bench press")
+        self.assertEqual(wu, {"weight_lb": 135, "reps": 10})
+
+    def test_no_warmup_for_isolation_or_missing_load(self):
+        from ai.session_planner import warmup_for
+
+        self.assertIsNone(warmup_for(20, "single arm tricep pushdown"))
+        self.assertIsNone(warmup_for(None, "bench press"))
+
+    def test_unilateral_movements_are_flagged(self):
+        from ai.session_planner import is_unilateral
+
+        self.assertTrue(is_unilateral("Single arm cable lateral raise"))
+        self.assertTrue(is_unilateral("Single-leg RDL"))
+        self.assertFalse(is_unilateral("Bench press"))
+
+    def test_set_count_follows_history(self):
+        from ai.session_planner import infer_target_sets
+
+        three = [_sess("2026-08-14", (205, 6), (205, 6), (205, 6))]
+        self.assertEqual(infer_target_sets(three, 4), 3)
+        self.assertEqual(infer_target_sets([], 4), 4)
+
+    def test_full_push_day_reproduces_his_shape(self):
+        lib = [
+            {
+                "exercise": "Bench press",
+                "n_sets": 54,
+                "n_sessions": 18,
+                "last_date": "2026-08-25",
+            },
+            {
+                "exercise": "Overhead press",
+                "n_sets": 46,
+                "n_sessions": 15,
+                "last_date": "2026-08-25",
+            },
+            {
+                "exercise": "Incline dumbbell press",
+                "n_sets": 13,
+                "n_sessions": 5,
+                "last_date": "2026-08-25",
+            },
+            {
+                "exercise": "Single arm cable lateral raise",
+                "n_sets": 9,
+                "n_sessions": 3,
+                "last_date": "2026-08-25",
+            },
+            {
+                "exercise": "Single arm tricep pushdown",
+                "n_sets": 9,
+                "n_sessions": 3,
+                "last_date": "2026-08-25",
+            },
+        ]
+        hist = {
+            "bench press": [
+                _sess("2026-08-18", (135, 10), (205, 6), (205, 6), (205, 6))
+            ],
+            "overhead press": [_sess("2026-08-18", (95, 10), (95, 10), (95, 10))],
+            "incline dumbbell press": [_sess("2026-08-18", (65, 8), (65, 8), (65, 8))],
+            "single arm cable lateral raise": [
+                _sess("2026-08-18", (10, 12), (10, 12), (10, 12))
+            ],
+            "single arm tricep pushdown": [
+                _sess("2026-08-18", (20, 12), (20, 12), (20, 12))
+            ],
+        }
+        plan = {
+            e["name"]: e
+            for e in plan_session("push", lib, hist, goal_lifts=["bench press"])
+        }
+        bench = plan["Bench press"]
+        self.assertEqual((bench["sets"], bench["reps"]), (3, "6"))
+        self.assertEqual(bench["warmup"], {"weight_lb": 135, "reps": 10})
+        self.assertEqual(bench["target_weight_lb"], 210)  # hit all 6s -> +5
+
+        ohp = plan["Overhead press"]
+        self.assertEqual((ohp["sets"], ohp["reps"]), (3, "10"))
+        self.assertEqual(ohp["target_weight_lb"], 100)
+
+        inc = plan["Incline dumbbell press"]
+        self.assertEqual((inc["sets"], inc["reps"]), (3, "8"))
+        # Only the opening lift gets a warmup set — a "45 lb bar" warmup on a
+        # dumbbell press is nonsense, and it is not how he trains.
+        self.assertIsNone(inc["warmup"])
+        self.assertIsNone(plan["Overhead press"]["warmup"])
+
+        lat = plan["Single arm cable lateral raise"]
+        self.assertTrue(lat["per_side"])
+        self.assertEqual(lat["reps"], "12")
+        self.assertIsNone(lat["warmup"])

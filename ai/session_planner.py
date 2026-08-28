@@ -37,9 +37,9 @@ from typing import Optional
 
 # Load increments. Big hinge/squat patterns move in bigger jumps than presses,
 # and isolation work moves in the smallest jump the rack allows.
-INCREMENT_LARGE = 10.0   # deadlift, squat
-INCREMENT_MEDIUM = 5.0   # barbell presses, rows
-INCREMENT_SMALL = 2.5    # cable/dumbbell isolation
+INCREMENT_LARGE = 10.0  # deadlift, squat
+INCREMENT_MEDIUM = 5.0  # barbell presses, rows
+INCREMENT_SMALL = 2.5  # cable/dumbbell isolation
 
 _LARGE = re.compile(r"\b(deadlift|squat)\b", re.I)
 _SMALL = re.compile(
@@ -83,7 +83,11 @@ def next_load(
       • Red recovery day -> hold rather than progress, whatever the history.
     """
     if not sessions:
-        return None, "No history for this lift — pick a working weight and log it.", "pick"
+        return (
+            None,
+            "No history for this lift — pick a working weight and log it.",
+            "pick",
+        )
 
     inc = load_increment(exercise)
     step = INCREMENT_SMALL if inc == INCREMENT_SMALL else INCREMENT_MEDIUM
@@ -131,7 +135,9 @@ def next_load(
         )
 
     # Missed. Did we also miss this same weight the session before?
-    prev_working = working((sessions[-2].get("sets") or [])) if len(sessions) > 1 else []
+    prev_working = (
+        working((sessions[-2].get("sets") or [])) if len(sessions) > 1 else []
+    )
     missed_twice = bool(
         prev_working
         and prev_working[0]["weight_lb"] == last_w
@@ -199,6 +205,56 @@ def infer_target_reps(sessions: list[dict], default: int, lookback: int = 3) -> 
         return default
     best = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
     return best[0]
+
+
+def infer_target_sets(sessions: list[dict], default: int, lookback: int = 3) -> int:
+    """Working-set count from history, like infer_target_reps does for reps.
+
+    Dylan's push day is three working sets per movement. A planner that
+    prescribes four is not reading his training, it is asserting a template —
+    the same mistake as imposing a rep scheme.
+    """
+    if not sessions:
+        return default
+    counts: dict[int, int] = {}
+    for sess in sessions[-lookback:]:
+        weighted = [s for s in (sess.get("sets") or []) if s.get("weight_lb")]
+        if not weighted:
+            continue
+        top = max(s["weight_lb"] for s in weighted)
+        n = sum(1 for s in weighted if s["weight_lb"] == top)
+        counts[n] = counts.get(n, 0) + 1
+    if not counts:
+        return default
+    return max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+
+
+_UNILATERAL = re.compile(
+    r"\b(single[- ]arm|single[- ]leg|one[- ]arm|each side)\b", re.I
+)
+
+
+def is_unilateral(name: str) -> bool:
+    """True for movements performed one limb at a time, so the plan can say
+    'x12 each side' rather than silently halving the real volume."""
+    return bool(_UNILATERAL.search(name or ""))
+
+
+def warmup_for(working_weight: Optional[float], exercise: str) -> Optional[dict]:
+    """One warmup set for a compound, at ~65% of the working load.
+
+    Dylan's bench day is literally "1 set of 135 for 10, then 3 of 205 for 6".
+    The planner previously emitted only working sets, so the session it showed
+    him was not the session he does. 65% of 205 rounds to 135, which is the
+    weight he actually uses.
+    """
+    if not working_weight or not _is_compound(exercise):
+        return None
+    w = _round_to(working_weight * 0.65, INCREMENT_MEDIUM)
+    w = max(w, 45.0)  # an empty barbell is the floor
+    if w >= working_weight:
+        return None
+    return {"weight_lb": w, "reps": 10}
 
 
 def _is_compound(name: str) -> bool:
@@ -271,14 +327,27 @@ def plan_session(
         weight, reason, action = next_load(
             history.get(low) or [], reps, name, intensity_band=intensity_band
         )
+        # Set count follows history too, unless the phase has parked this
+        # modality at maintenance (in which case the phase wins).
+        if is_primary_phase:
+            sets = infer_target_sets(history.get(low) or [], sets)
+            if intensity_band == "red":
+                sets = max(2, sets - 1)
         role = "GOAL LIFT" if is_goal else ("Main" if idx == 0 else "Accessory")
-        out.append({
-            "name": name,
-            "sets": sets,
-            "reps": str(reps),
-            "target_weight_lb": weight,
-            "reason": reason,
-            "action": action,
-            "notes": role,
-        })
+        out.append(
+            {
+                "name": name,
+                "sets": sets,
+                "reps": str(reps),
+                "target_weight_lb": weight,
+                # Warmup only on the opening lift. Dylan's push day is one warmup
+                # set on bench and straight into working sets on everything after,
+                # and a "45 lb bar" floor is meaningless for a dumbbell movement.
+                "warmup": warmup_for(weight, low) if idx == 0 else None,
+                "per_side": is_unilateral(name),
+                "reason": reason,
+                "action": action,
+                "notes": role,
+            }
+        )
     return out

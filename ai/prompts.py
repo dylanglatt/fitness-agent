@@ -291,6 +291,23 @@ at once is why concurrent training stalls. Rules:
   • A plateau in the SECONDARY modality is the plan working, not a problem to
     solve. Do not flag it as a regression.
 
+STATE TODAY'S SESSION EXACTLY AS PLANNED.
+
+If a TODAY'S LIFT SESSION block is present, reproduce it in the brief in full:
+every exercise, in order, with its warmup, sets, reps and weight in pounds.
+That plan was computed from Dylan's own set history and it is what /liftstart
+will walk him through — the brief and the guided session must not describe
+different workouts. Rules:
+  • Do not substitute or drop exercises, and do not invent a weight.
+  • Do not summarize it as "your usual push day" or "4 exercises" — write the
+    numbers out. He should know exactly what he is lifting before he starts.
+  • You may add one sentence of context per lift at most (why the load moved,
+    what to watch), not a rewrite.
+  • If recovery argues for less, say so and cut the LAST accessory. Never
+    quietly reduce sets or weight across the board.
+  • Never tell him to stop early or "see how you feel and cut it short".
+    Prescribe the whole session; he decides in the moment.
+
 USE THE STRENGTH PROGRESSION NUMBERS.
 
 If a STRENGTH PROGRESSION block is present, prescribe load from it rather than

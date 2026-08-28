@@ -197,6 +197,21 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_phase_dates "
                 "ON training_phases(start_date, end_date)"
             )
+            # ── Planned sessions — ONE plan per day, shared by the brief
+            # and /liftstart. They used to compute a session independently,
+            # so the brief could describe one workout and the guided session
+            # walk you through a different one. The morning plan is now
+            # authoritative: computed once, shown in the brief, held by
+            # /liftstart.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS planned_sessions (
+                    date TEXT PRIMARY KEY,
+                    pattern TEXT DEFAULT '',
+                    source TEXT DEFAULT '',
+                    plan_json TEXT NOT NULL,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
             # ── Brief history — what was PRESCRIBED, so tomorrow can check.
             # Every brief was a standalone snapshot: it never referenced what
             # it told you yesterday or whether you did it. A coach with no
@@ -2173,6 +2188,40 @@ class Database:
             lst.sort(key=lambda x: (-x["n_sets"], x["exercise"]))
         return {"by_pattern": by_pattern, "unresolved_sets": unresolved,
                 "weeks": weeks, "total_sets": len(rows)}
+
+    async def save_planned_session(
+        self, date: str, pattern: str, plan: list[dict], source: str = "planner"
+    ) -> None:
+        """Persist the day's session plan so the brief and /liftstart agree."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                INSERT INTO planned_sessions (date, pattern, source, plan_json)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(date) DO UPDATE SET
+                    pattern=excluded.pattern,
+                    source=excluded.source,
+                    plan_json=excluded.plan_json
+                """,
+                (date, pattern, source, json.dumps(plan)),
+            )
+            await db.commit()
+
+    async def get_planned_session(self, date: str) -> Optional[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM planned_sessions WHERE date = ?", (date,)
+            ) as cur:
+                row = await cur.fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        try:
+            out["plan"] = json.loads(out.pop("plan_json") or "[]")
+        except Exception:
+            out["plan"] = []
+        return out
 
     async def get_exercise_session_history(self, weeks: int = 16) -> dict:
         """Canonical exercise -> per-session sets, oldest first.

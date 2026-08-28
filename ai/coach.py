@@ -347,6 +347,45 @@ def _render_yesterday(prev: dict | None, actual: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _render_session_plan(plan: list[dict], pattern: str) -> str:
+    """Render today's lift session with warmups, sets, reps and loads.
+
+    This is the block the brief prints and /liftstart walks through — the same
+    plan object, so they cannot disagree. Previously the brief described a
+    session in prose while /liftstart independently built its own, and the two
+    could prescribe different work on the same morning.
+    """
+    if not plan:
+        return ""
+    total = sum(e.get("sets", 0) for e in plan)
+    lines = [
+        f"TODAY'S LIFT SESSION — {pattern.upper()} "
+        f"({len(plan)} exercises, {total} working sets). "
+        "STATE THIS VERBATIM IN THE BRIEF, INCLUDING EVERY WEIGHT:"
+    ]
+    for i, e in enumerate(plan, 1):
+        w = e.get("target_weight_lb")
+        side = " each side" if e.get("per_side") else ""
+        bits = []
+        wu = e.get("warmup")
+        if wu:
+            bits.append(f"1x{wu['reps']} @ {wu['weight_lb']:g} lb (warmup)")
+        load = f" @ {w:g} lb" if w else " @ working weight"
+        bits.append(f"{e['sets']}x{e['reps']}{side}{load}")
+        line = f"  {i}. {e['name']}: " + " then ".join(bits)
+        if e.get("notes"):
+            line += f"  [{e['notes']}]"
+        lines.append(line)
+        if e.get("reason"):
+            lines.append(f"       why: {e['reason']}")
+    lines.append(
+        "  This plan is authoritative. Do not substitute exercises, invent "
+        "weights, or shorten it. If recovery argues for less, say so and cut "
+        "the LAST accessory rather than rewriting the session."
+    )
+    return "\n".join(lines)
+
+
 def _render_phase_block(
     phase: Optional[dict], nxt: Optional[dict], today: _date
 ) -> str:
@@ -2036,6 +2075,40 @@ class Coach:
         except Exception as e:
             obs.source_failed(logger, "strength_progression", "brief", e)
 
+        # ── TODAY'S SESSION — the actual plan, computed once and persisted
+        # so /liftstart walks through exactly what the brief promised.
+        try:
+            planned = locals().get("session") or {}
+            stype = (planned.get("session_type") or "").lower()
+            focus_txt = (planned.get("focus") or "").lower()
+            pat = next(
+                (p for p in ("push", "pull", "legs", "core") if p in focus_txt),
+                None,
+            )
+            # Honor the readiness swap: if the engine moved the session, plan
+            # the pattern it moved TO.
+            sug_sub = (self._brief_decision or {}).get("prescribed_sub") or ""
+            if sug_sub in ("push", "pull", "legs", "core"):
+                pat = sug_sub
+            if stype in ("lift", "strength") or pat:
+                plan, plan_source = await self._build_session_plan(
+                    pat, planned.get("prescription", "")
+                )
+                block = _render_session_plan(plan, pat or "lift")
+                if block:
+                    lines.append("")
+                    lines.append(block)
+                    await self.db.save_planned_session(
+                        str(today), pat or "lift", plan, plan_source
+                    )
+                    obs.log_event(
+                        logger, logging.INFO, "session_plan.persisted",
+                        pattern=pat or "lift", exercises=len(plan),
+                        source=plan_source,
+                    )
+        except Exception as e:
+            obs.source_failed(logger, "session_plan", "brief", e)
+
         # ── EXERCISE LIBRARY — stop the model inventing movements.
         try:
             vocab = await self.db.get_exercise_vocabulary(weeks=26)
@@ -3518,10 +3591,16 @@ Rules:
         )
         if notes:
             head += f"  _({notes})_"
+        side = " each side" if ex.get("per_side") else ""
         line2 = (
-            f"Target: **{rec_w:g} lb × {reps}**" if rec_w is not None
-            else "Target: pick a working weight"
+            f"Target: **{rec_w:g} lb × {reps}{side}**" if rec_w is not None
+            else f"Target: pick a working weight × {reps}{side}"
         )
+        wu = ex.get("warmup")
+        if wu and set_idx == 0:
+            line2 = (
+                f"Warm up: {wu['weight_lb']:g} lb × {wu['reps']}, then\n" + line2
+            )
         line3 = f"_{rec_note}_" if rec_note else ""
         tail = (
             f"_{remaining} exercise{'s' if remaining != 1 else ''} left after this._"
@@ -3718,7 +3797,21 @@ Rules:
         pattern = next(
             (p for p in ("push", "pull", "legs", "core") if p in focus_text), None
         )
-        exercises, plan_source = await self._build_session_plan(pattern, prescription)
+        # The morning brief already computed and persisted today's session.
+        # Reuse it so the workout matches what the brief promised — that is
+        # the whole point of "it should tell me in the morning and hold".
+        saved = await self.db.get_planned_session(today_iso)
+        if saved and saved.get("plan"):
+            exercises, plan_source = saved["plan"], saved.get("source", "brief")
+            pattern = saved.get("pattern") or pattern
+        else:
+            exercises, plan_source = await self._build_session_plan(
+                pattern, prescription
+            )
+            if exercises:
+                await self.db.save_planned_session(
+                    today_iso, pattern or "lift", exercises, plan_source
+                )
         if not exercises:
             # When force=True is used on a non-lift day, the parser
             # correctly returns no exercises (its rules skip cardio +
@@ -3750,10 +3843,15 @@ Rules:
             total_sets += e.get("sets", 0)
             w = e.get("target_weight_lb")
             load = f"{w:g} lb" if w else "pick a working weight"
+            side = " each side" if e.get("per_side") else ""
+            wu = e.get("warmup")
+            warm = (
+                f"1x{wu['reps']} @ {wu['weight_lb']:g} lb → " if wu else ""
+            )
             tag = f" _{e['notes']}_" if e.get("notes") else ""
             plan_lines.append(
                 f"  {len(plan_lines) + 1}. **{e['name']}** "
-                f"{e['sets']}x{e['reps']} @ {load}{tag}"
+                f"{warm}{e['sets']}x{e['reps']}{side} @ {load}{tag}"
             )
         src = "" if plan_source == "planner" else " _(from plan text)_"
         header = (
