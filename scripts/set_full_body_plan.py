@@ -44,7 +44,7 @@ from data.database import Database  # noqa: E402
 TEMPLATE = {
     "monday": {
         "session_type": "lift",
-        "focus": "full body",
+        "focus": "full body (hinge + horizontal push/pull)",
         "prescription": (
             "Day A — hinge + horizontal push/pull. Trap-bar deadlift 3x4-6 "
             "(main lift, 2.5-4min rest, 1-3 RIR); Barbell bench press 3x5-8 "
@@ -83,7 +83,7 @@ TEMPLATE = {
     },
     "wednesday": {
         "session_type": "lift",
-        "focus": "full body",
+        "focus": "full body (quad + vertical push/pull)",
         "prescription": (
             "Day B — quad + vertical push/pull. This is the hardest leg "
             "day of the week. Hack squat 3x6-8 (main lower lift, 2.5-4min "
@@ -120,7 +120,7 @@ TEMPLATE = {
     },
     "friday": {
         "session_type": "lift",
-        "focus": "full body",
+        "focus": "full body (upper hypertrophy + low-fatigue legs)",
         "prescription": (
             "Day C — upper hypertrophy + low-fatigue legs. Deliberately "
             "not another heavy leg day. Incline DB press or plate-loaded "
