@@ -12,7 +12,7 @@ from ai.training_state import (
     recovery_intensity_band, assess_deload,
     whoop_recovery_sessions, merge_recovery_sessions, render_recovery_block,
     render_readiness_block,
-    PUSH, PULL, LEGS, CORE, RUN_EASY, RUN_QUALITY, RUN_LONG,
+    PUSH, PULL, LEGS, CORE, FULL_BODY, RUN_EASY, RUN_QUALITY, RUN_LONG,
 )
 
 TODAY = date(2026, 6, 10)
@@ -37,6 +37,17 @@ def test_classify_exercise():
     # unknown name falls back to the parser Workout tag, else None
     assert classify_exercise("Mystery move", workout_tag="Pull")[0] == PULL
     assert classify_exercise("Mystery move")[0] is None
+
+
+def test_classify_exercise_falls_back_to_free_exercise_db():
+    # "Good Morning" isn't in the hand-authored keyword list but is in
+    # free-exercise-db as a hamstring-primary powerlifting movement.
+    pattern, muscle = classify_exercise("Good morning")
+    assert pattern == LEGS
+    assert muscle == "hamstrings"
+    # still falls through to workout_tag / None when the DB has no match either
+    assert classify_exercise("Totally made up exercise", workout_tag="Push")[0] == PUSH
+    assert classify_exercise("Totally made up exercise")[0] is None
 
 
 def test_classify_run():
@@ -153,6 +164,37 @@ def test_recovery_merge_dedupes():
     assert sauna["source"] == "both" and sauna.get("notes") == "post-lift"
     # Non-empty render proves the brief would show recovery (not "zero").
     assert "RECENT RECOVERY SESSIONS" in render_recovery_block(merged)
+
+
+def test_classify_planned_session_full_body():
+    assert classify_planned_session(
+        {"session_type": "full_body"}
+    ) == ("lift", FULL_BODY)
+    assert classify_planned_session(
+        {"session_type": "lift", "focus": "Full body"}
+    ) == ("lift", FULL_BODY)
+    assert classify_planned_session(
+        {"session_type": "lift", "focus": "push (upper)"}
+    ) == ("lift", PUSH)
+
+
+def test_full_body_never_blocks_the_session():
+    """Full body trains every pattern each time — a pattern still inside the
+    spacing window is volume guidance, not a reason to skip the day (unlike a
+    single PPL pattern, which does get blocked — see test_push_yesterday_blocks_push_today)."""
+    lifts = [
+        {"date": _iso(1), "exercise": "back squat"},   # legs, 1d ago — inside 48h
+        {"date": _iso(5), "exercise": "bench press"},  # push, 5d ago — clear
+    ]
+    state = build_training_state(lifts, [], TODAY)
+    r = assess_readiness(state, ("lift", FULL_BODY))
+    assert r["status"] == "ready"
+    assert r["suggested"] is None
+    assert "legs: trained 1d ago" in r["reason"]
+    assert "keep volume light" in r["reason"]
+    assert "push: last 5d ago" in r["reason"]
+    assert "normal volume" in r["reason"]
+    assert "pull: last not yet logged" in r["reason"]
 
 
 if __name__ == "__main__":

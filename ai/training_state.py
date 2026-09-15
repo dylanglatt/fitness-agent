@@ -14,9 +14,17 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Optional
 
+from ai import exercise_db as _edb
+
 # ── Movement-pattern taxonomy ────────────────────────────────────────────────
 PUSH, PULL, LEGS, CORE = "push", "pull", "legs", "core"
 LIFT_PATTERNS = (PUSH, PULL, LEGS)  # core is accessory; not spacing-gated
+
+# A full-body session trains all three patterns every time by design —
+# it is not itself spacing-gated the way a single PPL pattern is. See the
+# FULL_BODY branch in assess_readiness() for how recency becomes
+# per-pattern volume guidance instead of a block.
+FULL_BODY = "full_body"
 
 # Exercise-name keyword -> (pattern, primary muscle). First match wins; the list
 # is ordered so more-specific phrases (e.g. "leg curl") are checked before
@@ -105,14 +113,20 @@ def classify_exercise(
 ) -> tuple[Optional[str], Optional[str]]:
     """Return (pattern, muscle) for an exercise name.
 
-    Falls back to the coarse parser Workout tag when the name is unknown, then
-    (None, None). Pure string logic — easy to unit-test and extend.
+    Three tiers: the hand-authored keyword list (precise judgment calls for
+    the lifts actually logged, e.g. "close grip" -> triceps not chest), then
+    the free-exercise-db dataset (ai/exercise_db.py) for anything that list
+    doesn't recognize, then the coarse parser Workout tag, then (None, None).
+    Pure logic throughout — easy to unit-test and extend.
     """
     n = (name or "").strip().lower()
     if n:
         for kw, (pat, mus) in _EXERCISE_KEYWORDS:
             if kw in n:
                 return pat, mus
+        pat, mus = _edb.classify_via_db(n)
+        if pat:
+            return pat, mus
     tag = (workout_tag or "").strip().lower()
     if tag in _WORKOUT_TAG_TO_PATTERN:
         return _WORKOUT_TAG_TO_PATTERN[tag], None
@@ -254,7 +268,9 @@ def classify_planned_session(session: Optional[dict]) -> tuple[str, Optional[str
                 or stype in ("interval", "tempo"):
             return "run", RUN_QUALITY
         return "run", RUN_EASY
-    if stype in ("lift", "strength"):
+    if stype in ("lift", "strength", "full_body"):
+        if stype == "full_body" or "full body" in focus or "full-body" in focus:
+            return "lift", FULL_BODY
         for pat in LIFT_PATTERNS:
             if pat in focus:
                 return "lift", pat
@@ -336,6 +352,24 @@ def assess_readiness(
         return result
 
     if kind == "lift":
+        if sub == FULL_BODY:
+            # Every pattern gets trained every session by design — there's no
+            # single pattern to gate the day on. A pattern still inside the
+            # spacing window isn't a reason to skip it (that defeats the
+            # point of full body); it's a reason to keep that pattern's
+            # volume light today while the other two run normal.
+            notes = []
+            for pat in LIFT_PATTERNS:
+                days_ago, st = pattern_status[pat]
+                if st == "too_soon":
+                    notes.append(f"{pat}: trained {days_ago}d ago \u2192 keep volume light")
+                else:
+                    when = "not yet logged" if days_ago is None else f"{days_ago}d ago"
+                    notes.append(f"{pat}: last {when} \u2192 normal volume")
+            result["reason"] = "Full-body day. " + "; ".join(notes) + "."
+            if unlogged_recent:
+                result["reason"] += _caveat()
+            return result
         if sub is None:
             result["status"] = "unknown"
             result["reason"] = (

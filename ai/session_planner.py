@@ -176,6 +176,27 @@ def next_prescription(
         }
 
     if worst >= high:
+        # RPE was logged all along but this function never looked at it —
+        # hitting the top of the range at RPE 9.5-10 was earned by grinding,
+        # not cleanly, and a full increment on top of a near-max effort is
+        # how you walk into a missed session. Half the jump instead.
+        rpes = [s["rpe"] for s in last_working if s.get("rpe") is not None]
+        avg_rpe = sum(rpes) / len(rpes) if rpes else None
+        if avg_rpe is not None and avg_rpe >= 9.5:
+            # Round the half-jump to the smallest increment, not `step` —
+            # rounding a 2.5 lb half-jump to a 5 lb step erases it entirely.
+            half = _round_to(w + inc / 2, INCREMENT_SMALL)
+            return {
+                "weight_lb": half,
+                "target_reps": low,
+                "action": "add_weight",
+                "reason": (
+                    f"Cleared the top of the range — {high} reps on every set at "
+                    f"{w:g} lb on {last.get('date')} — but RPE averaged "
+                    f"{avg_rpe:g}, near-max. Add half the usual jump "
+                    f"({half - w:g} lb, not {inc:g}) and reset to {low}."
+                ),
+            }
         nxt = _round_to(w + inc, step)
         return {
             "weight_lb": nxt,

@@ -257,6 +257,25 @@ class Database:
                     activated_at TEXT DEFAULT (datetime('now'))
                 )
             """)
+            # goal_races: the race a training block is actually built around.
+            # Only one row at a time has status='active' (same pattern as
+            # training_plans above). ai/race_periodization.py turns
+            # (today, race_date, distance) into a training block (base/build/
+            # peak/taper/race_week/post_race) — this table is just where that
+            # date lives; see scripts/set_goal_race.py to set it.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS goal_races (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    race_date TEXT NOT NULL,
+                    distance TEXT NOT NULL DEFAULT 'marathon',
+                    peak_weekly_mi REAL,
+                    target_time TEXT DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    notes TEXT DEFAULT '',
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
             # daily_plan_overrides: one-off exceptions to the recurring
             # weekly_template. Keyed by date (one override per day, latest
             # wins via UPSERT). When the bot resolves "what's today's plan",
@@ -1718,6 +1737,48 @@ class Database:
         logger.info(f"Saved training plan '{name}' (id={plan_id}, active={activate})")
         return plan_id
 
+    # ── Goal race (feeds ai/race_periodization.py) ─────────────────────────
+
+    async def get_active_goal_race(self) -> Optional[dict]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM goal_races WHERE status = 'active' "
+                "ORDER BY created_at DESC LIMIT 1"
+            ) as cursor:
+                row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def save_goal_race(
+        self,
+        name: str,
+        race_date: str,
+        distance: str = "marathon",
+        peak_weekly_mi: Optional[float] = None,
+        target_time: str = "",
+        notes: str = "",
+        activate: bool = True,
+    ) -> int:
+        """Save a goal race. If activate=True, archive any currently-active one."""
+        async with aiosqlite.connect(self.db_path) as db:
+            if activate:
+                await db.execute(
+                    "UPDATE goal_races SET status = 'archived' WHERE status = 'active'"
+                )
+            cursor = await db.execute(
+                "INSERT INTO goal_races "
+                "(name, race_date, distance, peak_weekly_mi, target_time, status, notes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    name, race_date, distance, peak_weekly_mi, target_time,
+                    "active" if activate else "draft", notes,
+                ),
+            )
+            race_id = cursor.lastrowid
+            await db.commit()
+        logger.info(f"Saved goal race '{name}' on {race_date} (id={race_id}, active={activate})")
+        return race_id
+
     async def set_active_plan(self, plan_id: int) -> bool:
         async with aiosqlite.connect(self.db_path) as db:
             # Check plan exists
@@ -2226,8 +2287,8 @@ class Database:
     async def get_exercise_session_history(self, weeks: int = 16) -> dict:
         """Canonical exercise -> per-session sets, oldest first.
 
-        The shape ai/session_planner.next_load() needs:
-            {"bench press": [{"date": "...", "sets": [{"weight_lb", "reps"}]}]}
+        The shape ai/session_planner.next_prescription() needs:
+            {"bench press": [{"date": "...", "sets": [{"weight_lb", "reps", "rpe"}]}]}
 
         This replaces regex-scraping `lifts.details` for a weight, which is
         what the guided session used to do while structured weight/reps sat
@@ -2237,7 +2298,7 @@ class Database:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
-                "SELECT date, exercise, reps, weight_lb FROM lift_sets "
+                "SELECT date, exercise, reps, weight_lb, rpe FROM lift_sets "
                 "WHERE date >= ? ORDER BY date ASC, set_number ASC",
                 (since,),
             )
@@ -2251,8 +2312,11 @@ class Database:
             sessions = out.setdefault(name, [])
             if not sessions or sessions[-1]["date"] != r["date"]:
                 sessions.append({"date": r["date"], "sets": []})
+            # rpe was logged all along but never selected here, so
+            # next_prescription() could never see how a top-of-range set
+            # actually felt — only whether the rep count cleared.
             sessions[-1]["sets"].append(
-                {"weight_lb": r["weight_lb"], "reps": r["reps"]}
+                {"weight_lb": r["weight_lb"], "reps": r["reps"], "rpe": r["rpe"]}
             )
         return out
 

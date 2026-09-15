@@ -364,6 +364,39 @@ class DoubleProgressionTests(unittest.TestCase):
         )
         self.assertEqual(rep_range_for([], 6), (6, 8))
 
+    def test_near_max_rpe_halves_the_jump_instead_of_blocking_it(self):
+        """RPE sat in lift_sets unused — next_prescription never looked at
+        it, so clearing the top of the range by grinding at RPE 9.5-10 got
+        the same full jump as clearing it easily. That's how you walk into a
+        missed session. High RPE should shrink the jump, not cancel it."""
+        s = [{
+            "date": "2026-08-15",
+            "sets": [
+                {"weight_lb": 205, "reps": 8, "rpe": 9.5},
+                {"weight_lb": 205, "reps": 8, "rpe": 10},
+                {"weight_lb": 205, "reps": 8, "rpe": 9.5},
+            ],
+        }]
+        p = self._step(s)
+        self.assertEqual(p["action"], "add_weight")
+        self.assertEqual(p["weight_lb"], 207.5)  # half of the 5 lb medium step
+        self.assertIn("near-max", p["reason"])
+
+    def test_moderate_rpe_at_top_of_range_still_gets_the_full_jump(self):
+        """Same clean top-of-range clear, but RPE says there was room —
+        nothing should change from before this feature existed."""
+        s = [{
+            "date": "2026-08-15",
+            "sets": [
+                {"weight_lb": 205, "reps": 8, "rpe": 7},
+                {"weight_lb": 205, "reps": 8, "rpe": 7.5},
+                {"weight_lb": 205, "reps": 8, "rpe": 7},
+            ],
+        }]
+        p = self._step(s)
+        self.assertEqual((p["weight_lb"], p["action"]), (210, "add_weight"))
+        self.assertNotIn("near-max", p["reason"])
+
 
 class ProgressionPaceTests(unittest.TestCase):
     """A per-set rule can run for a year and quietly miss the goal by 40 lb.

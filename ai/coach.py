@@ -55,6 +55,7 @@ from integrations.weather import WeatherClient
 from ai import recovery_planner as rp
 from ai import session_planner as sp
 from ai import training_state as ts
+from ai import race_periodization as rz
 
 logger = logging.getLogger(__name__)
 
@@ -1700,6 +1701,22 @@ class Coach:
         except Exception as e:
             obs.source_failed(logger, "strength_progression", "chat", e)
 
+        # Goal race periodization — same computed block as the brief, so
+        # chat answers "should I be lifting hard right now" consistently
+        # with what the brief already told the user.
+        try:
+            race = await self.db.get_active_goal_race()
+            if race:
+                race_block = rz.render_race_periodization_block(
+                    race["name"], race["race_date"], race.get("distance") or "marathon",
+                    today, race.get("peak_weekly_mi"),
+                )
+                if race_block:
+                    lines.append("")
+                    lines.append(race_block)
+        except Exception as e:
+            obs.source_failed(logger, "race_periodization", "chat", e)
+
         # PLAN ADHERENCE — only when a plan exists. Pulls 14 days of Strava
         # activities (one extra DB read, cheap) and reuses the 14-day lifts
         # already in hand. 14 days covers last week's Mon → today, so the
@@ -2108,6 +2125,23 @@ class Coach:
             )
         except Exception as e:
             obs.source_failed(logger, "strength_progression", "brief", e)
+
+        # ── GOAL RACE PERIODIZATION — computed from the race date instead
+        # of the hand-authored training_phases rows. Tells the brief (and,
+        # via is_primary above, the session planner) whether lifting should
+        # be pushed or held right now.
+        try:
+            race = await self.db.get_active_goal_race()
+            if race:
+                race_block = rz.render_race_periodization_block(
+                    race["name"], race["race_date"], race.get("distance") or "marathon",
+                    today, race.get("peak_weekly_mi"),
+                )
+                if race_block:
+                    lines.append("")
+                    lines.append(race_block)
+        except Exception as e:
+            obs.source_failed(logger, "race_periodization", "brief", e)
 
         # ── TODAY'S SESSION — the actual plan, computed once and persisted
         # so /liftstart walks through exactly what the brief promised.
@@ -3798,6 +3832,19 @@ Rules:
                 is_primary = False
         except Exception as e:
             obs.source_failed(logger, "phase_for_session", "liftstart", e)
+
+        # Goal race decides the same thing, computed instead of hand-authored
+        # — deprioritize lifting if EITHER source says so (manual phase or
+        # the automatic race-date block both get a veto, not a vote).
+        try:
+            race = await self.db.get_active_goal_race()
+            if race:
+                out = rz.days_to_race(_date.today(), _date.fromisoformat(race["race_date"]))
+                block = rz.training_block(out, race.get("distance") or "marathon")
+                if not rz.is_lifting_primary(block):
+                    is_primary = False
+        except Exception as e:
+            obs.source_failed(logger, "goal_race_for_session", "liftstart", e)
 
         band = None
         try:
