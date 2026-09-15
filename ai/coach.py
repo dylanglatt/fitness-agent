@@ -46,7 +46,6 @@ from ai.prompts import (
     WEEKLY_SUMMARY_PROMPT,
     SUNDAY_REFLECTION_PROMPT,
     CHAT_PROMPT,
-    get_daily_stoic_quote,
 )
 from integrations.strava import StravaClient
 from integrations.whoop import WhoopClient, WhoopAuthError
@@ -2550,8 +2549,7 @@ class Coach:
         except Exception as e:
             logger.warning(f"Brief knowledge retrieval failed (non-fatal): {e}")
 
-        stoic_quote = get_daily_stoic_quote()
-        prompt = DAILY_BRIEF_PROMPT.format(data=context, stoic_quote=stoic_quote)
+        prompt = DAILY_BRIEF_PROMPT.format(data=context)
         brief = await self._ask_claude(prompt, allow_tools=False, caller="daily_brief")
 
         # Persist the DETERMINISTIC decision (not the prose) so tomorrow's

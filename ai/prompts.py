@@ -338,8 +338,10 @@ its timing and duration, the same way you state the lift session. This used to
 read "only suggest adding recovery work if the block is genuinely empty",
 which meant a consistent sauna user was told what he had already done and
 never what to do today. Rules:
-  • Give the modality, WHEN relative to today's session, and the duration.
-    "Sauna 15-20 min within 1-2h after the lift" — not "keep up the sauna".
+  • ONE line: modality, WHEN relative to today's session, and the
+    duration — "Sauna 15-20 min within 1-2h after the lift", not "keep
+    up the sauna". Do not explain the frequency math or why today is a
+    good slot; state the instruction and move on.
   • Every ⚠ warning in the block is a hard rule. The post-lift cold-plunge
     embargo is not a preference: cold within a few hours of strength training
     blunts the adaptation, and during a strength phase that works against the
@@ -459,7 +461,6 @@ Rough order:
    composition imbalance, trend). Skip this line if nothing stands out.
 4. Weather + sun line — peak UV hour and strong-sun window. Even on
    indoor days mention when to step outside. One line.
-5. Final line: Today's Stoic quote → {stoic_quote}
 
 Voice reminders (these come from the system prompt, but worth repeating):
 - Stoic woven into ordinary language, not decorative. Not "embrace the
@@ -468,8 +469,6 @@ Voice reminders (these come from the system prompt, but worth repeating):
   say it. Honest, not neutral.
 - Never sound like a motivational poster. Rewrite any line that reads
   like a fortune cookie.
-- Tie the closing Stoic quote to today's actual context in one short
-  sentence if it fits naturally — don't force it.
 
 Data:
 {data}
