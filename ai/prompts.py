@@ -478,16 +478,28 @@ Data:
 # ── Weekly Summary Prompt ─────────────────────────────────────────────────────
 
 WEEKLY_SUMMARY_PROMPT = """
-Generate Dylan's weekly training summary based on the data below.
+Generate Dylan's weekly training summary from the week of data below.
 
-Cover:
-1. Overall training load and recovery balance this week
-2. Running: volume, intensity distribution, any trends
-3. Lifting: exercises logged, any PRs or regressions noted
-4. Recovery quality: sleep trends, HRV trend, sauna/cold plunge if noted
-5. One key takeaway or recommendation for next week
+This is a week-over-week ROLLUP, not a day-by-day recap — he already read
+each day's brief. Do not re-list individual runs or lifts one by one;
+aggregate them. If you're describing each session in order, you're doing
+it wrong.
 
-Be analytical. Reference actual numbers. Keep it tight — readable in 2 minutes.
+Rules:
+- Numbers only from the data below. Never estimate, round generously, or
+  state a number that isn't there.
+- Compare against the plan's weekly targets when available (e.g. 2/3
+  lifts, 3/3 runs) — over/under against target, not just a raw count.
+- Call out a PR or a real regression by name and number if one happened.
+  Skip that line entirely if nothing changed — no PR is not a finding.
+- One line on recovery direction (HRV/sleep trending up, down, or flat),
+  not a day-by-day replay.
+- End with exactly ONE recommendation for next week, concrete and
+  numeric ("add a rep to top-set bench" not "keep pushing" or "stay
+  consistent").
+- No philosophy quotes, no motivational language. Plain analysis.
+
+Target: 5-7 short lines total, readable in under 30 seconds.
 
 Data:
 {data}

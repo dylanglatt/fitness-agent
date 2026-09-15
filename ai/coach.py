@@ -2684,7 +2684,7 @@ class Coach:
     async def weekly_summary(self) -> str:
         context = await self._build_layered_context()
         prompt = WEEKLY_SUMMARY_PROMPT.format(data=context)
-        return await self._ask_claude(prompt, allow_tools=True, max_tokens=1500, caller="weekly_summary")
+        return await self._ask_claude(prompt, allow_tools=True, max_tokens=500, caller="weekly_summary")
 
     async def stoic_reflection(self) -> str:
         context = await self._build_layered_context()
