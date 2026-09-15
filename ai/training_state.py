@@ -40,6 +40,7 @@ _EXERCISE_KEYWORDS: list[tuple[str, tuple[str, str]]] = [
     ("hip thrust", (LEGS, "glutes")), ("glute", (LEGS, "glutes")),
     ("calf", (LEGS, "calves")),
     # push
+    ("incline curl", (PULL, "biceps")), ("incline dumbbell curl", (PULL, "biceps")), ("incline db curl", (PULL, "biceps")),
     ("incline", (PUSH, "chest")), ("bench", (PUSH, "chest")),
     ("chest press", (PUSH, "chest")), ("chest fly", (PUSH, "chest")),
     ("push-up", (PUSH, "chest")), ("pushup", (PUSH, "chest")),
@@ -119,7 +120,7 @@ def classify_exercise(
     doesn't recognize, then the coarse parser Workout tag, then (None, None).
     Pure logic throughout — easy to unit-test and extend.
     """
-    n = (name or "").strip().lower()
+    n = (name or "").strip().lower().replace("-", " ")
     if n:
         for kw, (pat, mus) in _EXERCISE_KEYWORDS:
             if kw in n:

@@ -39,6 +39,21 @@ def test_classify_exercise():
     assert classify_exercise("Mystery move")[0] is None
 
 
+def test_classify_exercise_specific_beats_generic_keyword():
+    # "incline curl" collides with the generic "incline" -> push/chest
+    # keyword; the specific curl entries must win since a curl on an
+    # incline bench is biceps work, not chest.
+    assert classify_exercise("Incline DB curl") == (PULL, "biceps")
+    assert classify_exercise("Incline dumbbell curl") == (PULL, "biceps")
+    # unaffected: real incline presses still classify as push/chest
+    assert classify_exercise("Incline dumbbell press") == (PUSH, "chest")
+
+
+def test_classify_exercise_hyphen_insensitive():
+    assert classify_exercise("Rear-delt fly") == (PULL, "rear delts")
+    assert classify_exercise("Trap-bar deadlift")[0] == LEGS
+
+
 def test_classify_exercise_falls_back_to_free_exercise_db():
     # "Good Morning" isn't in the hand-authored keyword list but is in
     # free-exercise-db as a hamstring-primary powerlifting movement.
