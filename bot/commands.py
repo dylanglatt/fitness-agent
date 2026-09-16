@@ -813,6 +813,22 @@ def register_commands(bot):
     # ── /liftstart — begin a guided, set-by-set lift session ──────────────
 
     @bot.hybrid_command(
+        name="session",
+        description="Compute today's exact lift session on demand — same plan /liftstart will use.",
+    )
+    @is_owner_hybrid
+    async def session_cmd(ctx: commands.Context):
+        """Generate (and persist) today's session right now instead of
+        waiting for the scheduled brief or starting /liftstart. Useful
+        before the brief has fired yet, after a /swap, or just to sanity
+        check what the deterministic engine actually decided for today —
+        same readiness verdict + same computed numbers /liftstart reuses.
+        """
+        await ctx.defer()
+        text = await coach.generate_todays_session()
+        await _send_chunked(ctx, text)
+
+    @bot.hybrid_command(
         name="liftstart",
         description="Start a guided lift session. The bot prompts each set with a recommended weight.",
     )

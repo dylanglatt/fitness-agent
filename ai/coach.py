@@ -3916,6 +3916,100 @@ Rules:
         parsed = await self._parse_prescription_to_exercises(prescription)
         return parsed, "prescription"
 
+    async def generate_todays_session(self) -> str:
+        """Compute (and persist) today's session on demand.
+
+        Runs the exact same deterministic pipeline the morning brief uses —
+        classify_planned_session -> assess_readiness -> _single_pattern_
+        from_session -> _build_session_plan — so this can be called any
+        time (before the scheduled brief has run, mid-day after a /swap, or
+        just to double check) without waiting for a cron job, and whatever
+        it prints here is exactly what /liftstart will walk through
+        afterward, because it persists to the same planned_sessions row via
+        save_planned_session. Added 2026-09-16 — until then, the concrete
+        computed session only existed as a side effect of the brief running
+        or of actually starting /liftstart.
+        """
+        plan = await self.db.get_active_plan()
+        if not plan:
+            return "No active training plan. Set one up before generating a session."
+
+        today = self._now().date()
+        today_iso = today.isoformat()
+        today_name = today.strftime("%A")
+
+        try:
+            session = await self.db.get_effective_session_for_date(today_iso)
+        except Exception as e:
+            obs.source_failed(logger, "effective_session", "generate_session", e)
+            session = (plan.get("weekly_template") or {}).get(today_name.lower())
+
+        if not session:
+            return f"No session defined for {today_name} — rest day or unscheduled."
+
+        stype = (session.get("session_type") or "").lower()
+        focus = session.get("focus", "")
+        override_tag = " (override)" if session.get("is_override") else ""
+
+        lines = [
+            f"**{plan.get('name')}** — {today_name}{override_tag}",
+            f"{stype.upper()} — {focus}" if focus else stype.upper(),
+        ]
+
+        # Readiness — same 14-day window + classifier the brief uses, so the
+        # verdict here matches what the brief would say about today.
+        readiness: dict = {}
+        try:
+            lifts_14d = await self.db.get_recent_lifts(days=14)
+            acts_14d = await self.db.get_strava_activities_range(
+                str(today - timedelta(days=14)), today_iso
+            )
+            state = ts.build_training_state(lifts_14d, acts_14d, today)
+            planned = ts.classify_planned_session(session)
+            readiness = ts.assess_readiness(state, planned)
+            block = ts.render_readiness_block(state, readiness)
+            if block:
+                lines.append("")
+                lines.append(block)
+        except Exception as e:
+            obs.source_failed(logger, "training_readiness", "generate_session", e)
+
+        if stype not in ("lift", "strength", "full_body"):
+            lines.append("")
+            lines.append("Not a lift day — nothing for session_planner.py to compute.")
+            return "\n".join(lines)
+
+        pat = _single_pattern_from_session(session)
+        sug = readiness.get("suggested") or ()
+        if len(sug) > 1 and sug[1] in ("push", "pull", "legs", "core"):
+            pat = sug[1]
+
+        if not pat:
+            lines.append("")
+            lines.append(
+                "Full-body (or pattern-unspecified) day — session_planner.py "
+                "can't build composite full-body numbers yet. Prescription "
+                "as written:"
+            )
+            if session.get("prescription"):
+                lines.append(session["prescription"])
+            return "\n".join(lines)
+
+        plan_ex, plan_source = await self._build_session_plan(
+            pat, session.get("prescription", "")
+        )
+        if not plan_ex:
+            lines.append("")
+            lines.append(f"No exercise history for '{pat}' to build a session from.")
+            return "\n".join(lines)
+
+        await self.db.save_planned_session(today_iso, pat, plan_ex, plan_source)
+        lines.append("")
+        lines.append(_render_session_plan(plan_ex, pat))
+        lines.append("")
+        lines.append("_(Saved — /liftstart will use this exact session.)_")
+        return "\n".join(lines)
+
     async def suggest_additional_exercises(self, limit: int = 3) -> list[dict]:
         """Movements from the library not yet done in this session.
 
