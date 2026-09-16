@@ -829,6 +829,24 @@ def register_commands(bot):
         await _send_chunked(ctx, text)
 
     @bot.hybrid_command(
+        name="editsession",
+        description="Swap or drop one exercise in today's planned session.",
+    )
+    @is_owner_hybrid
+    async def editsession_cmd(ctx: commands.Context, exercise: str = "", replacement: str = ""):
+        """Usage: /editsession <exercise> <replacement>
+                  /editsession <exercise> remove
+
+        Edits the persisted planned session (the row /session writes and
+        /liftstart reads) -- not a lift session already in progress, which
+        is a separate snapshot. Run /session first if today's plan hasn't
+        been generated yet; this will generate it before editing.
+        """
+        await ctx.defer()
+        text = await coach.edit_todays_session(exercise, replacement)
+        await _send_chunked(ctx, text)
+
+    @bot.hybrid_command(
         name="liftstart",
         description="Start a guided lift session. The bot prompts each set with a recommended weight.",
     )

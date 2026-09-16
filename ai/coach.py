@@ -4132,6 +4132,131 @@ Rules:
         lines.append("_(Saved — /liftstart will use this exact session.)_")
         return "\n".join(lines)
 
+    async def _compute_swap_exercise(
+        self,
+        name: str,
+        reps_hint: Optional[str] = None,
+        include_warmup: bool = False,
+    ) -> dict:
+        """Compute one fresh exercise entry from history — same math
+        _build_full_body_plan runs per exercise, factored out here so
+        edit_todays_session can swap in a NEW exercise with a real computed
+        weight instead of a blank "pick a weight" slate.
+        """
+        from data.exercise_vocab import canonical_exercise
+
+        try:
+            history = await self.db.get_exercise_session_history(weeks=16)
+        except Exception as e:
+            obs.source_failed(logger, "exercise_history", "edit_session", e)
+            history = {}
+
+        key = canonical_exercise(name) or name.lower()
+        sessions_for_lift = history.get(key) or []
+        rng = _parse_rep_range_str(reps_hint, sessions_for_lift)
+        presc = sp.next_prescription(sessions_for_lift, name, rep_range=rng)
+        sets = sp.infer_target_sets(sessions_for_lift, 3)
+
+        today = self._now().date()
+        notes = ""
+        if sessions_for_lift:
+            try:
+                last_days_ago = (
+                    today - _date.fromisoformat(sessions_for_lift[-1]["date"])
+                ).days
+                if last_days_ago <= 2:
+                    notes = f"also trained {last_days_ago}d ago"
+            except Exception:
+                pass
+
+        return {
+            "name": name,
+            "sets": sets,
+            "reps": str(presc["target_reps"]),
+            "rep_range": f"{rng[0]}-{rng[1]}",
+            "target_weight_lb": presc["weight_lb"],
+            "warmup": sp.warmup_for(presc["weight_lb"], name) if include_warmup else None,
+            "per_side": sp.is_unilateral(name),
+            "reason": presc["reason"],
+            "action": presc["action"],
+            "notes": notes,
+        }
+
+    async def edit_todays_session(self, find: str, replacement: str) -> str:
+        """Swap or drop one exercise in today's planned session.
+
+        Operates on the persisted planned_sessions row -- the same row
+        /session writes and /liftstart reads -- not a running guided
+        session, which is a separate snapshot taken at /liftstart time
+        (active_lift_session). If a session is already in progress this
+        edit won't reach it; say so rather than silently doing nothing.
+
+        Added 2026-09-16: there was no way to adjust a planned exercise
+        (e.g. drop one that duplicated a lift from a couple days ago)
+        short of ignoring the bot's plan entirely.
+        """
+        today = self._now().date()
+        today_iso = today.isoformat()
+
+        saved = await self.db.get_planned_session(today_iso)
+        if not saved or not saved.get("plan"):
+            gen = await self.generate_todays_session()
+            saved = await self.db.get_planned_session(today_iso)
+            if not saved or not saved.get("plan"):
+                return gen or "No session to edit today."
+
+        plan = list(saved["plan"])
+        pattern = saved.get("pattern") or "full_body"
+
+        find_norm = (find or "").strip().lower()
+        if not find_norm:
+            names = ", ".join(e["name"] for e in plan)
+            return (
+                "Usage: `/editsession <exercise> <replacement|remove>`\n"
+                f"Today's exercises: {names}"
+            )
+
+        matches = [i for i, e in enumerate(plan) if find_norm in e["name"].lower()]
+        if not matches:
+            names = ", ".join(e["name"] for e in plan)
+            return (
+                f"No exercise matching {find!r} in today's session. "
+                f"Today's exercises: {names}"
+            )
+        if len(matches) > 1:
+            hit_names = ", ".join(plan[i]["name"] for i in matches)
+            return f"{find!r} matches more than one exercise ({hit_names}) — be more specific."
+
+        idx = matches[0]
+        old = plan[idx]
+
+        repl_norm = (replacement or "").strip().lower()
+        if repl_norm in ("remove", "drop", "skip", "delete", "cut", ""):
+            plan.pop(idx)
+            msg_head = f"Dropped **{old['name']}** from today's session."
+        else:
+            replacement_name = (replacement or "").strip()
+            new_entry = await self._compute_swap_exercise(
+                replacement_name, old.get("rep_range"), idx == 0,
+            )
+            plan[idx] = new_entry
+            msg_head = f"Swapped **{old['name']}** → **{new_entry['name']}**."
+
+        await self.db.save_planned_session(today_iso, pattern, plan, "manual_edit")
+
+        active = await self.db.get_active_lift_session()
+        tail = (
+            "\n\n_Heads up: a lift session is already in progress — this "
+            "edit won't apply to it. `/liftend` then `/liftstart` to pick "
+            "it up._"
+            if active else
+            "\n\n_(Saved — /liftstart will use this.)_"
+        )
+        if not plan:
+            return msg_head + "\n\nToday's session is now empty." + tail
+        block = _render_session_plan(plan, pattern.replace("_", " "))
+        return msg_head + "\n\n" + block + tail
+
     async def suggest_additional_exercises(self, limit: int = 3) -> list[dict]:
         """Movements from the library not yet done in this session.
 
