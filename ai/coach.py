@@ -374,6 +374,28 @@ def _single_pattern_from_session(session: Optional[dict]) -> Optional[str]:
     return None
 
 
+def _parse_rep_range_str(
+    reps: Optional[str], sessions: list[dict], default_low: int = 8
+) -> tuple[int, int]:
+    """Turn a template-authored rep string ("6-8", "10", "?") into the
+    (low, high) tuple next_prescription() runs double progression in.
+
+    Falls back to session_planner.rep_range_for (inferred from what Dylan
+    actually trains) when the template didn't give a usable range — same
+    fallback next_prescription() itself uses when rep_range is omitted.
+    """
+    reps = (reps or "").strip()
+    m = re.match(r"^(\d+)\s*-\s*(\d+)$", reps)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        return (lo, hi) if lo <= hi else (hi, lo)
+    m = re.match(r"^(\d+)$", reps)
+    if m:
+        lo = int(m.group(1))
+        return lo, lo + 2
+    return sp.rep_range_for(sessions, default_low)
+
+
 def _render_session_plan(plan: list[dict], pattern: str) -> str:
     """Render today's lift session with warmups, sets, reps and loads.
 
@@ -2180,33 +2202,30 @@ class Coach:
             sug_sub = (self._brief_decision or {}).get("prescribed_sub") or ""
             if sug_sub in ("push", "pull", "legs", "core"):
                 pat = sug_sub
-            if pat:
+            # Unified for single-pattern AND full-body days. Full-body used
+            # to be skipped here (session_plan.skipped_no_single_pattern)
+            # because session_planner.py could only build one pattern's
+            # library at a time -- the ACTIVE PLAN block's raw prescription
+            # text was all the brief had for those days. _build_session_plan
+            # now routes pat=None to _build_full_body_plan, which computes a
+            # real per-exercise weight from history for the plan's named
+            # exercises, so full-body days get the same concrete numbers.
+            if pat or stype in ("lift", "strength", "full_body"):
                 plan, plan_source = await self._build_session_plan(
                     pat, planned.get("prescription", "")
                 )
-                block = _render_session_plan(plan, pat)
+                block = _render_session_plan(plan, pat or "full body")
                 if block:
                     lines.append("")
                     lines.append(block)
                     await self.db.save_planned_session(
-                        str(today), pat, plan, plan_source
+                        str(today), pat or "full_body", plan, plan_source
                     )
                     obs.log_event(
                         logger, logging.INFO, "session_plan.persisted",
-                        pattern=pat, exercises=len(plan),
+                        pattern=pat or "full_body", exercises=len(plan),
                         source=plan_source,
                     )
-            elif stype in ("lift", "strength", "full_body"):
-                # Full-body (or any lift day that doesn't reduce to a single
-                # push/pull/legs/core pattern) — session_planner.py can't
-                # build a concrete session for it yet. Don't force one; the
-                # ACTIVE PLAN block above already carries the real
-                # prescription text for today. See
-                # _single_pattern_from_session for the incident this guards.
-                obs.log_event(
-                    logger, logging.INFO, "session_plan.skipped_no_single_pattern",
-                    session_type=stype, focus=planned.get("focus", ""),
-                )
         except Exception as e:
             obs.source_failed(logger, "session_plan", "brief", e)
 
@@ -3843,7 +3862,16 @@ Rules:
         actual set history.
         """
         if not pattern:
-            pattern = "push"
+            # Full-body (or any day that doesn't reduce to a single push/
+            # pull/legs/core pattern). This used to silently fall back to
+            # `pattern = "push"` here — the exact same class of bug
+            # _single_pattern_from_session guards against on the focus-text
+            # side, just hit from the /liftstart-cold-start angle instead of
+            # the brief. plan_session()'s "rank the library, pick the top N"
+            # approach doesn't apply anyway: a full-body day's exercises are
+            # already fixed by the template, not chosen from a pool. Build
+            # from the named exercise list instead.
+            return await self._build_full_body_plan(prescription), "full_body_planner"
         try:
             vocab = await self.db.get_exercise_vocabulary(weeks=26)
             library = (vocab.get("by_pattern") or {}).get(pattern) or []
@@ -3916,6 +3944,84 @@ Rules:
         parsed = await self._parse_prescription_to_exercises(prescription)
         return parsed, "prescription"
 
+    async def _build_full_body_plan(
+        self, prescription: str, intensity_band: Optional[str] = None
+    ) -> list[dict]:
+        """Build a concrete session for a full-body (or any composite/
+        mixed) day from the plan's own named exercise list, computing a
+        real weight per exercise from history the same way
+        session_planner.plan_session() does for a single pattern.
+
+        plan_session() picks exercises FROM a pattern's library, ranked by
+        how often Dylan trains them — that doesn't fit a full-body day,
+        where the exercises are already fixed by the template (hack squat,
+        RDL, lat pulldown, ...), not chosen from a pool. So this parses the
+        prescription text into the named exercises (Haiku, via
+        _parse_prescription_to_exercises — safe here since it's parsing
+        clean authored template text, not a casual chat message) and runs
+        each one through the exact same next_prescription() double-
+        progression math, in the order the plan lists them, instead of
+        just printing the template's rep-range text with no real weight.
+
+        Also flags an exercise trained within the last 2 days (the same
+        spacing window training_state.py uses for push/pull/legs). A
+        full-body day can legitimately repeat a lift the template already
+        double-dips on (hack squat is a moderate Monday accessory AND
+        Wednesday's main lower lift, by design — see
+        scripts/set_full_body_plan.py's PLAN_NOTES), but Dylan should see
+        that plainly rather than have it look like a fresh prescription.
+        """
+        from data.exercise_vocab import canonical_exercise
+
+        parsed = await self._parse_prescription_to_exercises(prescription)
+        if not parsed:
+            return []
+
+        try:
+            history = await self.db.get_exercise_session_history(weeks=16)
+        except Exception as e:
+            obs.source_failed(logger, "exercise_history", "full_body_plan", e)
+            history = {}
+
+        today = self._now().date()
+        out: list[dict] = []
+        for idx, ex in enumerate(parsed):
+            name = ex["name"]
+            key = canonical_exercise(name) or name.lower()
+            sessions_for_lift = history.get(key) or []
+            rng = _parse_rep_range_str(ex.get("reps"), sessions_for_lift)
+            presc = sp.next_prescription(
+                sessions_for_lift, name, rep_range=rng, intensity_band=intensity_band,
+            )
+            sets = ex.get("sets") or sp.infer_target_sets(sessions_for_lift, 3)
+            notes = ex.get("notes", "")
+
+            last_days_ago = None
+            if sessions_for_lift:
+                try:
+                    last_days_ago = (
+                        today - _date.fromisoformat(sessions_for_lift[-1]["date"])
+                    ).days
+                except Exception:
+                    last_days_ago = None
+            if last_days_ago is not None and last_days_ago <= 2:
+                tag = f"also trained {last_days_ago}d ago"
+                notes = f"{notes}; {tag}" if notes else tag
+
+            out.append({
+                "name": name,
+                "sets": sets,
+                "reps": str(presc["target_reps"]),
+                "rep_range": f"{rng[0]}-{rng[1]}",
+                "target_weight_lb": presc["weight_lb"],
+                "warmup": sp.warmup_for(presc["weight_lb"], name) if idx == 0 else None,
+                "per_side": sp.is_unilateral(name),
+                "reason": presc["reason"],
+                "action": presc["action"],
+                "notes": notes,
+            })
+        return out
+
     async def generate_todays_session(self) -> str:
         """Compute (and persist) today's session on demand.
 
@@ -3929,6 +4035,16 @@ Rules:
         save_planned_session. Added 2026-09-16 — until then, the concrete
         computed session only existed as a side effect of the brief running
         or of actually starting /liftstart.
+
+        Unlike the brief's context block (which feeds render_readiness_block's
+        full per-pattern breakdown to the LLM), this is read directly by a
+        human in Discord, so readiness collapses to one line, and full-body
+        days now get the same computed weights/reps as single-pattern days
+        via _build_session_plan's _build_full_body_plan fallback — no more
+        "can't build composite numbers yet, here's the raw prescription".
+        Added 2026-09-16 after /session v1 feedback: no real weights on
+        full-body days, a cluttered readiness table, and no visibility into
+        an exercise (e.g. hack squat/RDL) repeating from a couple days ago.
         """
         plan = await self.db.get_active_plan()
         if not plan:
@@ -3956,8 +4072,11 @@ Rules:
             f"{stype.upper()} — {focus}" if focus else stype.upper(),
         ]
 
-        # Readiness — same 14-day window + classifier the brief uses, so the
-        # verdict here matches what the brief would say about today.
+        # Readiness — same 14-day window + classifier the brief uses, but
+        # collapsed to one line: this is a human reading Discord, not the
+        # LLM prompt that render_readiness_block's full per-pattern table
+        # feeds. (That full table is still what the brief's own context
+        # block uses — see _build_layered_context.)
         readiness: dict = {}
         try:
             lifts_14d = await self.db.get_recent_lifts(days=14)
@@ -3967,10 +4086,15 @@ Rules:
             state = ts.build_training_state(lifts_14d, acts_14d, today)
             planned = ts.classify_planned_session(session)
             readiness = ts.assess_readiness(state, planned)
-            block = ts.render_readiness_block(state, readiness)
-            if block:
-                lines.append("")
-                lines.append(block)
+            status = readiness.get("status", "ready").upper()
+            line = f"Readiness: {status}"
+            if readiness.get("reason"):
+                line += f" — {readiness['reason']}"
+            if readiness.get("suggested"):
+                sk, ss = readiness["suggested"]
+                line += " (suggested instead: " + sk + (f"/{ss})" if ss else ")")
+            lines.append("")
+            lines.append(line)
         except Exception as e:
             obs.source_failed(logger, "training_readiness", "generate_session", e)
 
@@ -3984,28 +4108,26 @@ Rules:
         if len(sug) > 1 and sug[1] in ("push", "pull", "legs", "core"):
             pat = sug[1]
 
-        if not pat:
-            lines.append("")
-            lines.append(
-                "Full-body (or pattern-unspecified) day — session_planner.py "
-                "can't build composite full-body numbers yet. Prescription "
-                "as written:"
-            )
-            if session.get("prescription"):
-                lines.append(session["prescription"])
-            return "\n".join(lines)
-
+        # Unified call for both single-pattern and full-body days — no more
+        # "session_planner.py can't build composite full-body numbers yet"
+        # special case. _build_session_plan routes pat=None to
+        # _build_full_body_plan, which computes a real per-exercise weight
+        # from history (same double-progression logic as the pattern path)
+        # and flags any exercise also trained in the last 2 days.
         plan_ex, plan_source = await self._build_session_plan(
             pat, session.get("prescription", "")
         )
         if not plan_ex:
+            label = pat or "full body"
             lines.append("")
-            lines.append(f"No exercise history for '{pat}' to build a session from.")
+            lines.append(f"No exercise history for '{label}' to build a session from.")
             return "\n".join(lines)
 
-        await self.db.save_planned_session(today_iso, pat, plan_ex, plan_source)
+        await self.db.save_planned_session(
+            today_iso, pat or "full_body", plan_ex, plan_source
+        )
         lines.append("")
-        lines.append(_render_session_plan(plan_ex, pat))
+        lines.append(_render_session_plan(plan_ex, pat or "full body"))
         lines.append("")
         lines.append("_(Saved — /liftstart will use this exact session.)_")
         return "\n".join(lines)
