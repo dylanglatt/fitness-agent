@@ -46,6 +46,8 @@ from ai.prompts import (
     WEEKLY_SUMMARY_PROMPT,
     SUNDAY_REFLECTION_PROMPT,
     CHAT_PROMPT,
+    CHAT_TOOL_GUIDANCE_ON,
+    CHAT_TOOL_GUIDANCE_OFF,
 )
 from integrations.strava import StravaClient
 from integrations.whoop import WhoopClient, WhoopAuthError
@@ -348,6 +350,30 @@ def _render_yesterday(prev: dict | None, actual: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _single_pattern_from_session(session: Optional[dict]) -> Optional[str]:
+    """The push/pull/legs/core pattern for session_planner.py's single-
+    pattern planner, or None when the session isn't reducible to one.
+
+    Uses ts.classify_planned_session (session_type + focus text, with a
+    real full-body branch) rather than substring-matching the focus text
+    directly against ("push", "pull", "legs", "core") — a full-body focus
+    string like "full body (quad + vertical push/pull)" contains the
+    literal substring "push", so that naive match classified every
+    full-body day as a push day. On 2026-09-16 that silently replaced a
+    correct full-body prescription (hack squat / lat pulldown / RDL as the
+    main lifts) with a concrete push-only session (bench / OHP / incline
+    press) in the morning brief, because session_planner.py's plan_session
+    only knows how to build a session for ONE pattern's exercise library —
+    it has no notion of full-body at all. Skip it for full-body (or any
+    other pattern-unspecified) lift day and let the ACTIVE PLAN block's own
+    prescription text stand as-is instead of forcing it into one pattern.
+    """
+    kind, sub = ts.classify_planned_session(session)
+    if kind == "lift" and sub in ("push", "pull", "legs", "core"):
+        return sub
+    return None
+
+
 def _render_session_plan(plan: list[dict], pattern: str) -> str:
     """Render today's lift session with warmups, sets, reps and loads.
 
@@ -583,6 +609,7 @@ _TREND_INTENT = re.compile(
     \b(
         trend|trending|progression|progress|improving|declining
       | history|historical|baseline
+      | correlat\w*|relationship\s+between
       | (last|past|over\s+the)\s+(week|month|year|\d+\s*(days?|weeks?|months?))
       | (in|during|for)\s+(january|february|march|april|may|june|july|
                           august|september|october|november|december)
@@ -2147,32 +2174,39 @@ class Coach:
         try:
             planned = locals().get("session") or {}
             stype = (planned.get("session_type") or "").lower()
-            focus_txt = (planned.get("focus") or "").lower()
-            pat = next(
-                (p for p in ("push", "pull", "legs", "core") if p in focus_txt),
-                None,
-            )
+            pat = _single_pattern_from_session(planned)
             # Honor the readiness swap: if the engine moved the session, plan
             # the pattern it moved TO.
             sug_sub = (self._brief_decision or {}).get("prescribed_sub") or ""
             if sug_sub in ("push", "pull", "legs", "core"):
                 pat = sug_sub
-            if stype in ("lift", "strength") or pat:
+            if pat:
                 plan, plan_source = await self._build_session_plan(
                     pat, planned.get("prescription", "")
                 )
-                block = _render_session_plan(plan, pat or "lift")
+                block = _render_session_plan(plan, pat)
                 if block:
                     lines.append("")
                     lines.append(block)
                     await self.db.save_planned_session(
-                        str(today), pat or "lift", plan, plan_source
+                        str(today), pat, plan, plan_source
                     )
                     obs.log_event(
                         logger, logging.INFO, "session_plan.persisted",
-                        pattern=pat or "lift", exercises=len(plan),
+                        pattern=pat, exercises=len(plan),
                         source=plan_source,
                     )
+            elif stype in ("lift", "strength", "full_body"):
+                # Full-body (or any lift day that doesn't reduce to a single
+                # push/pull/legs/core pattern) — session_planner.py can't
+                # build a concrete session for it yet. Don't force one; the
+                # ACTIVE PLAN block above already carries the real
+                # prescription text for today. See
+                # _single_pattern_from_session for the incident this guards.
+                obs.log_event(
+                    logger, logging.INFO, "session_plan.skipped_no_single_pattern",
+                    session_type=stype, focus=planned.get("focus", ""),
+                )
         except Exception as e:
             obs.source_failed(logger, "session_plan", "brief", e)
 
@@ -3259,8 +3293,17 @@ class Coach:
         # prompt, the savings stack.
         wants_tools = bool(_TREND_INTENT.search(message or ""))
 
+        # Keep the per-turn guidance honest about what's actually attached to
+        # THIS call — never point the model at a tool name unless allow_tools
+        # is about to be True for this same request. See CHAT_TOOL_GUIDANCE_ON
+        # / _OFF docstring in ai/prompts.py for why this matters.
         prompt = CHAT_PROMPT.format(
-            message=message, context=context, knowledge=knowledge
+            message=message,
+            context=context,
+            knowledge=knowledge,
+            tool_guidance=(
+                CHAT_TOOL_GUIDANCE_ON if wants_tools else CHAT_TOOL_GUIDANCE_OFF
+            ),
         )
         return await self._ask_claude(
             prompt,
@@ -3927,11 +3970,10 @@ Rules:
         prescription = sess_def.get("prescription", "")
         # Pattern comes from the readiness engine's decision where possible —
         # the same push/pull/legs call the brief made — falling back to the
-        # session focus text.
-        focus_text = (sess_def.get("focus") or "").lower()
-        pattern = next(
-            (p for p in ("push", "pull", "legs", "core") if p in focus_text), None
-        )
+        # session focus text. See _single_pattern_from_session: this used to
+        # substring-match the focus text directly, which misread a full-body
+        # focus like "full body (... push/pull)" as a push day.
+        pattern = _single_pattern_from_session(sess_def)
         # The morning brief already computed and persisted today's session.
         # Reuse it so the workout matches what the brief promised — that is
         # the whole point of "it should tell me in the morning and hold".

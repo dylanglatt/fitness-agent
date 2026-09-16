@@ -210,10 +210,19 @@ working weight. The set-by-set logging is handled by the session handler, not
 this chat path; if Dylan asks a question mid-session, answer it concisely and
 let him get back to his set.
 
-Tool use: prefer answering from the context provided. Only call tools when the
-question explicitly needs data outside that window (specific past dates, trend
-analysis over months, exercise-specific progression). For running performance
-questions over a date range, query_correlated_runs is the right call.
+Tool use: tools are only attached on some turns — whether you have any this
+turn depends on a keyword gate upstream, not on the message alone, so don't
+assume either way. If tools ARE available and the question needs data outside
+the context above (specific past dates, trend/correlation analysis over
+months or weeks, exercise-specific progression, running performance vs.
+HRV/HR), call the right one — e.g. query_correlated_runs for running-
+performance-over-time or -correlation questions — rather than guessing from a
+smaller window. If NO tools are available and the question genuinely needs
+data you don't have in front of you, say so plainly and ask Dylan for a
+specific date range or to ask again — never describe, narrate, or write out
+what a tool call would look like, and never imply you queried something you
+didn't. A fake tool call is worse than an honest "I'd need to pull that —
+give me a date range."
 """.strip()
 
 
@@ -545,14 +554,32 @@ If he's logging a lift, confirm it clearly and note any progression.
 If he's asking a coaching question, give a real answer grounded in his data and the knowledge base.
 If the topic touches on mindset, setbacks, or motivation — a brief Stoic framing is welcome but not required.
 
-Tool-use guidance:
+{tool_guidance}
+Discord caps each message at ~2000 characters; keep replies tight. If the
+answer is genuinely long, lead with the bottom line in the first paragraph
+and put detail below.
+"""
+
+# Filled into CHAT_PROMPT's {tool_guidance} slot. Two variants, chosen by
+# whichever way `wants_tools` (the _TREND_INTENT gate in coach.py) came out
+# for THIS turn — so the guidance never references a tool that isn't
+# actually attached to the API call. See the 2026-09-16 CoachAurelius
+# incident: the static system prompt told the model to call
+# query_correlated_runs on a correlation question the regex gate missed, no
+# tool was attached, and the model wrote out a fake XML tool-call instead of
+# admitting it couldn't look it up. Keeping this in sync with the gate is
+# what actually prevents that failure mode, not just widening the regex.
+CHAT_TOOL_GUIDANCE_ON = """Tool-use guidance:
 - For running-performance questions (pace trends, HR drift, zone distribution,
   fitness trajectory, "how has my running changed"), use query_correlated_runs
   over the relevant window. It pairs Strava pace/distance with WHOOP HR and
   Z1–Z5 time, which is what lets you actually talk about running quality — not
   just volume. Prefer it over get_strava_aggregates for anything about
   *performance* rather than *volume*.
-- Discord caps each message at ~2000 characters; keep replies tight. If the
-  answer is genuinely long, lead with the bottom line in the first paragraph
-  and put detail below.
+"""
+
+CHAT_TOOL_GUIDANCE_OFF = """Tool-use guidance:
+- No tools are attached to this turn. Answer from the context above. If the
+  question genuinely needs data outside that window, say so directly and ask
+  for a specific date range — do not describe or fake a tool call.
 """
