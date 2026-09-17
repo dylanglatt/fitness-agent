@@ -561,10 +561,10 @@ and put detail below.
 """
 
 # Filled into CHAT_PROMPT's {tool_guidance} slot. Two variants, chosen by
-# whichever way `wants_tools` (the _TREND_INTENT gate in coach.py) came out
-# for THIS turn — so the guidance never references a tool that isn't
-# actually attached to the API call. See the 2026-09-16 CoachAurelius
-# incident: the static system prompt told the model to call
+# whichever way `wants_tools` (the _TREND_INTENT / _SUBSTITUTION_INTENT gates
+# in coach.py) came out for THIS turn — so the guidance never references a
+# tool that isn't actually attached to the API call. See the 2026-09-16
+# CoachAurelius incident: the static system prompt told the model to call
 # query_correlated_runs on a correlation question the regex gate missed, no
 # tool was attached, and the model wrote out a fake XML tool-call instead of
 # admitting it couldn't look it up. Keeping this in sync with the gate is
@@ -576,6 +576,16 @@ CHAT_TOOL_GUIDANCE_ON = """Tool-use guidance:
   Z1–Z5 time, which is what lets you actually talk about running quality — not
   just volume. Prefer it over get_strava_aggregates for anything about
   *performance* rather than *volume*.
+- If Dylan says he's swapping, replacing, or can't do a planned exercise ("no
+  hack squat machine", "swap X for Y", "I did deadlift instead of hack
+  squat"), call apply_exercise_substitution right then. Don't just acknowledge
+  it in your reply — if you don't call it, the change isn't actually saved
+  anywhere, the ACTIVE PLAN block will keep showing the original exercise on
+  every later turn, and Dylan will have to repeat himself. This applies even
+  if he already mentioned the swap earlier in the conversation and it seems
+  like you should already know — the tool call is what makes it durable, a
+  memory of the conversation is not. Calling it again for the same swap is
+  harmless.
 """
 
 CHAT_TOOL_GUIDANCE_OFF = """Tool-use guidance:

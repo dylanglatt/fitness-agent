@@ -645,6 +645,34 @@ _TREND_INTENT = re.compile(
 )
 
 
+# ── Regex — does this chat message describe swapping/replacing/losing access
+# to a planned exercise ("no hack squat machine", "swap X for Y", "I did
+# deadlift instead of hack squat")? When TRUE, attach tools so the model can
+# call apply_exercise_substitution and actually persist the change instead of
+# just acknowledging it in prose. Added 2026-09-16 after Dylan had to repeat
+# "there's no hack squat machine, I'm using deadlift" three separate times in
+# one lift-day conversation -- the static ACTIVE PLAN prescription text (see
+# _build_tiered_context) got re-injected into context every turn regardless
+# of what had actually been discussed, and the substitution itself was never
+# written anywhere durable, so it fell out of the capped conversation history
+# and the model reverted to the original plan.
+_SUBSTITUTION_INTENT = re.compile(
+    r"""
+    \binstead\b
+      | \bswap\w*\b
+      | \breplac\w*\b
+      | \bsubstitut\w*\b
+      | \bno\s+.{0,25}\b(machine|equipment)\b
+      | \b(don'?t|doesn'?t)\s+have\b
+      | \bnot\s+available\b
+      | \bisn'?t\s+available\b
+      | \b(is|are)\s+taken\b
+      | \btaken\s+at\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
 # ── Regex — is the user asking an educational/conceptual question? ──────────
 # Only when TRUE do we hit the knowledge retriever (which adds 1–2K tokens
 # and a sentence-transformer encode call). For "log my bench", "how am I
@@ -868,6 +896,47 @@ TOOLS = [
             "required": ["start_date", "end_date"],
         },
     },
+    {
+        "name": "apply_exercise_substitution",
+        "description": (
+            "Use this WHENEVER Dylan says he's swapping, replacing, or "
+            "can't do a planned exercise -- no machine at his gym, "
+            "equipment taken, doing a different lift instead, etc. "
+            "('no hack squat machine', 'swap X for Y', 'I did deadlift "
+            "instead of hack squat'). This ACTUALLY REWRITES today's "
+            "persisted session so the change sticks for the rest of the "
+            "conversation and for /liftstart -- without calling it, the "
+            "substitution only lives in this one reply and the ACTIVE "
+            "PLAN block will keep showing the original exercise on later "
+            "turns, forcing Dylan to repeat himself. Call it as soon as "
+            "the substitution is stated, don't just acknowledge it in "
+            "prose. Safe to call even if he mentioned this earlier in the "
+            "conversation already -- it's idempotent, just re-persists "
+            "the same swap."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "find": {
+                    "type": "string",
+                    "description": (
+                        "The planned exercise being replaced, e.g. "
+                        "'hack squat'. Matched case-insensitively against "
+                        "today's session."
+                    ),
+                },
+                "replacement": {
+                    "type": "string",
+                    "description": (
+                        "The new exercise name, e.g. 'deadlift'. Pass "
+                        "'remove' instead if Dylan is just dropping the "
+                        "exercise with nothing replacing it."
+                    ),
+                },
+            },
+            "required": ["find", "replacement"],
+        },
+    },
 ]
 
 
@@ -1009,6 +1078,11 @@ class Coach:
                         "query_daily_metrics over the same window."
                     )
                 return json.dumps(payload, default=str)
+            if name == "apply_exercise_substitution":
+                result = await self.edit_todays_session(
+                    args["find"], args["replacement"]
+                )
+                return json.dumps({"result": result})
         except Exception as e:
             logger.error(f"Tool {name} failed: {e}")
             return json.dumps({"error": str(e)})
@@ -1715,7 +1789,47 @@ class Coach:
                     f"  Today ({today.strftime('%A')}): {stype}{override_tag}"
                     + (f" — {focus}" if focus else "")
                 )
-                if presc:
+                # Prefer the PERSISTED plan (planned_sessions) over the raw
+                # template prescription text once one exists for today --
+                # that's the row apply_exercise_substitution/edit_todays_
+                # session/generate_todays_session all write to. Without this,
+                # a substitution said in chat ("no hack squat machine, doing
+                # deadlift") only lived in that one reply: this block re-fed
+                # the ORIGINAL "Hack squat 3x6-8..." text into every later
+                # turn's context regardless of what had actually been
+                # discussed, and once the swap scrolled out of the capped
+                # conversation history the model reverted to prescribing
+                # hack squat again. See _SUBSTITUTION_INTENT for the incident.
+                persisted_plan = None
+                if stype in ("lift", "strength", "full_body"):
+                    try:
+                        saved = await self.db.get_planned_session(str(today))
+                        # Same staleness guard as the brief's TODAY'S SESSION
+                        # block: only trust the persisted plan if it was
+                        # built for the pattern today's session actually
+                        # calls for right now. A /swap to a different lift
+                        # pattern after the persisted plan was written makes
+                        # it stale -- fall through to the raw prescription
+                        # text (below) rather than show the wrong pattern's
+                        # exercise list.
+                        expected_pattern = (
+                            _single_pattern_from_session(session) or "full_body"
+                        )
+                        if (
+                            saved
+                            and saved.get("plan")
+                            and (saved.get("pattern") or None) == expected_pattern
+                        ):
+                            persisted_plan = saved["plan"]
+                    except Exception as e:
+                        obs.source_failed(logger, "planned_session", "chat", e)
+                if persisted_plan:
+                    lines.append(
+                        "    " + _render_session_plan(
+                            persisted_plan, expected_pattern
+                        ).replace("\n", "\n    ")
+                    )
+                elif presc:
                     lines.append(f"    Prescription: {presc}")
                 if notes:
                     lines.append(f"    Notes: {notes}")
@@ -2211,21 +2325,48 @@ class Coach:
             # real per-exercise weight from history for the plan's named
             # exercises, so full-body days get the same concrete numbers.
             if pat or stype in ("lift", "strength", "full_body"):
-                plan, plan_source = await self._build_session_plan(
-                    pat, planned.get("prescription", "")
-                )
-                block = _render_session_plan(plan, pat or "full body")
-                if block:
-                    lines.append("")
-                    lines.append(block)
-                    await self.db.save_planned_session(
-                        str(today), pat or "full_body", plan, plan_source
+                # Check for an ALREADY-persisted plan first and reuse it as
+                # is, rather than unconditionally rebuilding from the raw
+                # prescription text and overwriting. This function runs more
+                # than once a day -- the scheduled brief, and again whenever
+                # a chat trend question escalates to the full context -- and
+                # rebuilding every time silently stomped any substitution
+                # made via /editsession or apply_exercise_substitution back
+                # to the original plan the moment a trend question fired
+                # later that day. Same "persisted-if-exists, else build"
+                # pattern start_lift_session already uses for /liftstart.
+                saved = await self.db.get_planned_session(str(today))
+                # Only reuse the persisted plan if it was built for the SAME
+                # pattern today's effective session actually calls for. If
+                # they differ, a /swap changed today's session type/pattern
+                # after the persisted plan was written -- that plan is now
+                # stale and needs rebuilding, same as before this function
+                # started reusing persisted plans at all.
+                saved_pattern = (saved or {}).get("pattern") or None
+                current_pattern = pat or "full_body"
+                if saved and saved.get("plan") and saved_pattern == current_pattern:
+                    plan = saved["plan"]
+                    pat = saved_pattern
+                    block = _render_session_plan(plan, pat or "full body")
+                    if block:
+                        lines.append("")
+                        lines.append(block)
+                else:
+                    plan, plan_source = await self._build_session_plan(
+                        pat, planned.get("prescription", "")
                     )
-                    obs.log_event(
-                        logger, logging.INFO, "session_plan.persisted",
-                        pattern=pat or "full_body", exercises=len(plan),
-                        source=plan_source,
-                    )
+                    block = _render_session_plan(plan, pat or "full body")
+                    if block:
+                        lines.append("")
+                        lines.append(block)
+                        await self.db.save_planned_session(
+                            str(today), pat or "full_body", plan, plan_source
+                        )
+                        obs.log_event(
+                            logger, logging.INFO, "session_plan.persisted",
+                            pattern=pat or "full_body", exercises=len(plan),
+                            source=plan_source,
+                        )
         except Exception as e:
             obs.source_failed(logger, "session_plan", "brief", e)
 
@@ -3305,12 +3446,17 @@ class Coach:
             else ""
         )
 
-        # Tools are off by default. Enable only when the message looks like
-        # it'll need a database lookup (trend question or knowledge question
-        # with date phrases). Most chat ("log my squat", "how am I today")
-        # never enters a tool loop. With 3-iter cap and lean chat system
-        # prompt, the savings stack.
-        wants_tools = bool(_TREND_INTENT.search(message or ""))
+        # Tools are off by default. Enable when the message looks like it'll
+        # need a database lookup (trend question) OR describes swapping/
+        # losing access to a planned exercise (_SUBSTITUTION_INTENT) -- that
+        # second case needs apply_exercise_substitution actually called, not
+        # just talked about, or the swap only lives in this one reply. Most
+        # chat ("log my squat", "how am I today") never enters a tool loop.
+        # With 3-iter cap and lean chat system prompt, the savings stack.
+        wants_tools = bool(
+            _TREND_INTENT.search(message or "")
+            or _SUBSTITUTION_INTENT.search(message or "")
+        )
 
         # Keep the per-turn guidance honest about what's actually attached to
         # THIS call — never point the model at a tool name unless allow_tools
