@@ -11,7 +11,7 @@ on one dedicated day that keeps getting skipped.
 This template (v2, 2026-09-15) replaced the original generic placeholder
 version. It's built from Dylan's actual logged lifts (trap bar deadlift as
 the main leg movement, bench/OHP/incline as the push pool, barbell
-row/lat pulldown as the pull pool) plus hack squat and sissy squat added
+row/lat pulldown as the pull pool) plus leg press and sissy squat added
 in to close a real gap: almost no quad-dominant work existed under PPL,
 just posterior-chain (deadlift + leg curl). Full spec — set/rep ranges,
 RIR targets, rest times, superset pairings, exercise-priority tiers for
@@ -49,7 +49,7 @@ TEMPLATE = {
             "Day A — hinge + horizontal push/pull. Trap-bar deadlift 3x4-6 "
             "(main lift, 2.5-4min rest, 1-3 RIR); Barbell bench press 3x5-8 "
             "(main press, 2.5-4min rest, 1-3 RIR); Chest-supported row 3x6-10 "
-            "(2-3min rest, 1-2 RIR); Hack squat 2x8-10 (moderate, not "
+            "(2-3min rest, 1-2 RIR); Leg extension 2x10-15 (moderate, not "
             "maximal); Lat pulldown 2x8-12, controlled stretch; Cable "
             "lateral raise 2x12-20 superset with curls; Incline DB or cable "
             "curl 2x10-15 superset with laterals; Face pull 2x15-20 "
@@ -58,7 +58,7 @@ TEMPLATE = {
         ),
         "notes": (
             "Deadlift + bench + row are the priorities, never skip those. "
-            "Everything after hack squat should move fairly quickly — "
+            "Everything after leg extension should move fairly quickly — "
             "supersets (laterals+curls, face pulls+abs) are what keep this "
             "under control. Don't superset the trap-bar deadlift with "
             "anything. If short on time, cut abs/calves/face pulls/one "
@@ -86,7 +86,7 @@ TEMPLATE = {
         "focus": "full body (quad + vertical push/pull)",
         "prescription": (
             "Day B — quad + vertical push/pull. This is the hardest leg "
-            "day of the week. Hack squat 3x6-8 (main lower lift, 2.5-4min "
+            "day of the week. Leg press 3x6-8 (main lower lift, 2.5-4min "
             "rest, 1-3 RIR, don't grind these); Plate-loaded shoulder press "
             "3x6-10 (2-3min rest, 1-2 RIR); Lat pulldown 3x6-10 (2-3min "
             "rest, 1-2 RIR); Romanian deadlift 2x8-10 (don't grind these); "
@@ -96,11 +96,11 @@ TEMPLATE = {
             "plank 2 sets. ~20-22 sets."
         ),
         "notes": (
-            "Would not take hack squats or RDLs to failure — 1-3 RIR on "
-            "the hack squat, 1-2 RIR on the RDL. Curls/laterals/face-pull/"
+            "Would not take leg press or RDLs to failure — 1-3 RIR on "
+            "the leg press, 1-2 RIR on the RDL. Curls/laterals/face-pull/"
             "leg-curl accessories can go harder, 0-1 RIR on the last set. "
             "If this session is wrecking Thursday's run quality, first fix "
-            "is cutting RDL to 1-2 sets or backing off hack squat intensity "
+            "is cutting RDL to 1-2 sets or backing off leg press intensity "
             "slightly, not skipping it entirely."
         ),
     },
@@ -163,15 +163,15 @@ PLAN_NOTES = (
     "Full-body plan v2 (2026-09). 3 full-body lifts + 3 runs + 1 rest, "
     "~20-22 working sets/session, 60-75 min. Built from Dylan's actual "
     "logged lifts (trap bar deadlift, bench, OHP, barbell row, lat "
-    "pulldown) with hack squat + sissy squat added to close a real gap: "
+    "pulldown) with leg press + sissy squat added to close a real gap: "
     "under PPL, legs had almost no quad-dominant work, just posterior "
     "chain (deadlift + leg curl). Day A (Mon) = deadlift/bench/row "
-    "priority. Day B (Wed) = hardest leg day, hack squat is the main "
+    "priority. Day B (Wed) = hardest leg day, leg press is the main "
     "lower lift, placed before Thursday's quality run so gym performance "
     "stays fresh and running intensity stays controllable. Day C (Fri) = "
     "upper hypertrophy + deliberately low-fatigue legs (sissy squat, "
     "controlled) so Sunday's long run isn't compromised. RIR: 1-3 on "
-    "heavy compounds (trap bar/hack squat/bench/shoulder press), 1-2 on "
+    "heavy compounds (trap bar/leg press/bench/shoulder press), 1-2 on "
     "rows/pulldowns/RDL/dips, 0-1 on isolation (curls/laterals/face "
     "pulls/leg curls) — you don't need to fail trap-bar deadlifts to "
     "grow. Rest: 2.5-4min heavy compounds, 2-3min rows/pulldowns/RDL/"
@@ -193,7 +193,7 @@ PLAN_NOTES = (
 
 PLAN_GOAL = (
     "Full-body strength (hypertrophy + real progressive overload on the "
-    "big three: trap bar deadlift, bench, hack squat) alongside "
+    "big three: trap bar deadlift, bench, leg press) alongside "
     "marathon-focused running — 3 full-body lifts (Mon/Wed/Fri) + 3 runs "
     "(easy/quality/long) + 1 rest per week, ~60-75min sessions. Day B "
     "(Wed) carries the heaviest leg work and sits before the quality run "
