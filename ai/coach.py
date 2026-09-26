@@ -593,6 +593,15 @@ _LIFT_HINT = re.compile(
            clean|snatch|hinge|lunge|dip|ohp)\b)  # common lift names
     | (@\s*\d+)                         # @ 185
     | (\d{2,4}\s*(lb|lbs|kg))           # 185 lbs, 225lb
+    | (\b(same\s+(thing|weight|reps?)|another\s+set|one\s+more\s+set|
+           next\s+set|repeat\s+that|repeat\s+set)\b)  # bare continuation,
+           # e.g. "next set, same thing" -- no digits of its own, but it
+           # means "log another set like the last one." Without this
+           # alternative these messages never even reach the classifier:
+           # see the 2026-09-25 incident where every mid-exercise "same
+           # thing" reply (incline press sets 2-3, chest row sets 2-3, lat
+           # pulldown set 2, etc.) was silently dropped, not misattributed --
+           # the pre-filter rejected them before the parser ever ran.
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -3683,6 +3692,16 @@ Rules:
     fall back to inheriting from Recent lifts when the coach's last message
     didn't name a specific exercise, or the message is a bare continuation
     ("same thing", "next set") with no exercise-naming question pending.
+  • BARE CONTINUATION → INHERIT THE NUMBERS TOO, NOT JUST THE EXERCISE:
+    if the message is a pure continuation with NO numbers of its own ("same
+    thing", "same weight", "next set", "another set", "repeat that", "one
+    more set") and it's clearly continuing the most recent entry in Recent
+    lifts (not answering a pending question per the rule above), copy that
+    entry's weight_lb AND reps into this set — do not leave them null and
+    do not invent different numbers. This is what "same thing" means. A
+    continuation message with no exercise-naming question pending, no
+    numbers of its own, and no usable Recent lifts entry to copy from should
+    return {{"is_lift": false}} rather than guessing.
   • DO NOT infer a set number. Leave "set_number" null unless the user
     EXPLICITLY names one ("2nd set", "set 3"). The app assigns the running set
     number from what's already logged today; a guessed "1" creates a duplicate
