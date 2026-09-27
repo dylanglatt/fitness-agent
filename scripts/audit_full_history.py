@@ -21,8 +21,11 @@ import gzip
 import json
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytz
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -47,10 +50,25 @@ def load_messages():
     return msgs
 
 
+NY_TZ = pytz.timezone("America/New_York")
+
+
+def local_date(ts: str) -> str:
+    """Discord timestamps are UTC. The app assigns each lift's `date` using
+    America/New_York (config.py TIMEZONE), so grouping by raw UTC calendar
+    date silently shifts anything logged 8pm-midnight Eastern into the next
+    day's bucket. Convert before taking the date, or the audit corrupts
+    itself right at the boundary it most needs to get right."""
+    dt = datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(NY_TZ).strftime("%Y-%m-%d")
+
+
 def group_by_date(msgs):
     by_date = {}
     for m in msgs:
-        d = m["ts"][:10]
+        d = local_date(m["ts"])
         by_date.setdefault(d, []).append(m)
     return by_date
 
