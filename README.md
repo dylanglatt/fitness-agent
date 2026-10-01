@@ -235,8 +235,7 @@ fitness-agent/
 │   ├── strava_subscribe.py
 │   ├── strava_unsubscribe.py
 │   └── ...
-├── tests/
-│   └── test_debrief.py
+├── tests/                     # 13 offline pytest modules (146 tests)
 └── docs/
     ├── strava_auth.md         # Strava OAuth walkthrough
     ├── whoop_auth.md          # WHOOP OAuth walkthrough
@@ -290,9 +289,11 @@ terminate TLS and reverse-proxy `https://your-host/webhooks/*` to
 python -m pytest tests/
 ```
 
-The current test suite covers the post-workout debrief logic and WHOOP
-webhook signature verification. PRs adding tests for the scheduler and
-Notion writers are welcome.
+The suite is fully offline (all external APIs stubbed) and covers the debrief,
+brief quality, session/recovery planning, strength progression, training
+phases, race periodization, trend intent, exercise DB, and scheduler
+resilience. PRs adding tests for the Notion writers and webhook handlers are
+welcome.
 
 ---
 
