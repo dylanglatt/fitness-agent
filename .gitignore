@@ -76,3 +76,6 @@ build/
 .next/
 .cache/
 scripts/_audit_data/
+
+# FUSE leftovers from mounted-folder editing
+.fuse_hidden*
