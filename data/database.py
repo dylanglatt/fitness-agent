@@ -2268,6 +2268,21 @@ class Database:
             )
             await db.commit()
 
+    async def clear_planned_session(self, date: str) -> bool:
+        """Drop the persisted session plan for a date.
+
+        Called whenever that date's effective session changes (data/plan_ops.py).
+        Callers only check a saved plan's staleness by pattern, and every
+        full-body day shares the pattern "full_body", so without this a Day A
+        plan would survive a swap to Day B.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "DELETE FROM planned_sessions WHERE date = ?", (date,)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
     async def get_planned_session(self, date: str) -> Optional[dict]:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row

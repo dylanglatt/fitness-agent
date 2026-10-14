@@ -1,45 +1,111 @@
 """
-Shared session-swap vocabulary.
+Shared vocabulary for plan edits (swap a day, move a session).
 
-Single source of truth for translating user-facing swap targets ("push",
-"pull", "legs", "run", "rest", "cross") into the internal session_type
-vocabulary the weekly_template and daily_plan_overrides use ('lift' / 'run' /
-'rest' / 'cross_train'), with a readable focus label preserved.
+Pure parsing only: turns a user-typed target ("day b", "lift", "long run",
+"rest", "wednesday") into a (kind, detail) pair. Resolving that pair against
+the active weekly template lives in data/plan_ops.py, because the right answer
+depends on the plan (which day is "Day B", which run day is the long run).
 
-Used by both the Discord /swap command (bot/commands.py) and the iOS app's
-POST /swap-session endpoint (api_server.py) — extracted so the two can't
-drift.
+Used by the Discord /swap and /move commands (bot/commands.py), the app's
+POST /swap-session and /move-session endpoints (api_server.py), and the Muse
+MCP server (integrations/mcp_server.py), so all three accept the same words.
+
+History: this used to map push / pull / legs onto lift overrides. The plan
+moved to full body on 2026-09-15, and a "push" override on a full-body plan
+produced a push-only session with no prescription behind it, so those
+aliases are gone. Lift targets now resolve to a real template day.
 """
 
-SWAP_ALIASES = {
-    # session_type → set of accepted user inputs
-    "lift_push":  {"push", "lift_push", "bench"},
-    "lift_pull":  {"pull", "lift_pull", "row"},
-    "lift_legs":  {"legs", "lift_legs", "squat", "deadlift"},
-    "lift":       {"lift", "weights", "strength"},
-    "run":        {"run", "easy", "tempo", "intervals", "long"},
-    "rest":       {"rest", "off", "recovery"},
-    "cross_train": {"cross", "cross-train", "crosstrain", "bike", "swim", "yoga"},
+from __future__ import annotations
+
+import re
+
+WEEKDAYS = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+
+# kind -> accepted user inputs (already lowercased, whitespace-collapsed)
+_ALIASES = {
+    "lift": {
+        "lift",
+        "weights",
+        "strength",
+        "gym",
+        "full body",
+        "fullbody",
+        "full-body",
+    },
+    "rest": {"rest", "off", "recovery", "active recovery", "rest day"},
+    "cross": {
+        "cross",
+        "cross-train",
+        "crosstrain",
+        "cross train",
+        "bike",
+        "swim",
+        "yoga",
+    },
 }
 
+# run sub-kinds: the detail is a keyword matched against template run focus.
+_RUN_ALIASES = {
+    "run": None,
+    "easy": "easy",
+    "easy run": "easy",
+    "z2": "easy",
+    "zone 2": "easy",
+    "aerobic": "easy",
+    "quality": "quality",
+    "quality run": "quality",
+    "tempo": "quality",
+    "intervals": "quality",
+    "workout run": "quality",
+    "speed": "quality",
+    "long": "long",
+    "long run": "long",
+}
 
-def normalize_swap(label: str) -> tuple[str, str] | None:
-    """Return (session_type, focus_label) for a user-typed swap target.
+_DAY_RE = re.compile(r"^day\s*([a-z])$")
 
-    Returns None if the input doesn't match any known category. The focus
-    label is the title-cased original word so "pull" becomes
-    session_type='lift', focus='Pull' — readable in both adherence + brief
-    output.
+VALID_TARGETS_HINT = (
+    "day a / day b / day c, lift, run, easy, quality, long, rest, cross, "
+    "a weekday name (copy that day's template session), or reset"
+)
+
+
+def parse_target(label: str) -> tuple[str, str | None] | None:
+    """Return (kind, detail) for a user-typed target, or None if unknown.
+
+    kinds:
+      ("day", "b")          a lettered template lift day ("day b", "b")
+      ("lift", None)        whichever lift day is owed (resolved in plan_ops)
+      ("run", "long"|...)   a run, optionally a specific template run type
+      ("rest", None)
+      ("cross", None)
+      ("weekday", "monday") copy that weekday's template session
+      ("reset", None)       drop the override, back to the template
     """
-    norm = (label or "").strip().lower()
-    for kind, aliases in SWAP_ALIASES.items():
-        if norm in aliases:
-            if kind.startswith("lift_"):
-                sub = kind.split("_", 1)[1].title()  # Push / Pull / Legs
-                return ("lift", sub)
-            if kind == "lift":
-                return ("lift", "lift")
-            if kind == "cross_train":
-                return ("cross_train", norm.title())
-            return (kind, norm.title())
+    norm = " ".join((label or "").strip().lower().split())
+    if not norm:
+        return None
+    if norm == "reset":
+        return ("reset", None)
+    m = _DAY_RE.match(norm)
+    if m:
+        return ("day", m.group(1))
+    if len(norm) == 1 and norm.isalpha():
+        return ("day", norm)
+    if norm in WEEKDAYS:
+        return ("weekday", norm)
+    if norm in _RUN_ALIASES:
+        return ("run", _RUN_ALIASES[norm])
+    for kind, words in _ALIASES.items():
+        if norm in words:
+            return (kind, None)
     return None

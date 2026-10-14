@@ -16,9 +16,12 @@ SQLite DB.
 | GET | `/coach` | DB | opener + suggestions (chat happens via POST `/chat`) |
 | POST | `/chat` | coach | `{message}` → `{reply}` (Anthropic) |
 | POST | `/log-set` | DB | log a lift set from the live logger |
+| POST | `/swap-session` | DB | `{target, date?}` set what a day is (`day b`, `run`, `rest`, `reset`, ...) — same as Discord `/swap` |
+| POST | `/move-session` | DB | `{from, to}` two dates trade sessions — same as Discord `/move` |
 | POST | `/recovery` | DB | log a sauna/cold/etc. session |
 | POST | `/goals` / PATCH `/goals/{id}` | DB | create / retire (status) a goal |
 | POST | `/body` | DB | manual weight (BF% accepted, no column yet) |
+| POST | `/muse/mcp` | DB + coach | MCP endpoint for Muse/other agents, see `docs/muse.md` |
 | GET | `/health` | DB | liveness + latest WHOOP date (no auth required if token unset) |
 
 Data endpoints read straight from SQLite — they work even when Anthropic / the

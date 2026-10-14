@@ -65,10 +65,19 @@ def get_coach():
 _brief_cache: dict[str, str] = {}
 
 
+# Muse / MCP endpoint (integrations/mcp_server.py), mounted further down once
+# the /goals and /trends handlers it reuses exist. Stays None without a token.
+_mcp_session_manager = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.initialize()
-    yield
+    if _mcp_session_manager is not None:
+        async with _mcp_session_manager.run():
+            yield
+    else:
+        yield
 
 
 app = FastAPI(title="Coach Aurelius API", lifespan=lifespan)
@@ -391,52 +400,63 @@ async def log_set(payload: dict = Body(...)):
 
 @app.post("/swap-session", dependencies=[Depends(auth)])
 async def swap_session(payload: dict = Body(...)):
-    """Override today's plan from the app — same semantics as Discord /swap.
+    """Change what a day is from the app — same semantics as Discord /swap.
 
-    Body: {"target": "push"|"pull"|"legs"|"run"|"rest"|"cross"|"reset"}
-    "reset" clears today's override, falling back to the weekly template.
-    Returns the now-effective session so the UI can update without a
-    second round-trip.
+    Body: {"target": "day b"|"lift"|"run"|"long"|"rest"|"cross"|"reset"|..., "date"?: "YYYY-MM-DD"}
+    Lift targets resolve to a real template day (data/plan_ops.py). Returns
+    the now-effective session so the UI can update without a second round-trip.
     """
-    from data.plan_vocab import normalize_swap
+    from data import plan_ops
 
-    target = ((payload or {}).get("target") or "").strip().lower()
-    today_iso = _today_iso()
-
+    p = payload or {}
+    target = (p.get("target") or "").strip().lower()
     if not target:
         raise HTTPException(status_code=422, detail="missing 'target'")
+    try:
+        today = _now().date()
+        day = plan_ops.parse_date(p.get("date") or "today", today, upcoming=True)
+        await plan_ops.set_day(db, day, target, source="app_swap", today=today)
+    except plan_ops.PlanEditError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    _on_plan_change([day.isoformat()])
+    return {"ok": True, "session": await _session_card(day.isoformat())}
 
-    if target == "reset":
-        await db.clear_daily_override(today_iso)
-    else:
-        normalized = normalize_swap(target)
-        if not normalized:
-            raise HTTPException(
-                status_code=422,
-                detail=f"unknown target {target!r} — try push/pull/legs/run/rest/cross/reset",
-            )
-        new_type, new_focus = normalized
-        await db.set_daily_override(
-            date=today_iso,
-            session_type=new_type,
-            focus=new_focus,
-            prescription="",
-            notes="swap from iOS app",
-            source="app_swap",
-        )
 
-    # The cached morning brief may reference the old session — rebuild on
-    # next /today so the brief matches the new plan.
-    _brief_cache.pop(today_iso, None)
+@app.post("/move-session", dependencies=[Depends(auth)])
+async def move_session(payload: dict = Body(...)):
+    """Trade the sessions on two dates. Body: {"from": "...", "to": "..."}."""
+    from data import plan_ops
 
-    sess = await db.get_effective_session_for_date(today_iso) or {}
+    p = payload or {}
+    today = _now().date()
+    try:
+        if not p.get("from") or not p.get("to"):
+            raise plan_ops.PlanEditError("need both 'from' and 'to'")
+        a = plan_ops.parse_date(p["from"], today, upcoming=True)
+        b = plan_ops.parse_date(p["to"], today, upcoming=True)
+        await plan_ops.move_session(db, a, b, source="app_move", today=today)
+    except plan_ops.PlanEditError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    _on_plan_change([a.isoformat(), b.isoformat()])
     return {
         "ok": True,
-        "session": {
-            "type": (sess.get("session_type") or "rest").title(),
-            "focus": (sess.get("focus") or sess.get("prescription", "")[:80] or "").strip(),
-            "isOverride": bool(sess.get("is_override")),
-        },
+        "from": {"date": a.isoformat(), "session": await _session_card(a.isoformat())},
+        "to": {"date": b.isoformat(), "session": await _session_card(b.isoformat())},
+    }
+
+
+def _on_plan_change(dates: list[str]) -> None:
+    """The cached morning brief may describe the old plan; rebuild on next /today."""
+    for d in dates:
+        _brief_cache.pop(d, None)
+
+
+async def _session_card(date_iso: str) -> dict:
+    sess = await db.get_effective_session_for_date(date_iso) or {}
+    return {
+        "type": (sess.get("session_type") or "rest").title(),
+        "focus": (sess.get("focus") or sess.get("prescription", "")[:80] or "").strip(),
+        "isOverride": bool(sess.get("is_override")),
     }
 
 
@@ -591,3 +611,40 @@ async def _integrations():
         {"name": "Strava", "status": "Connected" if ok(latest_strava) else "Not synced", "ok": ok(latest_strava)},
         {"name": "Apple Health", "status": "Not connected", "ok": False},
     ]
+
+
+# ── Muse / MCP ────────────────────────────────────────────────────────────
+# Mounted last so it can reuse the /goals and /trends handlers. Public URL
+# behind Caddy (which strips /api): https://<host>/api/muse/mcp. See
+# docs/muse.md. Never mounted without a token: it has write tools.
+
+def _mcp_allowed_hosts() -> list[str]:
+    from urllib.parse import urlparse
+
+    hosts = ["127.0.0.1:*", "localhost:*"]
+    public = urlparse(getattr(config, "WEBHOOK_PUBLIC_URL", "") or "").hostname
+    if public:
+        hosts.append(public)
+    extra = os.getenv("MCP_ALLOWED_HOSTS", "")
+    hosts += [h.strip() for h in extra.split(",") if h.strip()]
+    return hosts
+
+
+async def _progress() -> dict:
+    return {"goals": (await goals())["active"], "trends": await trends()}
+
+
+if API_TOKEN and os.getenv("MCP_ENABLED", "1") != "0":
+    try:
+        from integrations.mcp_server import build_mcp_server, mount_mcp
+
+        _mcp = build_mcp_server(
+            db, get_coach, _now, progress=_progress, on_plan_change=_on_plan_change,
+        )
+        _mcp_session_manager = mount_mcp(app, _mcp, API_TOKEN, _mcp_allowed_hosts())
+        logger.info("MCP endpoint mounted at /muse/mcp")
+    except ImportError as e:
+        logger.warning("MCP endpoint disabled (pip install 'mcp>=2.3,<3'): %s", e)
+else:
+    logger.info("MCP endpoint not mounted (FITNESS_API_TOKEN unset or MCP_ENABLED=0)")
+

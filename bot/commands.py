@@ -294,106 +294,79 @@ def register_commands(bot):
             "or `/plan <monday..sunday>`."
         )
 
-    # ── /swap — override today's plan ─────────────────────────────────────
+    # ── /swap and /move — edit this week's plan ──────────────────────────
     #
-    # Single deterministic way to flip today's prescription without editing
-    # the weekly template. Backed by data/database.py:set_daily_override,
-    # which UPSERTs by date. /swap reset clears the override.
-    #
-    # Vocab: user-facing names accepted (Push / Pull / Legs / Run / Rest /
-    # Cross / Cross-train). Internally normalized to the same session_type
-    # vocabulary the weekly_template uses ('lift' / 'run' / 'rest' /
-    # 'cross_train'), with the user-facing label preserved as `focus`.
-    # That way /plan today shows e.g. "LIFT — Pull" rather than the bare
-    # session_type, which matches how the weekly template reads.
-    #
-    # Vocab + normalization live in data/plan_vocab.py, shared with the
-    # app's POST /swap-session endpoint (api_server.py).
+    # Both go through data/plan_ops.py, shared with the app API and the Muse
+    # MCP server. Edits are daily_plan_overrides rows; the weekly template is
+    # never touched. Lift targets resolve to a real template day (Day A/B/C)
+    # with its prescription, so /session has an exercise list to build from.
 
-    from data.plan_vocab import normalize_swap as _normalize_swap
+    from data import plan_ops as _plan_ops
+    from data.plan_vocab import VALID_TARGETS_HINT as _TARGETS_HINT
 
     @bot.hybrid_command(
         name="swap",
-        description=(
-            "Override today's plan. Usage: /swap <push|pull|legs|run|rest|cross>"
-            " or /swap reset to clear."
-        ),
+        description="Change what a day is. Usage: /swap <day b|run|long|rest|...> [date] or /swap reset",
     )
     @is_owner_hybrid
-    async def swap_cmd(ctx: commands.Context, target: str = ""):
-        today_iso = datetime.now(tz).date().isoformat()
-        today_name = datetime.now(tz).strftime("%A")
-        # Look up what the weekly template says for today, for the
-        # before/after reply line.
-        plan = await db.get_active_plan()
-        tpl = (plan or {}).get("weekly_template") or {}
-        base_session = tpl.get(today_name.lower()) or {}
-        base_label = (base_session.get("session_type") or "rest").upper()
-        base_focus = base_session.get("focus") or ""
-
-        norm = (target or "").strip().lower()
+    async def swap_cmd(ctx: commands.Context, *, args: str = ""):
+        # One string so the prefix form works with multi-word targets
+        # ("!swap day b friday", "!swap long run"); the date, if any, is the
+        # last token.
+        today = datetime.now(tz).date()
+        target, when = _plan_ops.split_target_and_date(args)
+        norm = target.strip().lower()
         if not norm:
             await ctx.send(
                 "Usage:\n"
-                "  `/swap <push|pull|legs|run|rest|cross>`  — override today\n"
-                "  `/swap reset`                            — clear today's override\n"
-                "  `/swap status`                           — what's today's effective plan?"
+                "  `/swap <target> [date]`  set what a day is (default today)\n"
+                "  `/swap reset [date]`     back to the weekly template\n"
+                "  `/swap status [date]`    what's the effective plan?\n"
+                f"Targets: {_TARGETS_HINT}."
             )
             return
-
-        if norm == "status":
-            sess = await db.get_effective_session_for_date(today_iso)
-            if not sess:
-                await ctx.send(f"No plan for {today_name}.")
+        try:
+            day = _plan_ops.parse_date(when, today, upcoming=True)
+            if norm == "status":
+                sess = await db.get_effective_session_for_date(day.isoformat())
+                tag = " (override)" if (sess or {}).get("is_override") else " (weekly template)"
+                await ctx.send(f"{day.strftime('%A')} {day.isoformat()}: **{_plan_ops.describe(sess)}**{tag}")
                 return
-            stype = (sess.get("session_type") or "?").upper()
-            focus = sess.get("focus") or ""
-            if sess.get("is_override"):
-                await ctx.send(
-                    f"Today ({today_name}, {today_iso}): **{stype}** — {focus}  "
-                    f"(override; weekly template says {base_label} — {base_focus})"
-                )
-            else:
-                await ctx.send(
-                    f"Today ({today_name}, {today_iso}): **{stype}** — {focus}  "
-                    "(weekly template, no override)"
-                )
+            res = await _plan_ops.set_day(db, day, norm, source="swap_cmd", today=today)
+        except _plan_ops.PlanEditError as e:
+            await ctx.send(str(e))
             return
+        after = await db.get_effective_session_for_date(res["date"])
+        await ctx.send(
+            f"✅ {day.strftime('%A')} {res['date']} → **{_plan_ops.describe(after)}**"
+            + ("" if norm == "reset" else "\nWeekly template unchanged. `/swap reset` to undo.")
+        )
 
-        if norm == "reset":
-            removed = await db.clear_daily_override(today_iso)
-            if removed:
-                await ctx.send(
-                    f"✅ Cleared today's override. Back to the weekly template: "
-                    f"**{base_label}** — {base_focus}"
-                )
-            else:
-                await ctx.send(
-                    f"No override for today to clear. Weekly template stands: "
-                    f"**{base_label}** — {base_focus}"
-                )
-            return
-
-        normalized = _normalize_swap(norm)
-        if not normalized:
+    @bot.hybrid_command(
+        name="move",
+        description="Swap the sessions on two days. Usage: /move <from> <to>, e.g. /move today tomorrow",
+    )
+    @is_owner_hybrid
+    async def move_cmd(ctx: commands.Context, from_day: str = "", to_day: str = ""):
+        if not from_day or not to_day:
             await ctx.send(
-                f"Unknown swap target {target!r}. Try: push / pull / legs / run / "
-                "rest / cross. Or `/swap reset` to clear."
+                "Usage: `/move <from> <to>` with today / tomorrow / a weekday / YYYY-MM-DD.\n"
+                "The two days trade sessions, so nothing in the week gets dropped."
             )
             return
-        new_type, new_focus = normalized
-        await db.set_daily_override(
-            date=today_iso,
-            session_type=new_type,
-            focus=new_focus,
-            prescription="",
-            notes=f"manual /swap from weekly template ({base_label})",
-            source="swap_cmd",
-        )
+        today = datetime.now(tz).date()
+        try:
+            a = _plan_ops.parse_date(from_day, today, upcoming=True)
+            b = _plan_ops.parse_date(to_day, today, upcoming=True)
+            await _plan_ops.move_session(db, a, b, source="move_cmd", today=today)
+        except _plan_ops.PlanEditError as e:
+            await ctx.send(str(e))
+            return
+        sa = await db.get_effective_session_for_date(a.isoformat())
+        sb = await db.get_effective_session_for_date(b.isoformat())
         await ctx.send(
-            f"✅ Switched today ({today_name} {today_iso}) → **{new_type.upper()}** "
-            f"— {new_focus}.\nWeekly template ({base_label} — {base_focus}) unchanged. "
-            "Use `/swap reset` to undo."
+            f"✅ {a.strftime('%a')} {a.isoformat()}: **{_plan_ops.describe(sa)}**\n"
+            f"✅ {b.strftime('%a')} {b.isoformat()}: **{_plan_ops.describe(sb)}**"
         )
 
     # ── /recovery — today's WHOOP recovery + one-line read ─────────────────

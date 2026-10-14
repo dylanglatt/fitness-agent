@@ -1429,13 +1429,15 @@ class Coach:
             if not session:
                 return "REST"
             stype = (session.get("session_type") or "").lower()
-            if stype in ("lift", "strength"):
+            if stype in ("lift", "strength", "full_body"):
                 return "LIFT"
             if stype in ("run", "long_run", "easy_run", "interval", "tempo"):
                 return "RUN"
             if stype in ("rest", "off"):
                 return "REST"
-            if stype == "cross":
+            # plan_ops / /swap cross write "cross_train" (the template's own
+            # vocabulary); "cross" alone used to make every cross day a deviation.
+            if stype in ("cross", "cross_train"):
                 return "CROSS"
             # Unknown session_type — keep the raw value so it's visible.
             return stype.upper() if stype else "?"
