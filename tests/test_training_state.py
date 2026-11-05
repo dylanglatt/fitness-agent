@@ -12,7 +12,7 @@ from ai.training_state import (
     recovery_intensity_band, assess_deload,
     whoop_recovery_sessions, merge_recovery_sessions, render_recovery_block,
     render_readiness_block,
-    PUSH, PULL, LEGS, CORE, FULL_BODY, RUN_EASY, RUN_QUALITY, RUN_LONG,
+    PUSH, PULL, LEGS, CORE, FULL_BODY, UPPER_PUMP, RUN_EASY, RUN_QUALITY, RUN_LONG,
 )
 
 TODAY = date(2026, 6, 10)
@@ -306,3 +306,30 @@ def test_no_unclassified_lifts_keeps_the_authoritative_header():
     r = assess_readiness(state, ("lift", PUSH))
     assert r["pattern_data_complete"] is True
     assert "authoritative" in render_readiness_block(state, r)
+
+
+# ── Pump day (data/session_library.py) ──────────────────────────────────────
+
+
+def test_pump_session_classifies_as_upper_pump():
+    from data.session_library import LIBRARY
+    for key, sess in LIBRARY.items():
+        assert classify_planned_session(sess) == ("lift", UPPER_PUMP), key
+
+
+def test_pump_day_with_sore_legs_never_suggests_legs():
+    """The point of the pump day is lifting when legs are cooked. With legs
+    the freshest pattern, the unspecified-lift branch would suggest legs."""
+    lifts = [
+        {"date": _iso(1), "exercise": "back squat"},   # legs, 1d ago
+        {"date": _iso(1), "exercise": "bench press"},  # push, 1d ago
+        {"date": _iso(4), "exercise": "lat pulldown"}, # pull, 4d ago
+    ]
+    state = build_training_state(lifts, [], TODAY)
+    r = assess_readiness(state, ("lift", UPPER_PUMP))
+    assert r["status"] == "ready"
+    assert r["suggested"] is None
+    assert "Pump day" in r["reason"]
+    assert "push: trained 1d ago" in r["reason"]
+    assert "pull: last 4d ago" in r["reason"]
+    assert "legs" not in r["reason"]

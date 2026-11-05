@@ -14,11 +14,15 @@ History: this used to map push / pull / legs onto lift overrides. The plan
 moved to full body on 2026-09-15, and a "push" override on a full-body plan
 produced a push-only session with no prescription behind it, so those
 aliases are gone. Lift targets now resolve to a real template day.
+Extra sessions outside the template (the "pump" day) resolve through
+data/session_library.py instead.
 """
 
 from __future__ import annotations
 
 import re
+
+from data.session_library import ALIASES as _LIBRARY_ALIASES
 
 WEEKDAYS = (
     "monday",
@@ -74,7 +78,8 @@ _RUN_ALIASES = {
 _DAY_RE = re.compile(r"^day\s*([a-z])$")
 
 VALID_TARGETS_HINT = (
-    "day a / day b / day c, lift, run, easy, quality, long, rest, cross, "
+    "day a / day b / day c, lift, pump, pump short, run, easy, quality, "
+    "long, rest, cross, "
     "a weekday name (copy that day's template session), or reset"
 )
 
@@ -84,6 +89,7 @@ def parse_target(label: str) -> tuple[str, str | None] | None:
 
     kinds:
       ("day", "b")          a lettered template lift day ("day b", "b")
+      ("library", "pump")   a standalone session from data/session_library.py
       ("lift", None)        whichever lift day is owed (resolved in plan_ops)
       ("run", "long"|...)   a run, optionally a specific template run type
       ("rest", None)
@@ -103,6 +109,8 @@ def parse_target(label: str) -> tuple[str, str | None] | None:
         return ("day", norm)
     if norm in WEEKDAYS:
         return ("weekday", norm)
+    if norm in _LIBRARY_ALIASES:
+        return ("library", _LIBRARY_ALIASES[norm])
     if norm in _RUN_ALIASES:
         return ("run", _RUN_ALIASES[norm])
     for kind, words in _ALIASES.items():

@@ -25,6 +25,8 @@ LIFT_PATTERNS = (PUSH, PULL, LEGS)  # core is accessory; not spacing-gated
 # FULL_BODY branch in assess_readiness() for how recency becomes
 # per-pattern volume guidance instead of a block.
 FULL_BODY = "full_body"
+# Standalone pump session (data/session_library.py): push + pull, no legs.
+UPPER_PUMP = "upper_pump"
 
 # Exercise-name keyword -> (pattern, primary muscle). First match wins; the list
 # is ordered so more-specific phrases (e.g. "leg curl") are checked before
@@ -270,6 +272,8 @@ def classify_planned_session(session: Optional[dict]) -> tuple[str, Optional[str
             return "run", RUN_QUALITY
         return "run", RUN_EASY
     if stype in ("lift", "strength", "full_body"):
+        if "pump" in focus:
+            return "lift", UPPER_PUMP
         if stype == "full_body" or "full body" in focus or "full-body" in focus:
             return "lift", FULL_BODY
         for pat in LIFT_PATTERNS:
@@ -368,6 +372,24 @@ def assess_readiness(
                     when = "not yet logged" if days_ago is None else f"{days_ago}d ago"
                     notes.append(f"{pat}: last {when} \u2192 normal volume")
             result["reason"] = "Full-body day. " + "; ".join(notes) + "."
+            if unlogged_recent:
+                result["reason"] += _caveat()
+            return result
+        if sub == UPPER_PUMP:
+            # Chosen on purpose (usually because legs are sore), so never
+            # suggest swapping it for the freshest pattern; that could be
+            # legs. Same volume guidance as full body, push and pull only.
+            notes = []
+            for pat in (PUSH, PULL):
+                days_ago, st = pattern_status[pat]
+                if st == "too_soon":
+                    notes.append(f"{pat}: trained {days_ago}d ago \u2192 keep volume light")
+                else:
+                    when = "not yet logged" if days_ago is None else f"{days_ago}d ago"
+                    notes.append(f"{pat}: last {when} \u2192 normal volume")
+            result["reason"] = (
+                "Pump day (extra session, no lower body). " + "; ".join(notes) + "."
+            )
             if unlogged_recent:
                 result["reason"] += _caveat()
             return result

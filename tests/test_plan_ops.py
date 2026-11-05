@@ -36,6 +36,16 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(parse_target("Monday"), ("weekday", "monday"))
         self.assertEqual(parse_target("reset"), ("reset", None))
 
+    def test_library_targets(self):
+        self.assertEqual(parse_target("pump"), ("library", "pump"))
+        self.assertEqual(parse_target("Upper Pump"), ("library", "pump"))
+        self.assertEqual(parse_target("pump short"), ("library", "pump short"))
+        self.assertEqual(parse_target("quick pump"), ("library", "pump short"))
+        self.assertEqual(
+            plan_ops.split_target_and_date("pump short friday"),
+            ("pump short", "friday"),
+        )
+
     def test_ppl_targets_are_gone(self):
         # The plan is full body; a push/pull/legs override built a push-only
         # session with no prescription behind it.
@@ -107,6 +117,16 @@ class ResolveTests(unittest.TestCase):
         for d in ("tuesday", "thursday", "sunday"):
             self.assertIsNone(plan_ops.day_label(TEMPLATE[d]), d)
 
+    def test_pump_is_a_standalone_session(self):
+        from data.session_library import LIBRARY
+        for key in LIBRARY:
+            got = plan_ops.resolve_target(TEMPLATE, key, THU)
+            self.assertEqual(got["session_type"], "lift")
+            self.assertEqual(got["prescription"], LIBRARY[key]["prescription"])
+            # not a lettered template day
+            self.assertIsNone(plan_ops.day_label(got), key)
+            self.assertTrue(plan_ops.describe(got).startswith("LIFT — pump"), key)
+
     def test_unknown(self):
         with self.assertRaises(PlanEditError):
             plan_ops.resolve_target(TEMPLATE, "push", WED)
@@ -122,6 +142,23 @@ class DbTests(unittest.TestCase):
 
     def eff(self, d):
         return run(self.db.get_effective_session_for_date(d.isoformat()))
+
+    def test_pump_on_a_run_day_leaves_template_alone(self):
+        from data.session_library import LIBRARY
+        res = run(plan_ops.set_day(self.db, THU, "pump", source="test"))
+        self.assertEqual(res["after"]["type"], "lift")
+        self.assertIsNone(res["after"]["day_label"])
+        s = self.eff(THU)
+        self.assertTrue(s["is_override"])
+        self.assertEqual(s["prescription"], LIBRARY["pump"]["prescription"])
+        # Friday's Day C and the weekly template are untouched
+        self.assertEqual(self.eff(FRI)["prescription"], TEMPLATE["friday"]["prescription"])
+        self.assertFalse(self.eff(FRI)["is_override"])
+        plan = run(self.db.get_active_plan())
+        self.assertEqual(plan["weekly_template"], TEMPLATE)
+        # and reset puts Thursday's run back
+        run(plan_ops.set_day(self.db, THU, "reset", source="test"))
+        self.assertEqual(self.eff(THU)["session_type"], "run")
 
     def test_set_day_copies_prescription_and_drops_stale_plan(self):
         run(

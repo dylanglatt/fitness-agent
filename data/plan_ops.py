@@ -25,6 +25,7 @@ import json
 import re
 from datetime import date, timedelta
 
+from data import session_library
 from data.plan_vocab import VALID_TARGETS_HINT, WEEKDAYS, parse_target
 
 LIFT_TYPES = ("lift", "strength", "full_body")
@@ -122,6 +123,11 @@ def resolve_target(template: dict, target: str, on_date: date) -> dict:
     kind, detail = parsed
     if kind == "reset":
         raise PlanEditError("'reset' is not a session; clear the override instead.")
+
+    if kind == "library":
+        # Standalone session, not a template day: the template and the
+        # Day A/B/C labels stay as they are.
+        return _fields(session_library.get(detail))
 
     lifts = lift_days(template)
 
